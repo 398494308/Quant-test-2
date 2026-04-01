@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+logs/*.log
+logs/*.out
+backups/*.py
+state/*.json
+reports/*.csv
+.git/
