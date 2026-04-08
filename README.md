@@ -22,6 +22,25 @@
 
 更完整的策略说明见 [STRATEGY.md](STRATEGY.md)。
 
+## 最近校正
+
+- 回测器已修正 `1h/4h` 上下文的取值时序，现在按 `15m` K 线收盘完成时刻对齐高周期状态
+- `freqtrade` 适配层已改成直接复用主策略入场函数，并尽量复用自研回测器的指标计算口径
+- `scripts/freqtrade_compare.py` 现在对比的是“原始入场信号”，不再拿它去和“实际成交次数”混着比
+
+当前验证口径下：
+
+- 主策略原始信号 vs `freqtrade` 适配层原始信号匹配度约 `83%`
+- 这已经足够做 dry-run / 主策略的一致性检查
+- 但仍然不能把回测收益直接当成未来 live 收益
+
+当前最重要的结构性提醒：
+
+- 回测器参数仍允许 `max_concurrent_positions = 4`
+- 但 `real-money-test` 现在只跑单一交易对 `BTC/USDT:USDT`
+- 实际 live / dry-run 更接近“单一净仓位 + 分批加减仓”，不是 4 笔彼此独立仓同时跑
+- 所以后续评估实盘预期时，建议同时看 `max_concurrent_positions = 1` 的基线结果，不要只看 4 并发回测
+
 当前评估链路：
 
 - `eval`：除最后 `2` 个留出块外，其余窗口全部参与 Walk-Forward 评分
@@ -79,6 +98,12 @@ python3 scripts/research_macd_aggressive.py --once
 python3 scripts/compare_strategies.py
 ```
 
+如果要做主策略 vs `freqtrade` 适配层的一致性检查，建议用仓库虚拟环境执行：
+
+```bash
+./.venv/bin/python scripts/freqtrade_compare.py
+```
+
 持续运行研究循环：
 
 ```bash
@@ -101,6 +126,11 @@ tail -f logs/macd_aggressive_research.log
 - 代码内置默认值和 `config/research.env(.example)` 的覆盖值可能不同
 - 例如代码默认研究循环间隔是 `600` 秒、默认切窗长度是 `28` 天
 - 如果在环境变量里显式设置 `MACD_LOOP_INTERVAL_SECONDS` 或 `MACD_EVAL_CHUNK_DAYS`，运行时会以环境变量为准
+
+运行注意：
+
+- 修改 `src/strategy_macd_aggressive.py`、`src/backtest_macd_aggressive.py` 或 `src/freqtrade_macd_aggressive.py` 后，已在跑的 `dry-run` / `live` 进程不会热更新
+- 需要重启对应进程，新的策略逻辑才会生效
 
 公开上传前至少应确认以下密钥没有被提交：
 

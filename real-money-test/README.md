@@ -37,6 +37,12 @@
 - `position_adjustment_enable`: 开启
 - `max_entry_position_adjustment`: 跟随 `EXIT_PARAMS["pyramid_max_times"]`，当前为 `2`
 
+当前实现状态补充：
+
+- 入场信号已直接复用主策略 `src/strategy_macd_aggressive.py`
+- 指标计算口径已尽量对齐自研回测器 `src/backtest_macd_aggressive.py`
+- `dry-run` 更适合看执行链路和持仓管理是否正常，不适合把单段收益直接当成未来 live 收益
+
 ## 先做什么
 
 先跑纸面盘，不要直接上实盘。
@@ -80,6 +86,8 @@ export I_UNDERSTAND_LIVE_RISK=YES
 bash real-money-test/start_live.sh
 ```
 
+如果刚改过策略或适配层代码，先停掉旧进程再启动新的 `dry-run` / `live`。现有进程不会自动加载新代码。
+
 ## 这一步已经解决了什么
 
 - `test2` 有了单独的实盘测试目录，不再和研究脚本混在一起
@@ -111,17 +119,19 @@ bash real-money-test/start_live.sh
 - 回测里的 1 分钟执行价与实盘真实成交之间的细微差异
 - 回测里的滑点假设与真实盘口冲击差异
 - 资金费、手续费和交易所返回字段在真实环境下的逐笔核对
+- 当前 `freqtrade` 壳子只跑单一交易对，因此更接近“单一净仓位 + 分批加减仓”，不是回测里 4 笔独立仓同时持有的结构
 
 所以这套现在的定位应该是：
 
 - 可以开始跑纸面盘
 - 可以准备小资金实盘
 - 已经很接近可执行版本
-- 但还不能把回测收益直接当成未来实盘收益
+- 但还不能把 4 并发回测收益直接当成未来实盘收益
 
 ## 推荐推进顺序
 
 1. 先跑 `dry-run`，确认能稳定拉起、能下模拟单、日志正常
 2. 做至少 `1` 到 `2` 周的连续纸面盘观察，重点看开平仓、部分止盈、加仓、退出原因
-3. 再做 very small size 的真实资金测试
-4. 最后才考虑放大仓位
+3. 同时用修正后的回测器补看更接近 live 的单仓基线，不要只看 `max_concurrent_positions = 4`
+4. 再做 very small size 的真实资金测试
+5. 最后才考虑放大仓位

@@ -184,11 +184,9 @@ def _run_trade_trace(intraday_data, hourly_state, four_hour_state, intraday_stat
         prev_bar_close_ts = prev_bar["timestamp"] + intraday_interval_ms if prev_bar else bar["timestamp"]
         bar_close_ts = bar["timestamp"] + intraday_interval_ms
         current_ts = bar["timestamp"]
-        current_dt = beijing_dt(current_ts)
-        current_hour_open = current_dt.replace(minute=0, second=0, microsecond=0)
-        current_hour_open_ts = int((current_hour_open - timedelta(hours=8)).timestamp() * 1000)
-        hourly_idx = bisect_right(hourly_timestamps, current_hour_open_ts - 1) - 1
-        four_hour_idx = bisect_right(four_hour_timestamps, current_hour_open_ts - 1) - 1
+        context_ref_ts = bar_close_ts - 1
+        hourly_idx = bisect_right(hourly_timestamps, context_ref_ts) - 1
+        four_hour_idx = bisect_right(four_hour_timestamps, context_ref_ts) - 1
 
         hourly_context = hourly_state[hourly_idx] if hourly_idx >= 0 else None
         prev_hourly_context = hourly_state[hourly_idx - 1] if hourly_idx > 0 else hourly_context

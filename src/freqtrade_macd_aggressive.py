@@ -45,12 +45,6 @@ except ImportError:  # pragma: no cover - 允许在无 freqtrade 环境下被对
             return int(timeframe[:-1]) * 60
         raise ValueError(f"unsupported timeframe: {timeframe}")
 
-try:
-    import talib.abstract as ta
-except ImportError:  # pragma: no cover - 对比脚本会显式跳过
-    ta = None
-
-import numpy as np
 import pandas as pd
 from pandas import DataFrame
 
@@ -62,52 +56,69 @@ P = core_strategy.PARAMS
 E = backtest_module.EXIT_PARAMS
 
 
-def _require_talib():
-    if ta is None:  # pragma: no cover - 运行期依赖检查
-        raise ImportError("TA-Lib is required for freqtrade_macd_aggressive")
+def _with_timestamp(dataframe: DataFrame) -> DataFrame:
+    frame = dataframe.copy()
+    if "timestamp" in frame.columns:
+        frame["timestamp"] = pd.to_numeric(frame["timestamp"], errors="coerce").astype("Int64")
+        return frame
+    if "date" in frame.columns:
+        date_series = pd.to_datetime(frame["date"], utc=True)
+        frame["timestamp"] = (date_series.astype("int64") // 1_000_000).astype("Int64")
+        return frame
+    raise ValueError("dataframe must contain either 'timestamp' or 'date'")
 
 
-def _choppiness(dataframe: DataFrame, length: int = 14) -> pd.Series:
-    prev_close = dataframe["close"].shift(1)
-    true_range = pd.concat(
-        [
-            (dataframe["high"] - dataframe["low"]).abs(),
-            (dataframe["high"] - prev_close).abs(),
-            (dataframe["low"] - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    tr_sum = true_range.rolling(length).sum()
-    high_window = dataframe["high"].rolling(length).max()
-    low_window = dataframe["low"].rolling(length).min()
-    price_range = (high_window - low_window).clip(lower=1e-9)
-    return 100.0 * np.log10((tr_sum / price_range).clip(lower=1e-9)) / np.log10(length)
+def _prepare_bt_state(
+    dataframe: DataFrame,
+    ema_fast: int,
+    ema_slow: int,
+    ema_anchor: int | None = None,
+) -> tuple[DataFrame, list[dict]]:
+    frame = _with_timestamp(dataframe).sort_values("timestamp").reset_index(drop=True)
+    bt_rows = (
+        frame[["timestamp", "open", "high", "low", "close", "volume"]]
+        .assign(timestamp=lambda item: item["timestamp"].astype("int64"))
+        .to_dict("records")
+    )
+    state = backtest_module._prepare_state(
+        bt_rows,
+        ema_fast,
+        ema_slow,
+        P["macd_fast"],
+        P["macd_slow"],
+        P["macd_signal"],
+        ema_anchor_len=ema_anchor,
+    )
+    return frame, state
 
 
 def _apply_trend_columns(dataframe: DataFrame, ema_fast: int, ema_slow: int, ema_anchor: int | None = None) -> DataFrame:
-    _require_talib()
-    frame = dataframe.copy()
-    frame["ema_fast"] = ta.EMA(frame, timeperiod=ema_fast)
-    frame["ema_slow"] = ta.EMA(frame, timeperiod=ema_slow)
+    frame, state = _prepare_bt_state(dataframe, ema_fast, ema_slow, ema_anchor=ema_anchor)
+    frame["ema_fast"] = [item["ema_fast"] for item in state]
+    frame["ema_slow"] = [item["ema_slow"] for item in state]
     if ema_anchor is not None:
-        frame["ema_anchor"] = ta.EMA(frame, timeperiod=ema_anchor)
-    trend_base = frame["ema_slow"].abs().clip(lower=1e-9)
-    frame["trend_spread_pct"] = (frame["ema_fast"] - frame["ema_slow"]) / trend_base
-    frame["ema_slow_slope_pct"] = (frame["ema_slow"] - frame["ema_slow"].shift(1)) / trend_base
-    frame["adx"] = ta.ADX(frame, timeperiod=14)
-    frame["chop"] = _choppiness(frame, 14)
+        frame["ema_anchor"] = [item["ema_anchor"] for item in state]
+    frame["trend_spread_pct"] = [item["trend_spread_pct"] for item in state]
+    frame["ema_slow_slope_pct"] = [item["ema_slow_slope_pct"] for item in state]
+    frame["adx"] = [item["adx"] for item in state]
+    frame["chop"] = [item["chop"] for item in state]
     return frame
 
 
 def _apply_intraday_indicators(dataframe: DataFrame) -> DataFrame:
-    frame = _apply_trend_columns(dataframe, P["intraday_ema_fast"], P["intraday_ema_slow"])
-    macd = ta.MACD(frame, fastperiod=P["macd_fast"], slowperiod=P["macd_slow"], signalperiod=P["macd_signal"])
-    frame["macd_line"] = macd["macd"]
-    frame["macd_signal_line"] = macd["macdsignal"]
-    frame["histogram"] = macd["macdhist"]
-    frame["atr"] = ta.ATR(frame, timeperiod=14)
-    frame["atr_ratio"] = frame["atr"] / frame["close"].clip(lower=1e-9)
-    frame["rsi"] = ta.RSI(frame, timeperiod=14)
+    frame, state = _prepare_bt_state(dataframe, P["intraday_ema_fast"], P["intraday_ema_slow"])
+    frame["ema_fast"] = [item["ema_fast"] for item in state]
+    frame["ema_slow"] = [item["ema_slow"] for item in state]
+    frame["trend_spread_pct"] = [item["trend_spread_pct"] for item in state]
+    frame["ema_slow_slope_pct"] = [item["ema_slow_slope_pct"] for item in state]
+    frame["adx"] = [item["adx"] for item in state]
+    frame["chop"] = [item["chop"] for item in state]
+    frame["macd_line"] = [item["macd_line"] for item in state]
+    frame["macd_signal_line"] = [item["signal_line"] for item in state]
+    frame["histogram"] = [item["histogram"] for item in state]
+    frame["atr"] = [item["atr"] for item in state]
+    frame["atr_ratio"] = [item["atr_ratio"] for item in state]
+    frame["rsi"] = [item["rsi"] for item in state]
     frame["breakout_high"] = frame["high"].rolling(window=P["breakout_lookback"]).max().shift(1)
     frame["breakdown_low"] = frame["low"].rolling(window=P["breakdown_lookback"]).min().shift(1)
     frame["avg_volume"] = frame["volume"].rolling(window=P["volume_lookback"]).mean()
@@ -120,21 +131,34 @@ def _apply_intraday_indicators(dataframe: DataFrame) -> DataFrame:
 
 
 def _apply_hourly_indicators(dataframe: DataFrame) -> DataFrame:
-    frame = _apply_trend_columns(
+    frame, state = _prepare_bt_state(
         dataframe,
-        P["hourly_ema_fast"],
-        P["hourly_ema_slow"],
+        ema_fast=P["hourly_ema_fast"],
+        ema_slow=P["hourly_ema_slow"],
         ema_anchor=P["hourly_ema_anchor"],
     )
-    macd = ta.MACD(frame, fastperiod=P["macd_fast"], slowperiod=P["macd_slow"], signalperiod=P["macd_signal"])
-    frame["macd_line"] = macd["macd"]
-    frame["macd_signal"] = macd["macdsignal"]
-    frame["histogram"] = macd["macdhist"]
+    frame["ema_fast"] = [item["ema_fast"] for item in state]
+    frame["ema_slow"] = [item["ema_slow"] for item in state]
+    frame["ema_anchor"] = [item["ema_anchor"] for item in state]
+    frame["trend_spread_pct"] = [item["trend_spread_pct"] for item in state]
+    frame["ema_slow_slope_pct"] = [item["ema_slow_slope_pct"] for item in state]
+    frame["adx"] = [item["adx"] for item in state]
+    frame["chop"] = [item["chop"] for item in state]
+    frame["macd_line"] = [item["macd_line"] for item in state]
+    frame["macd_signal"] = [item["signal_line"] for item in state]
+    frame["histogram"] = [item["histogram"] for item in state]
     return frame
 
 
 def _apply_fourh_indicators(dataframe: DataFrame) -> DataFrame:
-    return _apply_trend_columns(dataframe, P["fourh_ema_fast"], P["fourh_ema_slow"])
+    frame, state = _prepare_bt_state(dataframe, P["fourh_ema_fast"], P["fourh_ema_slow"])
+    frame["ema_fast"] = [item["ema_fast"] for item in state]
+    frame["ema_slow"] = [item["ema_slow"] for item in state]
+    frame["trend_spread_pct"] = [item["trend_spread_pct"] for item in state]
+    frame["ema_slow_slope_pct"] = [item["ema_slow_slope_pct"] for item in state]
+    frame["adx"] = [item["adx"] for item in state]
+    frame["chop"] = [item["chop"] for item in state]
+    return frame
 
 
 def _rename_informative(frame: DataFrame, suffix: str, columns: list[str]) -> DataFrame:
@@ -143,44 +167,29 @@ def _rename_informative(frame: DataFrame, suffix: str, columns: list[str]) -> Da
     return renamed.rename(columns=mapping)
 
 
-def _sideways_mask(dataframe: DataFrame) -> pd.Series:
-    intraday_spread = dataframe["trend_spread_pct"].abs()
-    hourly_spread = dataframe["trend_spread_pct_1h"].abs()
-    fourh_spread = dataframe["trend_spread_pct_4h"].abs()
-    hourly_slope = dataframe["ema_slow_slope_pct_1h"].abs()
-    fourh_slope = dataframe["ema_slow_slope_pct_4h"].abs()
-    atr_ratio = dataframe["atr_ratio"]
+def _merge_informative_on_timestamp(
+    base: DataFrame,
+    informative: DataFrame,
+    suffix: str,
+    columns: list[str],
+    base_timeframe: str,
+    informative_timeframe: str,
+) -> DataFrame:
+    merged_columns = _rename_informative(informative, suffix, columns)
+    merge_col = f"timestamp_merge_{suffix}"
+    base_minutes = timeframe_to_minutes(base_timeframe)
+    informative_minutes = timeframe_to_minutes(informative_timeframe)
+    shift_ms = max(0, informative_minutes - base_minutes) * 60_000
 
-    signals = (
-        ((dataframe["chop"] >= core_strategy.SIDEWAYS_INTRADAY_CHOP_MIN) & (dataframe["chop_1h"] >= core_strategy.SIDEWAYS_HOURLY_CHOP_MIN)).astype(int)
-        + ((atr_ratio < core_strategy.SIDEWAYS_MIN_ATR_RATIO) & (dataframe["chop_1h"] >= core_strategy.SIDEWAYS_HOURLY_CHOP_MIN - 1.0)).astype(int)
-        + ((hourly_spread < core_strategy.SIDEWAYS_MIN_HOURLY_SPREAD_PCT) & (fourh_spread < core_strategy.SIDEWAYS_MIN_FOURH_SPREAD_PCT)).astype(int)
-        + (
-            (intraday_spread < atr_ratio * 0.28)
-            & (hourly_slope < atr_ratio * 0.08)
-            & (fourh_slope < atr_ratio * 0.04)
-        ).astype(int)
-    )
-    return signals >= 2
-
-
-def _followthrough_mask(dataframe: DataFrame, side: str, trigger_col: str) -> pd.Series:
-    direction = -1.0 if side == "short" else 1.0
-    atr_ratio = dataframe["atr_ratio"]
-    trigger_price = dataframe[trigger_col].clip(lower=1e-9)
-    breakout_distance_pct = (dataframe["close"] - trigger_price).abs() / trigger_price
-
-    confirms = (
-        (direction * dataframe["trend_spread_pct"] >= atr_ratio * 0.30).astype(int)
-        + (direction * dataframe["trend_spread_pct_1h"] >= np.maximum(core_strategy.SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 1.35, atr_ratio * 0.85)).astype(int)
-        + (direction * dataframe["trend_spread_pct_4h"] >= np.maximum(core_strategy.SIDEWAYS_MIN_FOURH_SPREAD_PCT * 1.10, atr_ratio * 1.05)).astype(int)
-        + (
-            (direction * dataframe["ema_slow_slope_pct_1h"] >= atr_ratio * 0.08)
-            & (direction * dataframe["ema_slow_slope_pct_4h"] >= atr_ratio * 0.04)
-        ).astype(int)
-        + (breakout_distance_pct >= atr_ratio * 0.35).astype(int)
-    )
-    return confirms >= 3
+    merged_columns[merge_col] = pd.to_numeric(merged_columns["timestamp"], errors="coerce").astype("Int64") + shift_ms
+    merged_columns = merged_columns.drop(columns=["timestamp"]).sort_values(merge_col).reset_index(drop=True)
+    return pd.merge_asof(
+        base.sort_values("timestamp").reset_index(drop=True),
+        merged_columns,
+        left_on="timestamp",
+        right_on=merge_col,
+        direction="backward",
+    ).drop(columns=[merge_col])
 
 
 def apply_entry_logic(dataframe: DataFrame) -> DataFrame:
@@ -188,71 +197,17 @@ def apply_entry_logic(dataframe: DataFrame) -> DataFrame:
     frame["enter_long"] = 0
     frame["enter_short"] = 0
     frame["enter_tag"] = None
+    ohlcv = frame[["open", "high", "low", "close", "volume"]].to_dict("records")
+    signals: list[str | None] = []
+    for idx in range(len(frame)):
+        row = frame.iloc[idx]
+        prev_row = frame.iloc[idx - 1] if idx > 0 else row
+        market_state = _row_to_market_state(row, prev_row)
+        signals.append(core_strategy.strategy(ohlcv, idx, [], market_state))
 
-    sideways = _sideways_mask(frame)
-
-    intraday_bull = (
-        (frame["close"] > frame["ema_fast"])
-        & (frame["ema_fast"] > frame["ema_slow"])
-        & (frame["adx"] >= P["intraday_adx_min"])
-        & (frame["macd_line"] > frame["macd_signal_line"])
-    )
-    hourly_bull = (
-        (frame["close_1h"] > frame["ema_fast_1h"])
-        & (frame["ema_fast_1h"] > frame["ema_slow_1h"])
-        & (frame["close_1h"] > frame["ema_anchor_1h"])
-        & (frame["macd_line_1h"] > frame["macd_signal_1h"])
-        & (frame["adx_1h"] >= P["hourly_adx_min"])
-    )
-    fourh_bull = (
-        (frame["close_4h"] > frame["ema_fast_4h"])
-        & (frame["ema_fast_4h"] > frame["ema_slow_4h"])
-        & (frame["adx_4h"] >= P["fourh_adx_min"])
-    )
-    breakout_ready = (
-        (frame["close"] >= frame["breakout_high"] * (1.0 + P["breakout_buffer_pct"]))
-        & (frame["close_pos"] >= P["breakout_close_pos_min"])
-        & (frame["body_ratio"] >= P["breakout_body_ratio_min"])
-        & (frame["volume_ratio"] >= P["breakout_volume_ratio_min"])
-        & (frame["adx"] >= P["breakout_adx_min"])
-        & (frame["rsi"] >= P["breakout_rsi_min"])
-        & (frame["rsi"] <= P["breakout_rsi_max"])
-        & (frame["histogram"] >= P["breakout_hist_min"])
-    )
-    breakout_followthrough = _followthrough_mask(frame, "long", "breakout_high")
-
-    intraday_bear = (
-        (frame["close"] < frame["ema_fast"])
-        & (frame["ema_fast"] < frame["ema_slow"])
-        & (frame["adx"] >= P["intraday_adx_min"])
-        & (frame["macd_line"] < frame["macd_signal_line"])
-    )
-    hourly_bear = (
-        (frame["close_1h"] < frame["ema_fast_1h"])
-        & (frame["ema_fast_1h"] < frame["ema_slow_1h"])
-        & (frame["close_1h"] < frame["ema_anchor_1h"])
-        & (frame["macd_line_1h"] < frame["macd_signal_1h"])
-        & (frame["adx_1h"] >= P["hourly_adx_min"])
-    )
-    fourh_bear = (
-        (frame["close_4h"] < frame["ema_slow_4h"])
-        & (frame["adx_4h"] >= P["fourh_adx_min"])
-    )
-    breakdown_ready = (
-        (frame["close"] <= frame["breakdown_low"] * (1.0 - P["breakdown_buffer_pct"]))
-        & (frame["close_pos"] <= P["breakdown_close_pos_max"])
-        & (frame["body_ratio"] >= P["breakdown_body_ratio_min"])
-        & (frame["volume_ratio"] >= P["breakdown_volume_ratio_min"])
-        & (frame["adx"] >= P["breakdown_adx_min"])
-        & (frame["rsi"] >= P["breakdown_rsi_min"])
-        & (frame["rsi"] <= P["breakdown_rsi_max"])
-        & (frame["histogram"] <= P["breakdown_hist_max"])
-    )
-    breakdown_followthrough = _followthrough_mask(frame, "short", "breakdown_low")
-
-    long_mask = intraday_bull & hourly_bull & fourh_bull & breakout_ready & breakout_followthrough & (~sideways)
-    short_mask = intraday_bear & hourly_bear & fourh_bear & breakdown_ready & breakdown_followthrough & (~sideways)
-
+    signal_series = pd.Series(signals, index=frame.index, dtype="object")
+    long_mask = signal_series == "long_breakout"
+    short_mask = signal_series == "short_breakdown"
     frame.loc[long_mask, "enter_long"] = 1
     frame.loc[long_mask, "enter_tag"] = "long_breakout"
     frame.loc[short_mask, "enter_short"] = 1
@@ -261,42 +216,44 @@ def apply_entry_logic(dataframe: DataFrame) -> DataFrame:
 
 
 def build_signal_frame(df_15m: DataFrame, df_1h: DataFrame, df_4h: DataFrame) -> DataFrame:
+    df_15m = df_15m.copy()
+    df_1h = df_1h.copy()
+    df_4h = df_4h.copy()
+    for dataset in (df_15m, df_1h, df_4h):
+        dataset["timestamp"] = pd.to_numeric(dataset["timestamp"], errors="coerce").astype("Int64")
+
     intraday = _apply_intraday_indicators(df_15m.sort_values("timestamp").reset_index(drop=True))
     hourly = _apply_hourly_indicators(df_1h.sort_values("timestamp").reset_index(drop=True))
     fourh = _apply_fourh_indicators(df_4h.sort_values("timestamp").reset_index(drop=True))
 
-    merged = pd.merge_asof(
+    merged = _merge_informative_on_timestamp(
         intraday,
-        _rename_informative(
-            hourly,
-            "1h",
-            [
-                "timestamp",
-                "close",
-                "ema_fast",
-                "ema_slow",
-                "ema_anchor",
-                "macd_line",
-                "macd_signal",
-                "histogram",
-                "adx",
-                "trend_spread_pct",
-                "ema_slow_slope_pct",
-                "chop",
-            ],
-        ),
-        on="timestamp",
-        direction="backward",
+        hourly,
+        "1h",
+        [
+            "timestamp",
+            "close",
+            "ema_fast",
+            "ema_slow",
+            "ema_anchor",
+            "macd_line",
+            "macd_signal",
+            "histogram",
+            "adx",
+            "trend_spread_pct",
+            "ema_slow_slope_pct",
+            "chop",
+        ],
+        base_timeframe="15m",
+        informative_timeframe="1h",
     )
-    merged = pd.merge_asof(
+    merged = _merge_informative_on_timestamp(
         merged,
-        _rename_informative(
-            fourh,
-            "4h",
-            ["timestamp", "close", "ema_fast", "ema_slow", "adx", "trend_spread_pct", "ema_slow_slope_pct"],
-        ),
-        on="timestamp",
-        direction="backward",
+        fourh,
+        "4h",
+        ["timestamp", "close", "ema_fast", "ema_slow", "adx", "trend_spread_pct", "ema_slow_slope_pct"],
+        base_timeframe="15m",
+        informative_timeframe="4h",
     )
     return apply_entry_logic(merged)
 
@@ -321,13 +278,34 @@ def _safe_float(value, default: float = 0.0) -> float:
         return default
 
 
+def _has_all_values(row: pd.Series, columns: list[str]) -> bool:
+    return all(column in row.index and not pd.isna(row.get(column)) for column in columns)
+
+
 def _row_to_market_state(row: pd.Series, prev_row: pd.Series | None = None) -> dict:
     prev = prev_row if prev_row is not None else row
-    return {
-        "hourly": {
+    hourly = None
+    if _has_all_values(
+        row,
+        [
+            "close_1h",
+            "ema_fast_1h",
+            "ema_slow_1h",
+            "ema_anchor_1h",
+            "macd_line_1h",
+            "macd_signal_1h",
+            "histogram_1h",
+            "adx_1h",
+            "trend_spread_pct_1h",
+            "ema_slow_slope_pct_1h",
+            "chop_1h",
+        ],
+    ):
+        hourly = {
             "close": _safe_float(row.get("close_1h")),
             "ema_fast": _safe_float(row.get("ema_fast_1h")),
             "ema_slow": _safe_float(row.get("ema_slow_1h")),
+            "ema_anchor": _safe_float(row.get("ema_anchor_1h")),
             "histogram": _safe_float(row.get("histogram_1h")),
             "macd_line": _safe_float(row.get("macd_line_1h")),
             "signal_line": _safe_float(row.get("macd_signal_1h")),
@@ -335,11 +313,30 @@ def _row_to_market_state(row: pd.Series, prev_row: pd.Series | None = None) -> d
             "trend_spread_pct": _safe_float(row.get("trend_spread_pct_1h")),
             "ema_slow_slope_pct": _safe_float(row.get("ema_slow_slope_pct_1h")),
             "chop": _safe_float(row.get("chop_1h")),
-        },
-        "prev_hourly": {
+        }
+
+    prev_hourly = None
+    if _has_all_values(
+        prev,
+        [
+            "close_1h",
+            "ema_fast_1h",
+            "ema_slow_1h",
+            "ema_anchor_1h",
+            "macd_line_1h",
+            "macd_signal_1h",
+            "histogram_1h",
+            "adx_1h",
+            "trend_spread_pct_1h",
+            "ema_slow_slope_pct_1h",
+            "chop_1h",
+        ],
+    ):
+        prev_hourly = {
             "close": _safe_float(prev.get("close_1h")),
             "ema_fast": _safe_float(prev.get("ema_fast_1h")),
             "ema_slow": _safe_float(prev.get("ema_slow_1h")),
+            "ema_anchor": _safe_float(prev.get("ema_anchor_1h")),
             "histogram": _safe_float(prev.get("histogram_1h")),
             "macd_line": _safe_float(prev.get("macd_line_1h")),
             "signal_line": _safe_float(prev.get("macd_signal_1h")),
@@ -347,15 +344,33 @@ def _row_to_market_state(row: pd.Series, prev_row: pd.Series | None = None) -> d
             "trend_spread_pct": _safe_float(prev.get("trend_spread_pct_1h")),
             "ema_slow_slope_pct": _safe_float(prev.get("ema_slow_slope_pct_1h")),
             "chop": _safe_float(prev.get("chop_1h")),
-        },
-        "four_hour": {
+        }
+
+    four_hour = None
+    if _has_all_values(
+        row,
+        [
+            "close_4h",
+            "ema_fast_4h",
+            "ema_slow_4h",
+            "adx_4h",
+            "trend_spread_pct_4h",
+            "ema_slow_slope_pct_4h",
+        ],
+    ):
+        four_hour = {
             "close": _safe_float(row.get("close_4h")),
             "ema_fast": _safe_float(row.get("ema_fast_4h")),
             "ema_slow": _safe_float(row.get("ema_slow_4h")),
             "adx": _safe_float(row.get("adx_4h")),
             "trend_spread_pct": _safe_float(row.get("trend_spread_pct_4h")),
             "ema_slow_slope_pct": _safe_float(row.get("ema_slow_slope_pct_4h")),
-        },
+        }
+
+    return {
+        "hourly": hourly,
+        "prev_hourly": prev_hourly or hourly,
+        "four_hour": four_hour,
         "ema_fast": _safe_float(row.get("ema_fast")),
         "ema_slow": _safe_float(row.get("ema_slow")),
         "prev_ema_fast": _safe_float(prev.get("ema_fast")),
@@ -432,8 +447,9 @@ class MacdAggressiveStrategy(IStrategy):
         frame = dataframe
         if "date" in frame.columns:
             eligible = frame.loc[frame["date"] <= current_time]
-            if not eligible.empty:
-                frame = eligible
+            if eligible.empty:
+                return None, None
+            frame = eligible
         row = frame.iloc[-1]
         prev_row = frame.iloc[-2] if len(frame) >= 2 else row
         return row, prev_row
@@ -653,6 +669,7 @@ class MacdAggressiveStrategy(IStrategy):
             and entry_signal in {"long_breakout", "short_breakdown"}
             and close_pnl_pct >= float(E.get("pyramid_trigger_pnl", 20.0))
             and market_state["adx"] >= float(E.get("pyramid_adx_min", 30.0))
+            and market_state["hourly"] is not None
             and (
                 market_state["macd_line"] > market_state["signal_line"]
                 if side == "long"

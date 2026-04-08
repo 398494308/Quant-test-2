@@ -7,6 +7,7 @@ freqtrade 侧通过 src/freqtrade_macd_aggressive.py 的适配函数生成信号
 """
 import sys
 import os
+from bisect import bisect_right
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -36,13 +37,104 @@ def run_custom_engine():
     return result
 
 
+def run_core_signal_check():
+    """直接运行主策略函数，统计不受仓位管理影响的原始信号。"""
+    bt_engine.load_ohlcv_data.cache_clear()
+    intraday_data = bt_engine._slice_by_beijing_window(
+        bt_engine.load_ohlcv_data(str(BASE_DIR / "data/price/BTCUSDT_futures_15m_20240601_20260401.csv")),
+        START_DATE,
+        END_DATE,
+    )
+    hourly_data = bt_engine._slice_by_beijing_window(
+        bt_engine.load_ohlcv_data(str(BASE_DIR / "data/price/BTCUSDT_futures_1h_20240601_20260401.csv")),
+        START_DATE,
+        END_DATE,
+    )
+    if not intraday_data or not hourly_data:
+        raise ValueError(f"missing data for window {START_DATE}~{END_DATE}")
+
+    intraday_interval_ms = bt_engine._infer_interval_ms(intraday_data, 15)
+    intraday_state = bt_engine._prepare_state(
+        intraday_data,
+        strat_module.PARAMS["intraday_ema_fast"],
+        strat_module.PARAMS["intraday_ema_slow"],
+        strat_module.PARAMS["macd_fast"],
+        strat_module.PARAMS["macd_slow"],
+        strat_module.PARAMS["macd_signal"],
+    )
+    hourly_state = bt_engine._prepare_state(
+        hourly_data,
+        strat_module.PARAMS["hourly_ema_fast"],
+        strat_module.PARAMS["hourly_ema_slow"],
+        strat_module.PARAMS["macd_fast"],
+        strat_module.PARAMS["macd_slow"],
+        strat_module.PARAMS["macd_signal"],
+        strat_module.PARAMS.get("hourly_ema_anchor"),
+    )
+    four_hour_data = bt_engine._aggregate_bars(hourly_data, 4)
+    four_hour_state = bt_engine._prepare_state(
+        four_hour_data,
+        strat_module.PARAMS["fourh_ema_fast"],
+        strat_module.PARAMS["fourh_ema_slow"],
+        strat_module.PARAMS["macd_fast"],
+        strat_module.PARAMS["macd_slow"],
+        strat_module.PARAMS["macd_signal"],
+    )
+
+    hourly_timestamps = [row["timestamp"] for row in hourly_state]
+    four_hour_timestamps = [row["timestamp"] for row in four_hour_state]
+    long_timestamps = []
+    short_timestamps = []
+
+    for idx, bar in enumerate(intraday_data):
+        current_ts = bar["timestamp"]
+        bar_close_ts = bar["timestamp"] + intraday_interval_ms
+        context_ref_ts = bar_close_ts - 1
+        hourly_idx = bisect_right(hourly_timestamps, context_ref_ts) - 1
+        four_hour_idx = bisect_right(four_hour_timestamps, context_ref_ts) - 1
+
+        hourly_context = hourly_state[hourly_idx] if hourly_idx >= 0 else None
+        prev_hourly_context = hourly_state[hourly_idx - 1] if hourly_idx > 0 else hourly_context
+        four_hour_context = four_hour_state[four_hour_idx] if four_hour_idx >= 0 else None
+        intraday_context = intraday_state[idx]
+        prev_intraday_context = intraday_state[idx - 1] if idx > 0 else intraday_context
+        market_state = {
+            "hourly": hourly_context,
+            "prev_hourly": prev_hourly_context,
+            "four_hour": four_hour_context,
+            "sentiment": None,
+            "ema_fast": intraday_context["ema_fast"],
+            "ema_slow": intraday_context["ema_slow"],
+            "prev_ema_fast": prev_intraday_context["ema_fast"],
+            "prev_ema_slow": prev_intraday_context["ema_slow"],
+            "adx": intraday_context["adx"],
+            "atr": intraday_context["atr"],
+            "atr_ratio": intraday_context["atr_ratio"],
+            "rsi": intraday_context["rsi"],
+            "chop": intraday_context["chop"],
+            "macd_line": intraday_context["macd_line"],
+            "signal_line": intraday_context["signal_line"],
+            "histogram": intraday_context["histogram"],
+            "prev_histogram": intraday_state[idx - 1]["histogram"] if idx > 0 else intraday_context["histogram"],
+        }
+        signal = strat_module.strategy(intraday_data, idx, [], market_state)
+        if signal == "long_breakout":
+            long_timestamps.append(current_ts)
+        elif signal == "short_breakdown":
+            short_timestamps.append(current_ts)
+
+    return {
+        "long_signals": len(long_timestamps),
+        "short_signals": len(short_timestamps),
+        "total_signals": len(long_timestamps) + len(short_timestamps),
+        "long_timestamps": long_timestamps,
+        "short_timestamps": short_timestamps,
+    }
+
+
 def run_freqtrade_signal_check():
     """用 freqtrade 适配层生成入场信号并统计。"""
     import pandas as pd
-
-    if ft_adapter.ta is None:
-        print("[WARN] TA-Lib not available, skipping freqtrade adapter check")
-        return None
 
     df_15m = pd.read_csv(BASE_DIR / "data/price/BTCUSDT_futures_15m_20240601_20260401.csv")
     df_1h = pd.read_csv(BASE_DIR / "data/price/BTCUSDT_futures_1h_20240601_20260401.csv")
@@ -89,10 +181,9 @@ def compare_signals(custom_result, ft_result):
         print("\n[SKIP] freqtrade 适配层信号检查未运行")
         return
 
-    custom_entries = custom_result["signal_stats"]
-    custom_long = custom_entries.get("long_breakout", {}).get("entries", 0)
-    custom_short = custom_entries.get("short_breakdown", {}).get("entries", 0)
-    custom_total = custom_long + custom_short
+    custom_long = custom_result["long_signals"]
+    custom_short = custom_result["short_signals"]
+    custom_total = custom_result["total_signals"]
 
     ft_long = ft_result["long_signals"]
     ft_short = ft_result["short_signals"]
@@ -117,9 +208,9 @@ def compare_signals(custom_result, ft_result):
 
     if abs(ft_total - custom_total) > 0:
         print("\n差异说明:")
-        print("  - freqtrade 适配层已复用主策略参数，但指标实现仍基于 TA-Lib / pandas")
-        print("  - informative K线对齐方式与自研回测器可能仍有细微差异")
-        print("  - 这份对比更适合做架构一致性检查，不适合作为收益等价证明")
+        print("  - 当前对比的是“原始入场信号”，不是实际成交次数")
+        print("  - 剩余差异通常来自高周期合并口径或实现层细节，而不是仓位管理")
+        print("  - 这份对比更适合做信号一致性检查，不适合作为收益等价证明")
 
 
 def main():
@@ -136,6 +227,10 @@ def main():
     print(f"  交易: {custom_result['trades']}")
     print(f"  胜率: {custom_result['win_rate']:.1f}%")
     print(f"  手续费: {custom_result['fee_drag_pct']:.2f}%")
+    core_signal_result = run_core_signal_check()
+    print(f"  原始做多信号: {core_signal_result['long_signals']}")
+    print(f"  原始做空信号: {core_signal_result['short_signals']}")
+    print(f"  原始总信号:   {core_signal_result['total_signals']}")
 
     # freqtrade 适配层信号检查
     print("\n[2/2] 运行 freqtrade 适配层信号检查...")
@@ -146,13 +241,13 @@ def main():
         print(f"  总信号:   {ft_result['total_signals']}")
 
     # 对比
-    compare_signals(custom_result, ft_result)
+    compare_signals(core_signal_result, ft_result)
 
     print("\n" + "=" * 60)
     print("结论")
     print("=" * 60)
     if ft_result:
-        custom_total = sum(s.get("entries", 0) for s in custom_result["signal_stats"].values())
+        custom_total = core_signal_result["total_signals"]
         ft_total = ft_result["total_signals"]
         if max(custom_total, ft_total) > 0:
             ratio = min(custom_total, ft_total) / max(custom_total, ft_total) * 100
