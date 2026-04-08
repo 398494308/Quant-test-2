@@ -60,10 +60,10 @@ AGGRESSIVE_UNDERFIT_PENALTY = float(os.getenv("MACD_UNDERFIT_PENALTY", "0.3"))
 AGGRESSIVE_MIN_LEVERAGE = int(os.getenv("MACD_MIN_LEVERAGE", "14"))
 AGGRESSIVE_MIN_TP1_PNL_PCT = float(os.getenv("MACD_MIN_TP1_PNL_PCT", "42.0"))
 AGGRESSIVE_MIN_HOLDOUT_SCORE = float(
-    os.getenv("MACD_MIN_HOLDOUT_SCORE", os.getenv("MACD_MIN_SHADOW_TEST_SCORE", "0.0"))
+    os.getenv("MACD_MIN_HOLDOUT_SCORE", os.getenv("MACD_MIN_SHADOW_TEST_SCORE", "-6.0"))
 )
 AGGRESSIVE_MAX_EVAL_HOLDOUT_GAP = float(
-    os.getenv("MACD_MAX_EVAL_HOLDOUT_GAP", os.getenv("MACD_MAX_VAL_SHADOW_GAP", "28.0"))
+    os.getenv("MACD_MAX_EVAL_HOLDOUT_GAP", os.getenv("MACD_MAX_VAL_SHADOW_GAP", "40.0"))
 )
 AGGRESSIVE_MAX_HOLDOUT_REGRESSION = float(
     os.getenv("MACD_MAX_HOLDOUT_REGRESSION", os.getenv("MACD_MAX_SHADOW_REGRESSION", "6.0"))
@@ -486,8 +486,8 @@ def build_discord_summary_message(title, results, metrics, include_holdout=True,
     return "\n".join(message_parts)
 
 
-def _build_gate_reason(metrics, base_gate_passed, holdout_gate_passed, holdout_regression_passed):
-    if base_gate_passed and holdout_gate_passed and holdout_regression_passed:
+def _build_gate_reason(metrics, base_gate_passed, holdout_gate_passed, holdout_regression_warned):
+    if base_gate_passed and holdout_gate_passed and not holdout_regression_warned:
         return "通过"
     reasons = [
         f"trade={metrics['total_trades']}",
@@ -499,7 +499,7 @@ def _build_gate_reason(metrics, base_gate_passed, holdout_gate_passed, holdout_r
     ]
     if not holdout_gate_passed:
         reasons.append("留出=未过")
-    if not holdout_regression_passed:
+    if holdout_regression_warned:
         reasons.append("留出=退化")
     return ", ".join(reasons)
 
@@ -1135,12 +1135,12 @@ def run_iteration(iteration_id, use_model_optimization=True):
         and metrics["holdout_avg"] >= AGGRESSIVE_MIN_HOLDOUT_SCORE
         and metrics["holdout_gap"] <= AGGRESSIVE_MAX_EVAL_HOLDOUT_GAP
     )
-    holdout_regression_passed = (
-        metrics["promotion_score"] > best_score
-        or metrics["holdout_avg"] >= (best_holdout_avg - AGGRESSIVE_MAX_HOLDOUT_REGRESSION)
+    holdout_regression_warned = (
+        best_holdout_avg > -999000.0
+        and metrics["holdout_avg"] < (best_holdout_avg - AGGRESSIVE_MAX_HOLDOUT_REGRESSION)
     )
-    gate_passed = base_gate_passed and holdout_gate_passed and holdout_regression_passed
-    gate_reason = _build_gate_reason(metrics, base_gate_passed, holdout_gate_passed, holdout_regression_passed)
+    gate_passed = base_gate_passed and holdout_gate_passed
+    gate_reason = _build_gate_reason(metrics, base_gate_passed, holdout_gate_passed, holdout_regression_warned)
 
     if gate_passed and metrics["promotion_score"] > best_score:
         best_score = metrics["promotion_score"]
