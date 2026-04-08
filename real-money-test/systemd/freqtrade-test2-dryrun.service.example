@@ -1,0 +1,20 @@
+[Unit]
+Description=Freqtrade Test2 Dry Run
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/quant/test2
+ExecStart=/home/ubuntu/quant/test2/real-money-test/start_dry_run.sh
+ExecStop=/bin/kill -s SIGINT $MAINPID
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=120
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

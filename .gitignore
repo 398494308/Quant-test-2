@@ -10,3 +10,5 @@ reports/*.csv
 dist/
 .git/
 .venv/
+real-money-test/runtime/
+real-money-test/user_data/

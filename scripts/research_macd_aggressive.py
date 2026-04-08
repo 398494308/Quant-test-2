@@ -59,14 +59,22 @@ AGGRESSIVE_MAX_UNDERFIT_GAP = float(os.getenv("MACD_MAX_UNDERFIT_GAP", "20.0"))
 AGGRESSIVE_UNDERFIT_PENALTY = float(os.getenv("MACD_UNDERFIT_PENALTY", "0.3"))
 AGGRESSIVE_MIN_LEVERAGE = int(os.getenv("MACD_MIN_LEVERAGE", "14"))
 AGGRESSIVE_MIN_TP1_PNL_PCT = float(os.getenv("MACD_MIN_TP1_PNL_PCT", "42.0"))
-AGGRESSIVE_MIN_SHADOW_TEST_SCORE = float(os.getenv("MACD_MIN_SHADOW_TEST_SCORE", "0.0"))
-AGGRESSIVE_MAX_VAL_SHADOW_GAP = float(os.getenv("MACD_MAX_VAL_SHADOW_GAP", "28.0"))
-AGGRESSIVE_MAX_SHADOW_REGRESSION = float(os.getenv("MACD_MAX_SHADOW_REGRESSION", "6.0"))
-AGGRESSIVE_MIN_SHADOW_TEST_TRADES = int(os.getenv("MACD_MIN_SHADOW_TEST_TRADES", "8"))
+AGGRESSIVE_MIN_HOLDOUT_SCORE = float(
+    os.getenv("MACD_MIN_HOLDOUT_SCORE", os.getenv("MACD_MIN_SHADOW_TEST_SCORE", "0.0"))
+)
+AGGRESSIVE_MAX_EVAL_HOLDOUT_GAP = float(
+    os.getenv("MACD_MAX_EVAL_HOLDOUT_GAP", os.getenv("MACD_MAX_VAL_SHADOW_GAP", "28.0"))
+)
+AGGRESSIVE_MAX_HOLDOUT_REGRESSION = float(
+    os.getenv("MACD_MAX_HOLDOUT_REGRESSION", os.getenv("MACD_MAX_SHADOW_REGRESSION", "6.0"))
+)
+AGGRESSIVE_MIN_HOLDOUT_TRADES = int(
+    os.getenv("MACD_MIN_HOLDOUT_TRADES", os.getenv("MACD_MIN_SHADOW_TEST_TRADES", "8"))
+)
 EVAL_START_DATE = os.getenv("MACD_EVAL_START_DATE", "2025-09-01")
 EVAL_END_DATE = os.getenv("MACD_EVAL_END_DATE", "2026-03-31")
 EVAL_CHUNK_DAYS = int(os.getenv("MACD_EVAL_CHUNK_DAYS", "28"))
-SHADOW_CHUNK_COUNT = int(os.getenv("MACD_SHADOW_CHUNK_COUNT", "2"))
+HOLDOUT_CHUNK_COUNT = int(os.getenv("MACD_HOLDOUT_CHUNK_COUNT", os.getenv("MACD_SHADOW_CHUNK_COUNT", "2")))
 CORE_STRATEGY_PARAM_KEYS = (
     "hourly_adx_min",
     "breakout_adx_min",
@@ -112,7 +120,7 @@ HOURLY_FILE = str(BASE_DIR / "data/price/BTCUSDT_futures_1h_20240601_20260401.cs
 
 
 def _generate_windows():
-    """将评估区间切成尽量等长的窗口，并保持 shadow 窗口长度一致。"""
+    """将评估区间切成尽量等长的窗口，并保持 holdout 窗口长度一致。"""
     start_dt = datetime.strptime(EVAL_START_DATE, "%Y-%m-%d")
     end_dt = datetime.strptime(EVAL_END_DATE, "%Y-%m-%d")
     total_days = (end_dt - start_dt).days + 1
@@ -126,7 +134,7 @@ def _generate_windows():
         chunk_lengths = [total_days]
     else:
         chunk_lengths = [EVAL_CHUNK_DAYS] * full_chunks
-        eval_capacity = max(0, full_chunks - SHADOW_CHUNK_COUNT)
+        eval_capacity = max(0, full_chunks - HOLDOUT_CHUNK_COUNT)
         if remainder > 0:
             if eval_capacity >= 3:
                 for idx in range(remainder):
@@ -134,9 +142,9 @@ def _generate_windows():
             else:
                 chunk_lengths.append(remainder)
 
-    if len(chunk_lengths) < SHADOW_CHUNK_COUNT + 3:
+    if len(chunk_lengths) < HOLDOUT_CHUNK_COUNT + 3:
         raise ValueError(
-            f"not enough chunks: have={len(chunk_lengths)}, need>={SHADOW_CHUNK_COUNT + 3}"
+            f"not enough chunks: have={len(chunk_lengths)}, need>={HOLDOUT_CHUNK_COUNT + 3}"
         )
 
     boundaries = []
@@ -146,15 +154,15 @@ def _generate_windows():
         boundaries.append((cursor, chunk_end))
         cursor = chunk_end + timedelta(days=1)
 
-    eval_count = len(chunk_lengths) - SHADOW_CHUNK_COUNT
+    eval_count = len(chunk_lengths) - HOLDOUT_CHUNK_COUNT
     windows = []
     for idx, (chunk_start, chunk_end) in enumerate(boundaries):
         if idx < eval_count:
             group = "eval"
             label = f"窗口{idx + 1}"
         else:
-            group = "shadow"
-            label = f"影测{idx - eval_count + 1}"
+            group = "holdout"
+            label = f"留出{idx - eval_count + 1}"
         windows.append(
             (
                 group,
@@ -168,7 +176,7 @@ def _generate_windows():
 
 WINDOWS = _generate_windows()
 best_score = -999999.0
-best_shadow_test_avg = -999999.0
+best_holdout_avg = -999999.0
 iteration = 0
 plateau_pass_streak = 0
 strategy = strategy_module.strategy
@@ -287,17 +295,17 @@ def run_all_tests():
 
 def _score_summary(results):
     eval_returns = [item["result"]["return"] for item in results if item["group"] == "eval"]
-    shadow_returns = [item["result"]["return"] for item in results if item["group"] == "shadow"]
+    holdout_returns = [item["result"]["return"] for item in results if item["group"] == "holdout"]
     eval_avg = sum(eval_returns) / len(eval_returns) if eval_returns else 0.0
-    shadow_avg = sum(shadow_returns) / len(shadow_returns) if shadow_returns else 0.0
+    holdout_avg = sum(holdout_returns) / len(holdout_returns) if holdout_returns else 0.0
     eval_std = (
         sum((r - eval_avg) ** 2 for r in eval_returns) / len(eval_returns)
     ) ** 0.5 if len(eval_returns) > 1 else 0.0
-    shadow_std = (
-        sum((r - shadow_avg) ** 2 for r in shadow_returns) / len(shadow_returns)
-    ) ** 0.5 if len(shadow_returns) > 1 else 0.0
+    holdout_std = (
+        sum((r - holdout_avg) ** 2 for r in holdout_returns) / len(holdout_returns)
+    ) ** 0.5 if len(holdout_returns) > 1 else 0.0
     worst_eval_return = min(eval_returns) if eval_returns else 0.0
-    worst_shadow_return = min(shadow_returns) if shadow_returns else 0.0
+    worst_holdout_return = min(holdout_returns) if holdout_returns else 0.0
     worst_tail_count = min(3, len(eval_returns)) if eval_returns else 0
     worst_eval_cluster_avg = (
         sum(sorted(eval_returns)[:worst_tail_count]) / worst_tail_count if worst_tail_count else 0.0
@@ -312,7 +320,7 @@ def _score_summary(results):
     liquidations = sum(item["result"].get("liquidations", 0) for item in results)
     total_trades = sum(item["result"]["trades"] for item in results)
     eval_trades = sum(item["result"]["trades"] for item in results if item["group"] == "eval")
-    shadow_trades = sum(item["result"]["trades"] for item in results if item["group"] == "shadow")
+    holdout_trades = sum(item["result"]["trades"] for item in results if item["group"] == "holdout")
 
     consistency_penalty = eval_std * 0.15
     tail_penalty = max(0.0, -worst_eval_return - 15.0) * 0.12
@@ -330,22 +338,22 @@ def _score_summary(results):
         - drawdown_penalty
         - liquidation_penalty
     )
-    shadow_gap = eval_avg - shadow_avg
-    promotion_score = selection_score - max(0.0, shadow_gap) * 0.15 - max(0.0, -shadow_avg) * 0.10
+    holdout_gap = eval_avg - holdout_avg
+    promotion_score = selection_score - max(0.0, holdout_gap) * 0.15 - max(0.0, -holdout_avg) * 0.10
     return {
         "eval_avg": eval_avg,
-        "shadow_avg": shadow_avg,
+        "holdout_avg": holdout_avg,
         "eval_std": eval_std,
-        "shadow_std": shadow_std,
+        "holdout_std": holdout_std,
         "worst_eval_return": worst_eval_return,
         "worst_eval_cluster_avg": worst_eval_cluster_avg,
-        "worst_shadow_return": worst_shadow_return,
+        "worst_holdout_return": worst_holdout_return,
         "worst_drawdown": worst_drawdown,
         "avg_fee_drag": avg_fee_drag,
         "liquidations": liquidations,
         "total_trades": total_trades,
         "eval_trades": eval_trades,
-        "shadow_trades": shadow_trades,
+        "holdout_trades": holdout_trades,
         "eval_loss_blocks": eval_loss_blocks,
         "eval_loss_ratio": eval_loss_ratio,
         "positive_ratio": positive_ratio,
@@ -355,11 +363,11 @@ def _score_summary(results):
         "loss_ratio_penalty": loss_ratio_penalty,
         "selection_score": selection_score,
         "promotion_score": promotion_score,
-        "shadow_gap": shadow_gap,
+        "holdout_gap": holdout_gap,
     }
 
 
-def build_summary_message(title, results, metrics, include_shadow_test=True):
+def build_summary_message(title, results, metrics, include_holdout=True):
     total_trades = metrics["total_trades"]
     worst_drawdown = metrics["worst_drawdown"]
     pyramid_adds = sum(item["result"].get("pyramid_add_count", 0) for item in results)
@@ -373,15 +381,15 @@ def build_summary_message(title, results, metrics, include_shadow_test=True):
         f"正收益占比: {metrics['positive_ratio']:.0%}",
         f"选优分: {metrics['selection_score']:.2f}",
     ]
-    if include_shadow_test:
+    if include_holdout:
         lines.extend(
             [
-            f"影子测试: {metrics['shadow_avg']:.2f}%",
+            f"留出测试: {metrics['holdout_avg']:.2f}%",
             f"晋级分: {metrics['promotion_score']:.2f}",
             ]
         )
     else:
-        lines.append("影子测试: 已隔离")
+        lines.append("留出测试: 已隔离")
     lines.extend(
         [
             f"",
@@ -395,8 +403,8 @@ def build_summary_message(title, results, metrics, include_shadow_test=True):
             f"一致性(std): {metrics['eval_std']:.1f}",
         ]
     )
-    if include_shadow_test:
-        lines.append(f"影测差值(评估-影测): {metrics['shadow_gap']:.2f}")
+    if include_holdout:
+        lines.append(f"留出差值(评估-留出): {metrics['holdout_gap']:.2f}")
     lines.extend(
         [
             f"加仓次数: {pyramid_adds}",
@@ -406,10 +414,10 @@ def build_summary_message(title, results, metrics, include_shadow_test=True):
         ]
     )
     for item in results:
-        if item["group"] == "shadow" and not include_shadow_test:
+        if item["group"] == "holdout" and not include_holdout:
             continue
         result = item["result"]
-        group_label = {"eval": "评", "shadow": "影"}.get(item["group"], item["group"])
+        group_label = {"eval": "评", "holdout": "留"}.get(item["group"], item["group"])
         lines.append(
             f"{item['name']}({group_label})"
         )
@@ -443,22 +451,22 @@ def _format_discord_changes(changes, limit=4):
     return "变动: " + "；".join(preview)
 
 
-def build_discord_summary_message(title, results, metrics, include_shadow_test=True, changes=None):
+def build_discord_summary_message(title, results, metrics, include_holdout=True, changes=None):
     eval_count = sum(1 for item in results if item["group"] == "eval")
-    shadow_count = sum(1 for item in results if item["group"] == "shadow")
+    holdout_count = sum(1 for item in results if item["group"] == "holdout")
     leverage = backtest_module.EXIT_PARAMS.get("leverage", 0)
     position_fraction = backtest_module.EXIT_PARAMS.get("position_fraction", 0.0)
     rows = [
-        ("窗口", f"{eval_count}评估" + (f" / {shadow_count}影测" if include_shadow_test else "")),
+        ("窗口", f"{eval_count}评估" + (f" / {holdout_count}留出" if include_holdout else "")),
         (
             "收益",
             f"{metrics['eval_avg']:.2f}%"
-            + (f" / {metrics['shadow_avg']:.2f}%" if include_shadow_test else ""),
+            + (f" / {metrics['holdout_avg']:.2f}%" if include_holdout else ""),
         ),
         (
             "评分",
             f"{metrics['selection_score']:.2f}"
-            + (f" / {metrics['promotion_score']:.2f}" if include_shadow_test else ""),
+            + (f" / {metrics['promotion_score']:.2f}" if include_holdout else ""),
         ),
         ("最大回撤", f"{metrics['worst_drawdown']:.1f}%"),
         ("正收益窗", f"{metrics['positive_ratio']:.0%}"),
@@ -478,8 +486,8 @@ def build_discord_summary_message(title, results, metrics, include_shadow_test=T
     return "\n".join(message_parts)
 
 
-def _build_gate_reason(metrics, base_gate_passed, shadow_gate_passed, shadow_regression_passed):
-    if base_gate_passed and shadow_gate_passed and shadow_regression_passed:
+def _build_gate_reason(metrics, base_gate_passed, holdout_gate_passed, holdout_regression_passed):
+    if base_gate_passed and holdout_gate_passed and holdout_regression_passed:
         return "通过"
     reasons = [
         f"trade={metrics['total_trades']}",
@@ -489,10 +497,10 @@ def _build_gate_reason(metrics, base_gate_passed, shadow_gate_passed, shadow_reg
         f"正比={metrics['positive_ratio']:.0%}",
         f"杠杆={backtest_module.EXIT_PARAMS.get('leverage', 0)}",
     ]
-    if not shadow_gate_passed:
-        reasons.append("影测=未过")
-    if not shadow_regression_passed:
-        reasons.append("影测=退化")
+    if not holdout_gate_passed:
+        reasons.append("留出=未过")
+    if not holdout_regression_passed:
+        reasons.append("留出=退化")
     return ", ".join(reasons)
 
 
@@ -887,7 +895,7 @@ def optimize_strategy():
   - trailing_profit: breakout_trailing_activation_pct / breakout_trailing_giveback_pct
 - 默认先做高质量小步试探，优先 2-3 个键的成组联动，不要把参数分散乱改。
 - 非增强模式不要同时横跨多个参数组；增强模式也只允许两组以内的协调调整。
-- 当前系统使用 Walk-Forward 评估：近期区间按多个28天窗口切分，每个窗口独立回测，评分基于所有窗口的综合表现。
+- 当前系统使用 Walk-Forward 评估：近期区间按多个 {EVAL_CHUNK_DAYS} 天窗口切分，每个窗口独立回测，评分基于全部评估窗口的综合表现，最后 {HOLDOUT_CHUNK_COUNT} 个窗口只做留出门禁。
 - 系统会惩罚收益不一致（标准差高）和极端亏损窗口。
 - 正收益窗口占比需 >= 35%。
 - 允许在同一方向上尝试不同幅度，只避免完全相同的重复候选。
@@ -1006,14 +1014,14 @@ def _append_memory(bucket, changes, overall, gate):
 
 
 def initialize_best_score():
-    global best_score, best_shadow_test_avg, latest_eval_summary, latest_public_eval_summary, last_params_snapshot, last_exit_snapshot
+    global best_score, best_holdout_avg, latest_eval_summary, latest_public_eval_summary, last_params_snapshot, last_exit_snapshot
     reload_strategy()
     results = run_all_tests()
     metrics = _score_summary(results)
     best_score = metrics["promotion_score"]
-    best_shadow_test_avg = metrics["shadow_avg"]
-    latest_eval_summary = build_summary_message("基准", results, metrics, include_shadow_test=True)
-    latest_public_eval_summary = build_summary_message("基准", results, metrics, include_shadow_test=False)
+    best_holdout_avg = metrics["holdout_avg"]
+    latest_eval_summary = build_summary_message("基准", results, metrics, include_holdout=True)
+    latest_public_eval_summary = build_summary_message("基准", results, metrics, include_holdout=False)
     last_params_snapshot = dict(strategy_module.PARAMS)
     last_exit_snapshot = dict(backtest_module.EXIT_PARAMS)
     log_info(
@@ -1021,7 +1029,7 @@ def initialize_best_score():
         f"promotion={metrics['promotion_score']:.4f}, "
         f"selection={metrics['selection_score']:.4f}, "
         f"eval={metrics['eval_avg']:.4f}, "
-        f"shadow={metrics['shadow_avg']:.4f}, "
+        f"holdout={metrics['holdout_avg']:.4f}, "
         f"fee_drag={metrics['avg_fee_drag']:.4f}"
     )
     heartbeat_for_log(
@@ -1030,14 +1038,14 @@ def initialize_best_score():
         promotion=metrics["promotion_score"],
         selection=metrics["selection_score"],
         eval_avg=metrics["eval_avg"],
-        shadow=metrics["shadow_avg"],
+        holdout=metrics["holdout_avg"],
         fee_drag=metrics["avg_fee_drag"],
     )
-    send_discord(build_discord_summary_message("基准", results, metrics, include_shadow_test=True))
+    send_discord(build_discord_summary_message("基准", results, metrics, include_holdout=True))
 
 
 def run_iteration(iteration_id, use_model_optimization=True):
-    global best_score, best_shadow_test_avg, latest_eval_summary, latest_public_eval_summary, last_params_snapshot, last_exit_snapshot, plateau_pass_streak
+    global best_score, best_holdout_avg, latest_eval_summary, latest_public_eval_summary, last_params_snapshot, last_exit_snapshot, plateau_pass_streak
     shutil.copy(STRATEGY_FILE, BACKUP_FILE)
     shutil.copy(BACKTEST_FILE, BACKTEST_BACKUP_FILE)
 
@@ -1075,8 +1083,8 @@ def run_iteration(iteration_id, use_model_optimization=True):
         log_exception(f"❌ 激进版第 {iteration_id} 轮失败: {exc}")
         raise
 
-    latest_eval_summary = build_summary_message("最近一轮", results, metrics, include_shadow_test=True)
-    latest_public_eval_summary = build_summary_message("最近一轮", results, metrics, include_shadow_test=False)
+    latest_eval_summary = build_summary_message("最近一轮", results, metrics, include_holdout=True)
+    latest_public_eval_summary = build_summary_message("最近一轮", results, metrics, include_holdout=False)
     current_params_snapshot = dict(strategy_module.PARAMS)
     current_exit_snapshot = dict(backtest_module.EXIT_PARAMS)
     changes = _describe_param_changes(
@@ -1122,33 +1130,33 @@ def run_iteration(iteration_id, use_model_optimization=True):
         and metrics["positive_ratio"] >= 0.35
         and backtest_module.EXIT_PARAMS.get('leverage', 0) >= AGGRESSIVE_MIN_LEVERAGE
     )
-    shadow_gate_passed = (
-        metrics["shadow_trades"] >= AGGRESSIVE_MIN_SHADOW_TEST_TRADES
-        and metrics["shadow_avg"] >= AGGRESSIVE_MIN_SHADOW_TEST_SCORE
-        and metrics["shadow_gap"] <= AGGRESSIVE_MAX_VAL_SHADOW_GAP
+    holdout_gate_passed = (
+        metrics["holdout_trades"] >= AGGRESSIVE_MIN_HOLDOUT_TRADES
+        and metrics["holdout_avg"] >= AGGRESSIVE_MIN_HOLDOUT_SCORE
+        and metrics["holdout_gap"] <= AGGRESSIVE_MAX_EVAL_HOLDOUT_GAP
     )
-    shadow_regression_passed = (
+    holdout_regression_passed = (
         metrics["promotion_score"] > best_score
-        or metrics["shadow_avg"] >= (best_shadow_test_avg - AGGRESSIVE_MAX_SHADOW_REGRESSION)
+        or metrics["holdout_avg"] >= (best_holdout_avg - AGGRESSIVE_MAX_HOLDOUT_REGRESSION)
     )
-    gate_passed = base_gate_passed and shadow_gate_passed and shadow_regression_passed
-    gate_reason = _build_gate_reason(metrics, base_gate_passed, shadow_gate_passed, shadow_regression_passed)
+    gate_passed = base_gate_passed and holdout_gate_passed and holdout_regression_passed
+    gate_reason = _build_gate_reason(metrics, base_gate_passed, holdout_gate_passed, holdout_regression_passed)
 
     if gate_passed and metrics["promotion_score"] > best_score:
         best_score = metrics["promotion_score"]
-        best_shadow_test_avg = metrics["shadow_avg"]
+        best_holdout_avg = metrics["holdout_avg"]
         plateau_pass_streak = 0
         last_params_snapshot = current_params_snapshot
         last_exit_snapshot = current_exit_snapshot
         _append_memory("accepted", changes, metrics["promotion_score"], gate_reason)
-        msg = build_summary_message(f"🚀 新最优激进版策略 #{iteration_id}", results, metrics, include_shadow_test=True)
+        msg = build_summary_message(f"🚀 新最优激进版策略 #{iteration_id}", results, metrics, include_holdout=True)
         log_info(msg)
         heartbeat_for_log(
             "new_best",
             f"iteration {iteration_id} accepted",
             promotion=metrics["promotion_score"],
             selection=metrics["selection_score"],
-            shadow=metrics["shadow_avg"],
+            holdout=metrics["holdout_avg"],
             gate=gate_reason,
         )
         send_discord(
@@ -1156,7 +1164,7 @@ def run_iteration(iteration_id, use_model_optimization=True):
                 f"🚀 新最优激进版策略 #{iteration_id}",
                 results,
                 metrics,
-                include_shadow_test=True,
+                include_holdout=True,
                 changes=changes,
             )
         )
@@ -1173,7 +1181,7 @@ def run_iteration(iteration_id, use_model_optimization=True):
         f"iteration {iteration_id} rejected",
         promotion=metrics["promotion_score"],
         selection=metrics["selection_score"],
-        shadow=metrics["shadow_avg"],
+        holdout=metrics["holdout_avg"],
         gate=gate_reason,
     )
     return "rejected"

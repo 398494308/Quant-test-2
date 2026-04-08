@@ -12,12 +12,12 @@ SIDEWAYS_MAX_HOURLY_ADX = 18.0
 SIDEWAYS_MAX_FOURH_ADX = 16.0
 
 # PARAMS_START
-PARAMS = {'breakdown_adx_min': 24.3,
+PARAMS = {'breakdown_adx_min': 25.6,
  'breakdown_body_ratio_min': 0.39,
  'breakdown_buffer_pct': 0.0002,
  'breakdown_close_pos_max': 0.36,
  'breakdown_hist_max': 16.0,
- 'breakdown_lookback': 23,
+ 'breakdown_lookback': 22,
  'breakdown_rsi_max': 42.0,
  'breakdown_rsi_min': 21.0,
  'breakdown_volume_ratio_min': 1.08,
@@ -27,7 +27,7 @@ PARAMS = {'breakdown_adx_min': 24.3,
  'breakout_close_pos_min': 0.48,
  'breakout_hist_min': -95.0,
  'breakout_lookback': 20,
- 'breakout_rsi_max': 80.8,
+ 'breakout_rsi_max': 81.6,
  'breakout_rsi_min': 44.0,
  'breakout_volume_ratio_min': 1.12,
  'fourh_adx_min': 12.5,
