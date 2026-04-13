@@ -13,8 +13,8 @@ DATA_DIR = REPO_ROOT / "data/price"
 FUNDING_DIR = REPO_ROOT / "data/funding"
 API_URL = "https://fapi.binance.com/fapi/v1/klines"
 OKX_FUNDING_API_URL = "https://www.okx.com/api/v5/public/funding-rate-history"
-LOCAL_FORWARD_15M = REPO_ROOT.parent / "test1/data/price/BTCUSDT_futures_15m_20250601_20260401.csv"
-LOCAL_FORWARD_1H = REPO_ROOT.parent / "test1/data/price/BTCUSDT_futures_1h_20250601_20260401.csv"
+LOCAL_FORWARD_15M = REPO_ROOT / "data/price/BTCUSDT_futures_15m_20250601_20260401.csv"
+LOCAL_FORWARD_1H = REPO_ROOT / "data/price/BTCUSDT_futures_1h_20250601_20260401.csv"
 DATA_END_STR = "2026-04-01"
 
 

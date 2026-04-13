@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+config/secrets.env
 logs/*.log
 logs/*.out
 backups/*.py

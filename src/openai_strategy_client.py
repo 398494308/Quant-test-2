@@ -14,8 +14,8 @@ import requests
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ENV_FILES = (
+    REPO_ROOT / "config/secrets.env",
     REPO_ROOT / "config/research.env",
-    REPO_ROOT.parent / "test1/freqtrade.service.env",
 )
 
 DEFAULT_RESPONSES_URL = "https://api.openai.com/v1/responses"

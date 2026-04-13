@@ -11,11 +11,16 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 SRC_DIR = REPO_ROOT / "src"
 TEST1_DIR = REPO_ROOT.parent / "test1"
-sys.path.insert(0, str(TEST1_DIR))
+if TEST1_DIR.exists():
+    sys.path.insert(0, str(TEST1_DIR))
 sys.path.insert(0, str(SRC_DIR))
 
-import backtest_macd as conservative_backtest  # noqa: E402
-import strategy_macd as conservative_strategy  # noqa: E402
+try:
+    import backtest_macd as conservative_backtest  # noqa: E402
+    import strategy_macd as conservative_strategy  # noqa: E402
+    HAS_CONSERVATIVE = True
+except ImportError:
+    HAS_CONSERVATIVE = False
 from backtest_macd_aggressive import backtest_macd_aggressive  # noqa: E402
 import backtest_macd_aggressive as aggressive_backtest  # noqa: E402
 import strategy_macd_aggressive as aggressive_strategy  # noqa: E402

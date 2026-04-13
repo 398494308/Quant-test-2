@@ -10,6 +10,7 @@ from pathlib import Path
 # ==================== 环境加载 ====================
 
 ENV_FILES = (
+    "config/secrets.env",
     "config/research_v2.env",
     "config/research.env",
 )

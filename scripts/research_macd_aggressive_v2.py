@@ -30,7 +30,7 @@ import strategy_macd_aggressive as strategy_module
 from openai_strategy_client import StrategyGenerationTransientError, build_json_text_format, generate_json_object
 from research_v2.config import ResearchRuntimeConfig, StressScenario, load_research_runtime_config
 from research_v2.evaluation import EvaluationReport, summarize_evaluation
-from research_v2.journal import append_journal_entry, build_journal_prompt_summary, has_recent_code_hash, load_journal_entries
+from research_v2.journal import append_journal_entry, build_journal_prompt_summary, has_recent_code_hash, load_journal_entries, maybe_compact
 from research_v2.prompting import build_candidate_response_schema, build_strategy_research_prompt
 from research_v2.strategy_code import (
     StrategyCandidate,
@@ -231,7 +231,7 @@ def _build_model_candidate(base_source: str, journal_entries: list[dict[str, Any
     prompt = build_strategy_research_prompt(
         strategy_source=base_source,
         evaluation_summary=report.prompt_summary_text,
-        journal_summary=build_journal_prompt_summary(journal_entries, limit=RUNTIME.max_recent_journal_entries),
+        journal_summary=build_journal_prompt_summary(journal_entries, limit=RUNTIME.max_recent_journal_entries, journal_path=RUNTIME.paths.journal_file),
         previous_best_score=report.metrics["promotion_score"],
     )
     payload = generate_json_object(
@@ -443,6 +443,8 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
         best_report = candidate_report
         _persist_best_state(best_source, best_report)
         append_journal_entry(RUNTIME.paths.journal_file, entry_base)
+        if maybe_compact(RUNTIME.paths.journal_file):
+            log_info("研究日志已压缩")
         log_info(
             f"🚀 第 {iteration_id} 轮产生新最优: "
             f"quality={best_report.metrics['quality_score']:.2f}, "
@@ -459,6 +461,8 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
         return "accepted"
 
     append_journal_entry(RUNTIME.paths.journal_file, entry_base)
+    if maybe_compact(RUNTIME.paths.journal_file):
+        log_info("研究日志已压缩")
     write_strategy_source(RUNTIME.paths.strategy_file, best_source)
     reload_strategy_module()
     log_info(
