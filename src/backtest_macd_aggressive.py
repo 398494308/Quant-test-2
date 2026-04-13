@@ -147,6 +147,10 @@ def _beijing_dt(timestamp_ms):
     return datetime.fromtimestamp(timestamp_ms / 1000, UTC) + timedelta(hours=8)
 
 
+def _beijing_day_label(timestamp_ms):
+    return _beijing_dt(timestamp_ms).strftime("%Y-%m-%d")
+
+
 def _beijing_timestamp_ms(date_str):
     dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=UTC) - timedelta(hours=8)
     return int(dt.timestamp() * 1000)
@@ -610,6 +614,34 @@ def _apply_funding(position, funding_rate, settlement_price, leverage):
     return funding_pnl
 
 
+def _append_daily_equity_point(points, timestamp_ms, equity):
+    day = _beijing_day_label(timestamp_ms)
+    payload = {"date": day, "timestamp": timestamp_ms, "equity": round(equity, 8)}
+    if points and points[-1]["date"] == day:
+        points[-1] = payload
+    else:
+        points.append(payload)
+
+
+def _daily_returns_from_equity_curve(daily_equity_curve):
+    returns = []
+    for idx in range(1, len(daily_equity_curve)):
+        prev_equity = daily_equity_curve[idx - 1]["equity"]
+        current_equity = daily_equity_curve[idx]["equity"]
+        if prev_equity <= 1e-9:
+            continue
+        returns.append((current_equity - prev_equity) / prev_equity)
+    return returns
+
+
+def _trade_reason_stats(trades):
+    counts = {}
+    for trade in trades:
+        reason = trade.get("reason", "")
+        counts[reason] = counts.get(reason, 0) + 1
+    return counts
+
+
 def backtest_macd_aggressive(
     strategy_func,
     intraday_file,
@@ -621,6 +653,7 @@ def backtest_macd_aggressive(
     sentiment_file=None,
     execution_file=None,
     funding_file=None,
+    include_diagnostics=False,
 ):
     exit_p = dict(EXIT_PARAMS)
     if exit_params:
@@ -712,6 +745,7 @@ def backtest_macd_aggressive(
     total_funding_pnl = 0.0
     funding_event_count = 0
     funding_idx = 0
+    daily_equity_curve = []
     delay_minutes = int(exit_p.get("entry_delay_minutes", 1))
     taker_fee_rate = float(exit_p["okx_taker_fee_rate"]) if int(exit_p.get("trading_fee_enabled", 1)) > 0 else 0.0
     slippage_pct = float(exit_p.get("slippage_pct", 0.0003))
@@ -1060,6 +1094,7 @@ def backtest_macd_aggressive(
             + position.get("funding_pnl", 0.0)
             for position in positions
         )
+        _append_daily_equity_point(daily_equity_curve, bar_close_ts, equity)
         max_equity = max(max_equity, equity)
         if max_equity > 0:
             max_drawdown = max(max_drawdown, (max_equity - equity) / max_equity * 100.0)
@@ -1090,6 +1125,7 @@ def backtest_macd_aggressive(
         total_trading_fees += exit_fee
         record_trade(trade)
 
+    _append_daily_equity_point(daily_equity_curve, end_ts, capital)
     total_return = (capital - initial_capital) / initial_capital * 100.0
     fee_drag_pct = total_trading_fees / initial_capital * 100.0
     fee_penalty = fee_drag_pct * 0.35
@@ -1104,7 +1140,7 @@ def backtest_macd_aggressive(
             "win_rate": (signal_closed_wins.get(signal, 0) / closed_trades * 100.0 if closed_trades else 0.0),
         }
 
-    return {
+    result = {
         "trades": len(trades),
         "return": total_return,
         "max_drawdown": max_drawdown,
@@ -1127,3 +1163,9 @@ def backtest_macd_aggressive(
         "pyramid_add_count": pyramid_add_count,
         "signal_stats": signal_stats,
     }
+    if include_diagnostics:
+        result["daily_equity_curve"] = daily_equity_curve
+        result["daily_returns"] = _daily_returns_from_equity_curve(daily_equity_curve)
+        result["trade_reason_stats"] = _trade_reason_stats(trades)
+        result["trades_detail"] = trades
+    return result

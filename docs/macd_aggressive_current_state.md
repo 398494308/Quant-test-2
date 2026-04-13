@@ -1,135 +1,99 @@
-# 激进版 MACD 当前设定
+# 激进版 MACD 当前状态
 
-## 定位
+本文档只记录当前代码和当前状态文件真正对应的版本，不沿用旧说明。
 
-- 面向高风险、高回报场景
-- 目标是提升趋势段收益弹性，而不是做平滑曲线
-- 接受较高回撤，但研究循环会限制极端坏解进入最优基底
+## 当前定位
 
-## 信号结构
+- 目标: 找到一版能在趋势段吃到弹性、但不会在留出和压力测试里立刻崩掉的激进趋势策略
+- 当前主线: `v2` 研究器
+- 当前默认策略文件: [src/strategy_macd_aggressive.py](../src/strategy_macd_aggressive.py)
+- 当前默认回测器: [src/backtest_macd_aggressive.py](../src/backtest_macd_aggressive.py)
 
-当前有效信号：
+## 当前信号结构
 
-- `long_breakout` — 三周期共振 + 突破前高
-- `short_breakdown` — 三周期共振 + 跌破前低
+当前只有两个有效入场信号:
 
-入场前置过滤：
+- `long_breakout`
+- `short_breakdown`
 
-- **横盘过滤**：通过多周期 choppiness、ATR ratio、EMA spread 和 slope 综合判断，横盘环境下不开仓
-- **趋势确认**：breakout/breakdown 触发后还需通过 EMA spread、slope、突破距离等 5 项中至少 3 项确认，避免假突破
+入场前会做三层过滤:
 
-## 当前运行参数
+1. `15m`、`1h`、`4h` 三周期同方向
+2. 横盘过滤不过就不做
+3. 突破/破位后还要看量能、K 线质量、ADX、RSI、跟随确认
 
-- 杠杆：`14x`
-- 最大并发：`5`
-- 单仓保证金占比：`17%`
-- 单仓最小保证金：`5000 USDT`
-- 单仓最大保证金：`30000 USDT`
+## 当前默认执行参数
 
-## 做多出场参数（long_breakout）
+- 杠杆: `14x`
+- 单仓保证金占比: `0.17`
+- 单仓最小保证金: `5000`
+- 单仓最大保证金: `30000`
+- 最大并发仓位: `4`
+- 最大持仓: `288` 根
+- `long_breakout` 最大持仓: `384` 根
+- `short_breakdown` 最大持仓: `96` 根
+- 是否允许金字塔加仓: `是`
+- 最大加仓次数: `2`
+- 加仓比例: 当前仓位的 `28%`
+- 加仓触发收益: `16%`
 
-| 参数 | 值 | 说明 |
-|------|-----|------|
-| breakout_stop_atr_mult | 2.3 | ATR 止损倍数 |
-| breakout_tp1_pnl_pct | 56.0% | 第一止盈触发门槛 |
-| breakout_tp1_close_fraction | 0.16 | 第一止盈平仓比例 |
-| breakout_trailing_activation_pct | 98.0% | 移动止盈激活门槛 |
-| breakout_trailing_giveback_pct | 32.0% | 移动止盈允许回吐 |
-| breakout_break_even_activation_pct | 42.0% | 保本激活门槛 |
-| breakout_max_hold_bars | 384 | 最大持仓 K 线数 |
+## 当前研究窗口
 
-## 做空出场参数（short_breakdown）
+- 评估范围: `2025-09-01` ~ `2026-03-31`
+- `eval` 窗口长度: `28` 天
+- `eval` 步长: `21` 天
+- `holdout` 长度: `28` 天
+- 当前实际窗口数: `9` 个 `eval` + `1` 个 `holdout`
 
-| 参数 | 值 | 说明 |
-|------|-----|------|
-| short_breakdown_stop_atr_mult | 2.1 | ATR 止损倍数 |
-| short_breakdown_tp1_pnl_pct | 22.0% | 第一止盈触发门槛 |
-| short_breakdown_tp1_close_fraction | 0.22 | 第一止盈平仓比例 |
-| short_breakdown_trailing_activation_pct | 34.0% | 移动止盈激活门槛 |
-| short_breakdown_trailing_giveback_pct | 9.0% | 移动止盈允许回吐 |
-| short_breakdown_break_even_activation_pct | 18.0% | 保本激活门槛 |
-| short_breakdown_max_hold_bars | 96 | 最大持仓 K 线数 |
+当前 `holdout`:
 
-## 加仓机制
+- `2026-03-04` ~ `2026-03-31`
 
-- 金字塔加仓：开启
-- 最大加仓次数：3
-- 加仓比例：当前仓位的 28%
-- 加仓触发利润：10%
-- 加仓 ADX 门槛：19.0
+## 当前 Gate
 
-## 当前 13 个核心优化参数
+- 总交易数 `>= 30`
+- `eval` 交易数 `>= 24`
+- `holdout` 交易数 `>= 8`
+- `eval` 正收益窗口占比 `>= 40%`
+- 最大回撤 `<= 45%`
+- 爆仓次数 `<= 0`
+- `holdout` 平均收益 `>= 0%`
+- `eval-holdout` 落差 `<= 22`
+- 平均手续费拖累 `<= 6%`
+- 压力测试最差收益 `>= -8%`
 
-入场 7 个：
+## 当前最优基底指标
 
-- `macd_fast = 5`
-- `macd_slow = 16`
-- `macd_signal = 3`
-- `hourly_adx_min = 15.2`
-- `breakout_lookback = 22`
-- `breakdown_lookback = 25`
-- `breakout_rsi_max = 82.1`
+来源:
 
-出场 6 个：
+- 本地运行态文件 `state/research_macd_aggressive_v2_best.json`
 
-- `leverage = 14`
-- `position_fraction = 0.17`
-- `breakout_stop_atr_mult = 2.3`
-- `breakout_trailing_activation_pct = 98.0`
-- `breakout_trailing_giveback_pct = 32.0`
-- `short_breakdown_trailing_activation_pct = 34.0`
+截至 `2026-04-13`，当前最优基底是:
 
-## 参数搜索分组
+- `weighted_eval_return = 3.70%`
+- `eval_median_return = 1.37%`
+- `eval_p25_return = -10.03%`
+- `holdout_avg_return = -15.50%`
+- `worst_drawdown = 31.67%`
+- `avg_fee_drag = 4.44%`
+- `total_trades = 240`
+- `daily_sharpe = 0.23`
+- `daily_sortino = 0.49`
+- `profit_factor = 1.16`
+- `stress_avg_return = 1.23%`
+- `stress_worst_return = -18.47%`
+- `quality_score = 0.52`
+- `promotion_score = -8.62`
+- `gate_passed = false`
 
-| 组名 | 包含参数 |
-|------|---------|
-| momentum_core | macd_fast, macd_slow, macd_signal |
-| trend_timing | hourly_adx_min, breakout_lookback, breakdown_lookback, breakout_rsi_max |
-| aggression_risk | leverage, position_fraction, breakout_stop_atr_mult |
-| trailing_profit | breakout_trailing_activation_pct, breakout_trailing_giveback_pct, short_breakdown_trailing_activation_pct |
+当前不过线的直接原因:
 
-## 评分机制
+- 留出收益不足 `(-15.50%)`
+- 压力测试过弱 `(-18.47%)`
 
-当前评分已切到 Walk-Forward `eval + holdout` 双层结构：
+## 当前结论
 
-- `selection_score` 只基于全部 `eval` 窗口表现
-- `promotion_score` = `selection_score` 再叠加留出窗口回归惩罚
-- 优化模型只看到 `eval` 摘要，`holdout` 只在外层 gate / 晋级时使用
-
-惩罚项：
-
-- **一致性惩罚**：`eval` 收益标准差 x 0.15
-- **尾部惩罚**：最差 `eval` 窗口亏损超过 15% 时，超出部分 x 0.18
-- **亏损窗口惩罚**：亏损 `eval` 窗口占比超过 55% 时触发
-- **回撤惩罚**：回撤超过 55% 时，超出部分 x 0.22
-- **爆仓惩罚**：每次爆仓扣 1.5 分
-- **留出落差惩罚**：`eval_avg - holdout_avg` 为正时，差值 x 0.15
-- **负留出惩罚**：`holdout_avg < 0` 时继续扣分
-
-门禁条件：
-
-- 总交易 >= 30，`eval` 交易 >= 20，留出交易 >= 8
-- 最大回撤 <= 65%
-- 爆仓 <= 10 次
-- `eval` 均值 > 0
-- `eval` 正收益窗口占比 >= 35%
-- 杠杆 >= 14x
-- 留出均值 >= 0
-- `eval_avg - holdout_avg <= 28`
-- `holdout_avg` 不得比历史最优留出均值低超过 6 个百分点
-
-## 研究循环设置
-
-- 每轮默认最多改动 `4` 个键
-- 单键步长通常不超过当前值 `12%`
-- 连续 `6` 轮通过但未刷新最优时，自动放宽到 `6` 个键和 `18%` 步长
-- 重复检测只检查精确匹配，允许同方向不同幅度的尝试
-- accepted / rejected 各保留最近 `16` 条精确签名记忆
-- 最多重规划 `2` 次，仍重复则直接跳过本轮
-
-## 评估窗口
-
-- 评估范围：2025-09-01 ~ 2026-03-31
-- 每块 20 天
-- 除最后 2 块留出窗口外，其余全部作为 Walk-Forward `eval`
-- 留出结果不直接暴露给优化模型，仅用于外层拦截与晋级判断
+- 这版基底在一部分 `eval` 窗口里可以赚钱。
+- 但它还没有证明自己能扛住最后的留出窗口。
+- 也没有证明自己在更差的手续费、滑点和延迟条件下足够稳。
+- 所以它目前还是“可继续研究的底稿”，不是“已经确认过关的版本”。

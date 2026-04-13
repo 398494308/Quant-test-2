@@ -237,6 +237,22 @@ def _clean_code_block(text: str) -> str:
     return text.strip()
 
 
+def build_json_text_format(
+    *,
+    schema: dict[str, Any] | None = None,
+    schema_name: str = "response_payload",
+    strict: bool = True,
+) -> dict[str, Any]:
+    if schema is None:
+        return {"type": "json_object"}
+    return {
+        "type": "json_schema",
+        "name": schema_name,
+        "schema": schema,
+        "strict": strict,
+    }
+
+
 def _request_headers(config: StrategyClientConfig) -> dict[str, str]:
     return {
         "Authorization": f"Bearer {config.api_key}",
@@ -251,8 +267,9 @@ def _build_payload(
     system_prompt: str,
     max_output_tokens: int,
     effort: str,
+    text_format: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "model": config.model,
         "reasoning": {"effort": effort},
         "instructions": system_prompt,
@@ -265,6 +282,9 @@ def _build_payload(
         "max_output_tokens": max_output_tokens,
         "stream": False,
     }
+    if text_format is not None:
+        payload["text"] = {"format": text_format}
+    return payload
 
 
 def _resolve_attempt_timeout(
@@ -305,6 +325,12 @@ def _is_retryable_error(exc: Exception) -> bool:
         return True
     if isinstance(exc, requests.HTTPError) and exc.response is not None:
         return exc.response.status_code in RETRYABLE_STATUS_CODES
+    if isinstance(exc, ValueError):
+        message = str(exc)
+        return (
+            "Responses API returned unreadable SSE payload" in message
+            or "Failed to parse SSE event" in message
+        )
     return False
 
 
@@ -352,6 +378,7 @@ def generate_strategy_code(
     max_output_tokens: int = 3200,
     timeout: float | tuple[float, float] | None = None,
     config: StrategyClientConfig | None = None,
+    text_format: dict[str, Any] | None = None,
 ) -> str:
     """Generate strategy content through a single OpenAI Responses API boundary."""
     client_config = config or load_strategy_client_config()
@@ -368,7 +395,14 @@ def generate_strategy_code(
     started_at = time.time()
 
     for effort_index, effort in enumerate(attempt_plan):
-        payload = _build_payload(client_config, prompt, system_prompt, max_output_tokens, effort)
+        payload = _build_payload(
+            client_config,
+            prompt,
+            system_prompt,
+            max_output_tokens,
+            effort,
+            text_format=text_format,
+        )
         for retry_index in range(client_config.retry_count + 1):
             try:
                 request_timeout = _resolve_attempt_timeout(client_config, timeout, started_at)
@@ -405,6 +439,7 @@ def generate_json_object(
     max_output_tokens: int = 3200,
     timeout: float | tuple[float, float] | None = None,
     config: StrategyClientConfig | None = None,
+    text_format: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     raw_text = generate_strategy_code(
         prompt=prompt,
@@ -412,6 +447,7 @@ def generate_json_object(
         max_output_tokens=max_output_tokens,
         timeout=timeout,
         config=config,
+        text_format=text_format or build_json_text_format(),
     )
     json_text = _extract_json_candidate(raw_text)
     try:

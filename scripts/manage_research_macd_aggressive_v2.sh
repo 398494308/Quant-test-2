@@ -4,15 +4,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-PID_FILE="${REPO_ROOT}/state/research_macd_aggressive.pid"
-LOCK_FILE="${REPO_ROOT}/state/research_macd_aggressive.lock"
-OUT_FILE="${REPO_ROOT}/logs/macd_aggressive_research.out"
-HEARTBEAT_FILE="${REPO_ROOT}/state/research_macd_aggressive_heartbeat.json"
-STOP_FILE="${REPO_ROOT}/state/research_macd_aggressive.stop"
+PID_FILE="${REPO_ROOT}/state/research_macd_aggressive_v2.pid"
+LOCK_FILE="${REPO_ROOT}/state/research_macd_aggressive_v2.lock"
+OUT_FILE="${REPO_ROOT}/logs/macd_aggressive_research_v2.out"
+HEARTBEAT_FILE="${REPO_ROOT}/state/research_macd_aggressive_v2_heartbeat.json"
+STOP_FILE="${REPO_ROOT}/state/research_macd_aggressive_v2.stop"
 BASE_ENV="${REPO_ROOT}/../test1/freqtrade.service.env"
-LOCAL_ENV="${REPO_ROOT}/config/research.env"
-RUNNER="${REPO_ROOT}/scripts/run_research_macd_aggressive.sh"
-STARTUP_TIMEOUT_SECONDS="${MACD_SUPERVISOR_STARTUP_TIMEOUT_SECONDS:-25}"
+LOCAL_ENV="${REPO_ROOT}/config/research_v2.env"
+RUNNER="${REPO_ROOT}/scripts/run_research_macd_aggressive_v2.sh"
+STARTUP_TIMEOUT_SECONDS="${MACD_V2_SUPERVISOR_STARTUP_TIMEOUT_SECONDS:-25}"
 
 mkdir -p "${REPO_ROOT}/logs" "${REPO_ROOT}/state"
 
@@ -59,7 +59,7 @@ PY
 }
 
 list_running_pids() {
-  pgrep -f "python3 -u scripts/research_macd_aggressive.py|python3 scripts/research_macd_aggressive.py" || true
+  pgrep -f "python3 -u scripts/research_macd_aggressive_v2.py|python3 scripts/research_macd_aggressive_v2.py" || true
 }
 
 cmd_start() {
@@ -70,7 +70,7 @@ cmd_start() {
   local existing_pids
   existing_pids="$(list_running_pids | xargs echo)"
   if [[ -n "${existing_pids}" ]]; then
-    echo "existing unmanaged process detected: ${existing_pids}" >&2
+    echo "existing unmanaged v2 process detected: ${existing_pids}" >&2
     echo "run '$0 stop' first" >&2
     exit 1
   fi
@@ -169,7 +169,7 @@ case "${1:-status}" in
     bash "$0" start
     ;;
   reset)
-    bash "${SCRIPT_DIR}/reset_research_macd_aggressive_state.sh"
+    bash "${SCRIPT_DIR}/reset_research_macd_aggressive_v2_state.sh"
     ;;
   status)
     cmd_status
@@ -179,3 +179,4 @@ case "${1:-status}" in
     exit 1
     ;;
 esac
+

@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import pprint
+import random
 import re
 import shutil
 import sys
@@ -44,6 +45,9 @@ HEARTBEAT_FILE = BASE_DIR / "state/research_macd_aggressive_heartbeat.json"
 LOOP_INTERVAL_SECONDS = int(os.getenv("MACD_LOOP_INTERVAL_SECONDS", "600"))
 PROVIDER_RECOVERY_WAIT_SECONDS = int(os.getenv("MACD_PROVIDER_RECOVERY_WAIT_SECONDS", "120"))
 FAILURE_COOLDOWN_SECONDS = int(os.getenv("MACD_FAILURE_COOLDOWN_SECONDS", "60"))
+LOCAL_FALLBACK_ENABLED = os.getenv("MACD_LOCAL_FALLBACK_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+PROVIDER_EMPTY_OUTPUT_FALLBACK_SECONDS = int(os.getenv("MACD_PROVIDER_EMPTY_OUTPUT_FALLBACK_SECONDS", "1800"))
+LOCAL_FALLBACK_GENERATION_ATTEMPTS = int(os.getenv("MACD_LOCAL_FALLBACK_GENERATION_ATTEMPTS", "8"))
 MAX_PARAM_CHANGES_PER_ITERATION = int(os.getenv("MACD_MAX_PARAM_CHANGES", "4"))
 MAX_PARAM_RELATIVE_STEP = float(os.getenv("MACD_MAX_PARAM_RELATIVE_STEP", "0.12"))
 MAX_DUPLICATE_REPLAN_ATTEMPTS = int(os.getenv("MACD_DUPLICATE_REPLAN_ATTEMPTS", "2"))
@@ -186,6 +190,8 @@ latest_public_eval_summary = ""
 last_params_snapshot = None
 last_exit_snapshot = None
 _resolved_discord_channel_id = CHANNEL_ID
+provider_local_only_until = 0.0
+provider_local_only_reason = ""
 
 logging.basicConfig(
     filename=LOG_FILE,
@@ -839,6 +845,160 @@ def _pick_core_params(source_params, allowed_keys):
     return {key: source_params[key] for key in allowed_keys if key in source_params}
 
 
+def _ordered_search_groups(search_policy):
+    ordered = []
+    for group in search_policy.get("focus_groups", ()):
+        if group in PARAM_SEARCH_GROUPS and group not in ordered:
+            ordered.append(group)
+    for group in PARAM_SEARCH_GROUPS:
+        if group not in ordered:
+            ordered.append(group)
+    return ordered
+
+
+def _provider_local_fallback_remaining_seconds():
+    return max(0, int(provider_local_only_until - time.time()))
+
+
+def _provider_local_fallback_active():
+    return LOCAL_FALLBACK_ENABLED and _provider_local_fallback_remaining_seconds() > 0
+
+
+def _should_use_local_fallback(exc):
+    if not LOCAL_FALLBACK_ENABLED:
+        return False
+    message = str(exc)
+    return "Responses API returned no text output" in message
+
+
+def _activate_provider_local_fallback(exc):
+    global provider_local_only_until, provider_local_only_reason
+    provider_local_only_until = time.time() + PROVIDER_EMPTY_OUTPUT_FALLBACK_SECONDS
+    provider_local_only_reason = str(exc).splitlines()[0]
+    return PROVIDER_EMPTY_OUTPUT_FALLBACK_SECONDS
+
+
+def _json_schema_type_for_value(value):
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    return "string"
+
+
+def _build_optimizer_response_schema(strategy_params, exit_params):
+    def build_section_schema(params):
+        return {
+            "type": "object",
+            "properties": {
+                key: {"type": _json_schema_type_for_value(value)}
+                for key, value in params.items()
+            },
+            "required": list(params.keys()),
+            "additionalProperties": False,
+        }
+
+    return {
+        "type": "object",
+        "properties": {
+            "strategy_params": build_section_schema(strategy_params),
+            "exit_params": build_section_schema(exit_params),
+        },
+        "required": ["strategy_params", "exit_params"],
+        "additionalProperties": False,
+    }
+
+
+def _sample_local_candidate_payload(core_strategy_params, core_exit_params, search_policy):
+    ordered_groups = _ordered_search_groups(search_policy)
+    candidate_groups = ordered_groups[: max(1, min(search_policy["max_groups"], len(ordered_groups)))]
+    scoped_candidates = []
+    for group in candidate_groups:
+        for scoped_key in PARAM_SEARCH_GROUPS[group]:
+            section, key = scoped_key.split(".", 1)
+            if section == "strategy" and key in core_strategy_params:
+                scoped_candidates.append((section, key, group))
+            elif section == "exit" and key in core_exit_params:
+                scoped_candidates.append((section, key, group))
+
+    if not scoped_candidates:
+        for key in core_strategy_params:
+            scoped_candidates.append(("strategy", key, "other"))
+        for key in core_exit_params:
+            scoped_candidates.append(("exit", key, "other"))
+
+    seed = time.time_ns() ^ len(_load_memory_payload().get("accepted", [])) ^ (plateau_pass_streak << 8)
+    for local_attempt in range(LOCAL_FALLBACK_GENERATION_ATTEMPTS):
+        rng = random.Random(seed + local_attempt)
+        max_changes = min(search_policy["max_changes"], len(scoped_candidates))
+        if max_changes <= 0:
+            break
+        min_changes = 1 if max_changes == 1 else 2
+        preferred_max = min(3, max_changes)
+        change_count = rng.randint(min_changes, preferred_max)
+        picked = rng.sample(scoped_candidates, change_count)
+
+        strategy_updates = {}
+        exit_updates = {}
+        for section, key, _group in picked:
+            current_value = core_strategy_params[key] if section == "strategy" else core_exit_params[key]
+            if isinstance(current_value, bool):
+                proposed_value = not current_value
+            elif isinstance(current_value, int):
+                step_cap = int(max(1, round(_numeric_step_cap(current_value, search_policy["relative_step"]))))
+                raw_step = rng.randint(1, step_cap)
+                proposed_value = current_value + rng.choice((-raw_step, raw_step))
+                if proposed_value <= 0:
+                    proposed_value = current_value + raw_step
+            elif isinstance(current_value, float):
+                step_cap = float(_numeric_step_cap(current_value, search_policy["relative_step"]))
+                raw_step = step_cap * rng.uniform(0.35, 1.0)
+                proposed_value = current_value + rng.choice((-raw_step, raw_step))
+                if current_value > 0 and proposed_value <= 0:
+                    proposed_value = current_value + raw_step
+            else:
+                continue
+
+            normalized = _normalize_candidate_value(current_value, proposed_value, search_policy["relative_step"])
+            if normalized == current_value:
+                continue
+            if section == "strategy":
+                strategy_updates[key] = normalized
+            else:
+                exit_updates[key] = normalized
+
+        candidate_strategy = dict(core_strategy_params)
+        candidate_strategy.update(strategy_updates)
+        candidate_exit = dict(core_exit_params)
+        candidate_exit.update(exit_updates)
+        changes = _describe_param_changes(
+            core_strategy_params,
+            candidate_strategy,
+            core_exit_params,
+            candidate_exit,
+        )
+        if not changes:
+            continue
+        if _find_recent_duplicate_direction(changes) is not None:
+            continue
+        log_info(
+            "模型候选不可用，使用本地候选生成器: "
+            f"groups={', '.join(sorted({group for _, _, group in picked}))}, "
+            f"changes={'; '.join(changes)}"
+        )
+        return {
+            "strategy_params": strategy_updates,
+            "exit_params": exit_updates,
+        }
+
+    return {
+        "strategy_params": {},
+        "exit_params": {},
+    }
+
+
 def optimize_strategy():
     with open(STRATEGY_FILE, "r") as f:
         current_strategy_code = f.read()
@@ -849,6 +1009,7 @@ def optimize_strategy():
 
     core_strategy_params = _pick_core_params(strategy_module.PARAMS, CORE_STRATEGY_PARAM_KEYS)
     core_exit_params = _pick_core_params(backtest_module.EXIT_PARAMS, CORE_EXIT_PARAM_KEYS)
+    response_schema = _build_optimizer_response_schema(core_strategy_params, core_exit_params)
     search_policy = _current_search_policy()
     if search_policy["mode"] == "boosted":
         log_info(
@@ -909,16 +1070,40 @@ def optimize_strategy():
   "exit_params": {{...}}
 }}
 """
-        payload = generate_json_object(
-            prompt=prompt,
-            system_prompt=(
-                "你是激进版 BTC 双向趋势策略参数优化 AI。"
-                "只输出纯JSON，不要markdown代码块，不要任何解释。"
-                "必须输出完整的JSON，确保所有括号和引号闭合。"
-                "格式：{\"strategy_params\": {...}, \"exit_params\": {...}}"
-            ),
-            max_output_tokens=1500,
-        )
+        if _provider_local_fallback_active():
+            remaining = _provider_local_fallback_remaining_seconds()
+            log_info(
+                "Provider 本地兜底窗口生效中，跳过模型请求: "
+                f"remaining={remaining}s, reason={provider_local_only_reason}"
+            )
+            payload = _sample_local_candidate_payload(core_strategy_params, core_exit_params, search_policy)
+        else:
+            try:
+                payload = generate_json_object(
+                    prompt=prompt,
+                    system_prompt=(
+                        "你是激进版 BTC 双向趋势策略参数优化 AI。"
+                        "只输出纯JSON，不要markdown代码块，不要任何解释。"
+                        "必须输出完整的JSON，确保所有括号和引号闭合。"
+                        "格式：{\"strategy_params\": {...}, \"exit_params\": {...}}"
+                    ),
+                    max_output_tokens=1500,
+                    text_format={
+                        "type": "json_schema",
+                        "name": "macd_aggressive_parameter_update",
+                        "schema": response_schema,
+                        "strict": True,
+                    },
+                )
+            except Exception as exc:
+                if not _should_use_local_fallback(exc):
+                    raise
+                cooldown_seconds = _activate_provider_local_fallback(exc)
+                log_info(
+                    "模型候选输出不可用，切换到本地候选生成器: "
+                    f"fallback_window={cooldown_seconds}s, error={str(exc).splitlines()[0]}"
+                )
+                payload = _sample_local_candidate_payload(core_strategy_params, core_exit_params, search_policy)
 
         guarded_strategy_params = _apply_local_search_guardrails(
             core_strategy_params,
