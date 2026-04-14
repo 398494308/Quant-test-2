@@ -124,6 +124,12 @@ def _run_base_backtests(allow_early_reject: bool = False) -> list[dict[str, Any]
     eval_count = 0
     check_at = RUNTIME.early_reject_after_windows
     threshold = RUNTIME.early_reject_sortino_threshold
+    prepared_context = backtest_module.prepare_backtest_context(
+        strategy_module.PARAMS,
+        intraday_file=backtest_module.DEFAULT_INTRADAY_FILE,
+        hourly_file=backtest_module.DEFAULT_HOURLY_FILE,
+        exit_params=backtest_module.EXIT_PARAMS,
+    )
 
     for window in WINDOWS:
         result = backtest_module.backtest_macd_aggressive(
@@ -135,6 +141,7 @@ def _run_base_backtests(allow_early_reject: bool = False) -> list[dict[str, Any]
             strategy_params=strategy_module.PARAMS,
             exit_params=backtest_module.EXIT_PARAMS,
             include_diagnostics=True,
+            prepared_context=prepared_context,
         )
         results.append({"window": window, "result": result})
 
@@ -193,6 +200,7 @@ def _build_model_candidate(base_source: str, journal_entries: list[dict[str, Any
             "你是严谨的量化研究员。"
             "只输出 JSON，不要解释，不要 markdown。"
             "你必须提供完整策略文件源码。"
+            "除 candidate_id 与 change_tags 外，其余说明字段必须使用简体中文。"
         ),
         max_output_tokens=RUNTIME.prompt_max_output_tokens,
         text_format=build_json_text_format(
@@ -298,27 +306,39 @@ def initialize_best_state(force_rebuild: bool = False) -> None:
 
 def _build_journal_entry(
     *,
+    iteration_id: int,
     candidate: StrategyCandidate,
     base_source: str,
-    candidate_report: EvaluationReport,
+    candidate_report: EvaluationReport | None,
     outcome: str,
+    stop_stage: str,
+    gate_reason: str | None = None,
+    note: str | None = None,
 ) -> dict[str, Any]:
     base_promotion = best_report.metrics["promotion_score"] if best_report is not None else 0.0
     diff_summary = build_diff_summary(base_source, candidate.strategy_code, limit=18)
+    promotion_score = candidate_report.metrics["promotion_score"] if candidate_report is not None else None
+    quality_score = candidate_report.metrics["quality_score"] if candidate_report is not None else None
+    resolved_gate_reason = gate_reason or (
+        candidate_report.gate_reason if candidate_report is not None else "unknown"
+    )
     return {
+        "iteration": iteration_id,
         "timestamp": datetime.now(UTC).isoformat(),
         "candidate_id": candidate.candidate_id,
         "outcome": outcome,
+        "stop_stage": stop_stage,
         "hypothesis": candidate.hypothesis,
         "change_plan": candidate.change_plan,
         "change_tags": list(candidate.change_tags),
         "edited_regions": list(candidate.edited_regions),
         "expected_effects": list(candidate.expected_effects),
-        "quality_score": candidate_report.metrics["quality_score"],
-        "promotion_score": candidate_report.metrics["promotion_score"],
-        "promotion_delta": candidate_report.metrics["promotion_score"] - base_promotion,
-        "gate_reason": candidate_report.gate_reason,
-        "metrics": candidate_report.metrics,
+        "quality_score": quality_score,
+        "promotion_score": promotion_score,
+        "promotion_delta": promotion_score - base_promotion if promotion_score is not None else None,
+        "gate_reason": resolved_gate_reason,
+        "metrics": candidate_report.metrics if candidate_report is not None else {},
+        "note": note or "",
         "code_hash": source_hash(candidate.strategy_code),
         "diff_summary": diff_summary,
     }
@@ -372,8 +392,27 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
     except EarlyRejection as exc:
         write_strategy_source(RUNTIME.paths.strategy_file, best_source)
         reload_strategy_module()
+        append_journal_entry(
+            RUNTIME.paths.journal_file,
+            _build_journal_entry(
+                iteration_id=iteration_id,
+                candidate=candidate,
+                base_source=best_source,
+                candidate_report=None,
+                outcome="early_rejected",
+                stop_stage="early_reject",
+                gate_reason="前段评估过差",
+                note=str(exc),
+            ),
+        )
+        if maybe_compact(RUNTIME.paths.journal_file):
+            log_info("研究日志已压缩")
         log_info(f"第 {iteration_id} 轮提前淘汰: {exc}")
-        write_heartbeat("iteration_early_rejected", message=f"iteration {iteration_id} early rejected: {exc}")
+        write_heartbeat(
+            "iteration_early_rejected",
+            message=f"iteration {iteration_id} early rejected: {exc}",
+            gate="前段评估过差",
+        )
         return "early_rejected"
     except StrategyGenerationTransientError:
         raise
@@ -383,10 +422,12 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
         raise
 
     entry_base = _build_journal_entry(
+        iteration_id=iteration_id,
         candidate=candidate,
         base_source=best_source,
         candidate_report=candidate_report,
         outcome="accepted" if candidate_report.gate_passed and candidate_report.metrics["promotion_score"] > best_report.metrics["promotion_score"] else "rejected",
+        stop_stage="full_eval",
     )
 
     if candidate_report.gate_passed and candidate_report.metrics["promotion_score"] > best_report.metrics["promotion_score"]:

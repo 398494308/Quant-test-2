@@ -62,6 +62,18 @@ list_running_pids() {
   pgrep -f "python3 -u scripts/research_macd_aggressive_v2.py|python3 scripts/research_macd_aggressive_v2.py" || true
 }
 
+kill_pid_or_group() {
+  local signal="$1"
+  local pid="$2"
+  local pgid=""
+  pgid="$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d ' ' || true)"
+  if [[ -n "${pgid}" ]] && [[ "${pgid}" == "${pid}" ]]; then
+    kill -"${signal}" -- "-${pid}" 2>/dev/null || kill -"${signal}" "${pid}" 2>/dev/null || true
+    return
+  fi
+  kill -"${signal}" "${pid}" 2>/dev/null || true
+}
+
 cmd_start() {
   if is_running; then
     echo "already running: pid=$(cat "${PID_FILE}")"
@@ -114,7 +126,7 @@ cmd_stop() {
       exit 0
     fi
     for pid in ${stray_pids}; do
-      kill "${pid}" 2>/dev/null || true
+      kill_pid_or_group TERM "${pid}"
     done
     rm -f "${PID_FILE}"
     echo "stopped stray pids: ${stray_pids}"
@@ -123,7 +135,7 @@ cmd_stop() {
   local pid
   pid="$(cat "${PID_FILE}")"
   touch "${STOP_FILE}"
-  kill "${pid}" 2>/dev/null || true
+  kill_pid_or_group TERM "${pid}"
   for _ in {1..20}; do
     if ! kill -0 "${pid}" 2>/dev/null; then
       rm -f "${PID_FILE}" "${STOP_FILE}"
@@ -132,7 +144,7 @@ cmd_stop() {
     fi
     sleep 1
   done
-  kill -9 "${pid}" 2>/dev/null || true
+  kill_pid_or_group KILL "${pid}"
   rm -f "${PID_FILE}" "${STOP_FILE}"
   echo "killed: pid=${pid}"
 }
@@ -179,4 +191,3 @@ case "${1:-status}" in
     exit 1
     ;;
 esac
-

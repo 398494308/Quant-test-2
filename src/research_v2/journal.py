@@ -12,6 +12,7 @@ from typing import Any
 
 
 COMPACT_INTERVAL = 20
+NEGATIVE_OUTCOMES = {"rejected", "early_rejected"}
 
 
 # ==================== 基础读写 ====================
@@ -65,24 +66,48 @@ def _mean(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
+def _outcome_bucket(raw_outcome: str) -> str:
+    if raw_outcome == "accepted":
+        return "accepted"
+    if raw_outcome in NEGATIVE_OUTCOMES:
+        return "rejected"
+    return raw_outcome
+
+
+def _score_value(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _truncate(text: Any, limit: int) -> str:
+    cleaned = " ".join(str(text or "").split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: max(0, limit - 3)] + "..."
+
+
 def _compact_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
     """把一批 journal 条目压缩成结构化的经验摘要。"""
     if not entries:
         return {}
 
-    accepted = [e for e in entries if e.get("outcome") == "accepted"]
-    rejected = [e for e in entries if e.get("outcome") == "rejected"]
+    accepted = [e for e in entries if _outcome_bucket(str(e.get("outcome", ""))) == "accepted"]
+    rejected = [e for e in entries if _outcome_bucket(str(e.get("outcome", ""))) == "rejected"]
+    early_rejected_count = sum(1 for e in entries if e.get("outcome") == "early_rejected")
 
     # 标签统计：哪些方向有效 / 无效
     tag_stats: dict[str, dict[str, Any]] = defaultdict(
         lambda: {"accepted": 0, "rejected": 0, "scores": []}
     )
     for entry in entries:
-        outcome = entry.get("outcome", "")
-        score = entry.get("promotion_score", 0.0)
+        outcome = _outcome_bucket(str(entry.get("outcome", "")))
+        score = _score_value(entry.get("promotion_score"))
         for tag in entry.get("change_tags", []):
             bucket = tag_stats[tag]
-            bucket[outcome] = bucket.get(outcome, 0) + 1
+            if outcome in {"accepted", "rejected"}:
+                bucket[outcome] = bucket.get(outcome, 0) + 1
             bucket["scores"].append(score)
 
     # 区域统计
@@ -90,9 +115,10 @@ def _compact_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
         lambda: {"accepted": 0, "rejected": 0}
     )
     for entry in entries:
-        outcome = entry.get("outcome", "")
+        outcome = _outcome_bucket(str(entry.get("outcome", "")))
         for region in entry.get("edited_regions", []):
-            region_stats[region][outcome] = region_stats[region].get(outcome, 0) + 1
+            if outcome in {"accepted", "rejected"}:
+                region_stats[region][outcome] = region_stats[region].get(outcome, 0) + 1
 
     # 常见失败原因
     gate_reasons: dict[str, int] = defaultdict(int)
@@ -121,8 +147,8 @@ def _compact_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
                 }
 
     # 最佳 / 最差候选摘要
-    best_entry = max(entries, key=lambda e: e.get("promotion_score", -9999))
-    worst_entry = min(entries, key=lambda e: e.get("promotion_score", 9999))
+    best_entry = max(entries, key=lambda e: _score_value(e.get("promotion_score")))
+    worst_entry = min(entries, key=lambda e: _score_value(e.get("promotion_score")))
 
     tag_summary = {}
     for tag, stats in tag_stats.items():
@@ -136,6 +162,7 @@ def _compact_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
         "entry_count": len(entries),
         "accepted_count": len(accepted),
         "rejected_count": len(rejected),
+        "early_rejected_count": early_rejected_count,
         "accept_rate": len(accepted) / len(entries) if entries else 0.0,
         "tag_summary": tag_summary,
         "region_summary": dict(region_stats),
@@ -143,13 +170,13 @@ def _compact_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
         "accepted_metric_ranges": accepted_metric_ranges,
         "best_candidate": {
             "id": best_entry.get("candidate_id", ""),
-            "score": best_entry.get("promotion_score", 0.0),
+            "score": _score_value(best_entry.get("promotion_score")),
             "tags": best_entry.get("change_tags", []),
             "hypothesis": best_entry.get("hypothesis", ""),
         },
         "worst_candidate": {
             "id": worst_entry.get("candidate_id", ""),
-            "score": worst_entry.get("promotion_score", 0.0),
+            "score": _score_value(worst_entry.get("promotion_score")),
             "tags": worst_entry.get("change_tags", []),
             "hypothesis": worst_entry.get("hypothesis", ""),
         },
@@ -194,7 +221,7 @@ def maybe_compact(journal_path: Path) -> bool:
     return True
 
 
-def _format_compact_for_prompt(compact_data: dict[str, Any]) -> list[str]:
+def _format_compact_for_prompt(compact_data: dict[str, Any], limit: int) -> list[str]:
     """把压缩数据转成 AI 可读的文本。"""
     rounds = compact_data.get("rounds", [])
     if not rounds:
@@ -203,10 +230,12 @@ def _format_compact_for_prompt(compact_data: dict[str, Any]) -> list[str]:
     lines = ["历史经验压缩摘要:"]
     total_accepted = sum(r.get("accepted_count", 0) for r in rounds)
     total_rejected = sum(r.get("rejected_count", 0) for r in rounds)
+    total_early_rejected = sum(r.get("early_rejected_count", 0) for r in rounds)
     total_entries = sum(r.get("entry_count", 0) for r in rounds)
     lines.append(
         f"共 {total_entries} 轮历史，{total_accepted} 次通过，"
-        f"{total_rejected} 次被拒，通过率 {total_accepted / total_entries:.0%}"
+        f"{total_rejected} 次失败，其中提前淘汰 {total_early_rejected} 次，"
+        f"通过率 {total_accepted / total_entries:.0%}"
         if total_entries else "无历史"
     )
 
@@ -223,17 +252,49 @@ def _format_compact_for_prompt(compact_data: dict[str, Any]) -> list[str]:
                 merged["scores"].append(stats["avg_score"])
 
     if merged_tags:
-        ranked = sorted(
-            merged_tags.items(),
-            key=lambda x: x[1]["accepted"] - x[1]["rejected"],
+        success_ranked = sorted(
+            (
+                (tag, stats)
+                for tag, stats in merged_tags.items()
+                if stats["accepted"] > 0
+            ),
+            key=lambda item: (
+                item[1]["accepted"] - item[1]["rejected"],
+                item[1]["accepted"],
+                -item[1]["rejected"],
+                _mean(item[1]["scores"]),
+            ),
             reverse=True,
         )
-        lines.append("方向标签历史效果:")
-        for tag, stats in ranked[:10]:
-            avg = _mean(stats["scores"]) if stats["scores"] else 0.0
-            lines.append(
-                f"  {tag}: 通过{stats['accepted']}次 拒绝{stats['rejected']}次 均分{avg:.1f}"
-            )
+        failure_ranked = sorted(
+            (
+                (tag, stats)
+                for tag, stats in merged_tags.items()
+                if stats["rejected"] > 0
+            ),
+            key=lambda item: (
+                item[1]["rejected"] - item[1]["accepted"],
+                item[1]["rejected"],
+                -item[1]["accepted"],
+                -_mean(item[1]["scores"]),
+            ),
+            reverse=True,
+        )
+
+        if success_ranked:
+            lines.append("历史较优方向标签:")
+            for tag, stats in success_ranked[:limit]:
+                avg = _mean(stats["scores"]) if stats["scores"] else 0.0
+                lines.append(
+                    f"  {tag}: 通过{stats['accepted']}次 失败{stats['rejected']}次 均分{avg:.2f}"
+                )
+        if failure_ranked:
+            lines.append("历史高失败方向标签:")
+            for tag, stats in failure_ranked[:limit]:
+                avg = _mean(stats["scores"]) if stats["scores"] else 0.0
+                lines.append(
+                    f"  {tag}: 失败{stats['rejected']}次 通过{stats['accepted']}次 均分{avg:.2f}"
+                )
 
     # 合并失败原因
     merged_failures: dict[str, int] = defaultdict(int)
@@ -260,80 +321,110 @@ def _format_compact_for_prompt(compact_data: dict[str, Any]) -> list[str]:
 # ==================== 摘要生成 ====================
 
 
-def _recent_by_outcome(entries: list[dict[str, Any]], outcome: str, limit: int) -> list[dict[str, Any]]:
-    filtered = [entry for entry in entries if entry.get("outcome") == outcome]
-    return filtered[-limit:]
+def _uncompacted_recent_entries(
+    entries: list[dict[str, Any]],
+    journal_path: Path | None,
+) -> tuple[list[dict[str, Any]], int]:
+    if not entries:
+        return [], 0
+    if journal_path is None:
+        start_index = max(0, len(entries) - COMPACT_INTERVAL)
+        return entries[start_index:], start_index
+    compacted_up_to = int(load_compact(journal_path).get("compacted_up_to", 0) or 0)
+    compacted_up_to = max(0, min(compacted_up_to, len(entries)))
+    return entries[compacted_up_to:], compacted_up_to
 
 
-def _format_recent_entries(entries: list[dict[str, Any]]) -> list[str]:
-    lines: list[str] = []
+def _format_metric(value: Any) -> str:
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _display_outcome(raw_outcome: str) -> str:
+    return {
+        "accepted": "保留",
+        "rejected": "未保留",
+        "early_rejected": "提前淘汰",
+    }.get(raw_outcome, raw_outcome or "-")
+
+
+def _display_stage(entry: dict[str, Any]) -> str:
+    stage = str(entry.get("stop_stage") or "")
+    if stage == "early_reject":
+        return "提前淘汰"
+    if stage == "full_eval":
+        return "完整评估"
+    if str(entry.get("outcome", "")) in {"accepted", "rejected"}:
+        return "完整评估"
+    if str(entry.get("outcome", "")) == "early_rejected":
+        return "提前淘汰"
+    return stage or "-"
+
+
+def _recent_failure_tag_lines(entries: list[dict[str, Any]], limit: int) -> list[str]:
+    bucket: dict[str, int] = defaultdict(int)
     for entry in entries:
-        tags = ", ".join(entry.get("change_tags", [])) or "无标签"
-        regions = ", ".join(entry.get("edited_regions", [])) or "未标注区域"
+        if _outcome_bucket(str(entry.get("outcome", ""))) != "rejected":
+            continue
+        for tag in entry.get("change_tags", []):
+            bucket[tag] += 1
+    ranked = sorted(bucket.items(), key=lambda item: (-item[1], item[0]))
+    return [f"- {tag}: 最近失败 {count} 次" for tag, count in ranked[:limit]]
+
+
+def _format_recent_rounds_table(entries: list[dict[str, Any]], start_index: int) -> list[str]:
+    lines = [
+        "| 轮次 | 候选 | 结果 | 阶段 | promotion | quality | gate | tags | regions | 摘要 |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for offset, entry in enumerate(entries, start=1):
+        round_label = entry.get("iteration")
+        if round_label in (None, "", 0):
+            round_label = f"j{start_index + offset}"
+        candidate_id = _truncate(entry.get("candidate_id", "unknown"), 36)
+        outcome = _display_outcome(str(entry.get("outcome", "")))
+        stage = _display_stage(entry)
+        promotion = _format_metric(entry.get("promotion_score"))
+        quality = _format_metric(entry.get("quality_score"))
+        gate = _truncate(entry.get("gate_reason", "-"), 20) or "-"
+        tags = _truncate(",".join(entry.get("change_tags", [])) or "-", 42)
+        regions = _truncate(",".join(entry.get("edited_regions", [])) or "-", 22)
+        summary = _truncate(entry.get("note") or entry.get("hypothesis") or "-", 42)
         lines.append(
-            f"- {entry.get('candidate_id', 'unknown')}: "
-            f"score={entry.get('promotion_score', 0.0):.2f}, "
-            f"gate={entry.get('gate_reason', 'unknown')}, "
-            f"tags={tags}, regions={regions}, "
-            f"hypothesis={entry.get('hypothesis', '')}"
+            f"| {round_label} | {candidate_id} | {outcome} | {stage} | {promotion} | "
+            f"{quality} | {gate} | {tags} | {regions} | {summary} |"
         )
     return lines
 
 
-def _scoreboard(entries: list[dict[str, Any]], key: str, limit: int) -> list[str]:
-    bucket: dict[str, dict[str, float]] = {}
-    for entry in entries:
-        outcome = entry.get("outcome", "")
-        direction = 1.0 if outcome == "accepted" else -1.0 if outcome == "rejected" else 0.0
-        if direction == 0.0:
-            continue
-        for value in entry.get(key, []):
-            item = bucket.setdefault(value, {"score": 0.0, "accepted": 0.0, "rejected": 0.0})
-            item["score"] += direction
-            if direction > 0:
-                item["accepted"] += 1
-            else:
-                item["rejected"] += 1
-    ranked = sorted(bucket.items(), key=lambda item: (-item[1]["score"], item[0]))
-    return [
-        f"- {name}: score={stats['score']:.1f}, accepted={int(stats['accepted'])}, rejected={int(stats['rejected'])}"
-        for name, stats in ranked[:limit]
-    ]
-
-
 def build_journal_prompt_summary(entries: list[dict[str, Any]], limit: int = 6, journal_path: Path | None = None) -> str:
-    # 最近 20 条的明细
-    recent = entries[-COMPACT_INTERVAL:]
-    accepted = _recent_by_outcome(recent, "accepted", limit=min(3, limit))
-    rejected = _recent_by_outcome(recent, "rejected", limit=min(5, limit))
-
     parts: list[str] = []
 
     # 先放压缩的历史经验
     if journal_path is not None:
         compact_data = load_compact(journal_path)
-        compact_lines = _format_compact_for_prompt(compact_data)
+        compact_lines = _format_compact_for_prompt(compact_data, limit=min(8, limit))
         if compact_lines:
             parts.extend(compact_lines)
             parts.append("")
 
-    # 再放最近的明细
-    if accepted:
-        parts.append(f"最近{COMPACT_INTERVAL}轮有效方向:")
-        parts.extend(_format_recent_entries(accepted))
-    if rejected:
-        parts.append(f"最近{COMPACT_INTERVAL}轮无效方向:")
-        parts.extend(_format_recent_entries(rejected))
-
-    tag_board = _scoreboard(recent, "change_tags", limit=6)
-    if tag_board:
-        parts.append("标签得分板:")
-        parts.extend(tag_board)
-
-    region_board = _scoreboard(recent, "edited_regions", limit=6)
-    if region_board:
-        parts.append("代码区域得分板:")
-        parts.extend(region_board)
+    recent_entries, recent_start = _uncompacted_recent_entries(entries, journal_path)
+    if recent_entries:
+        accepted_count = sum(1 for entry in recent_entries if entry.get("outcome") == "accepted")
+        rejected_count = sum(1 for entry in recent_entries if entry.get("outcome") == "rejected")
+        early_rejected_count = sum(1 for entry in recent_entries if entry.get("outcome") == "early_rejected")
+        parts.append(
+            f"最近未压缩轮次共 {len(recent_entries)} 条："
+            f"保留 {accepted_count}，未保留 {rejected_count}，提前淘汰 {early_rejected_count}。"
+        )
+        failure_tag_lines = _recent_failure_tag_lines(recent_entries, limit=min(8, limit))
+        if failure_tag_lines:
+            parts.append("最近高频失败标签:")
+            parts.extend(failure_tag_lines)
+        parts.append("最近未压缩轮次表:")
+        parts.extend(_format_recent_rounds_table(recent_entries, recent_start))
 
     return "\n".join(parts) if parts else "暂无研究历史。"
 

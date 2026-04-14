@@ -121,4 +121,6 @@ def build_strategy_research_prompt(
 - 只输出 JSON。
 - `strategy_code` 字段里放完整的最新策略文件源码，不要 markdown。
 - `change_tags` 用简短标签描述方向，比如 `sideways_filter`, `breakout_entry`, `tighten_filter`, `reduce_false_breakout`。
+- `hypothesis`、`change_plan`、`expected_effects` 必须使用简体中文。
+- `candidate_id` 与 `change_tags` 保持 ASCII 标识符，避免中文变量名或空格标签。
 """

@@ -174,6 +174,24 @@ def _beijing_window_indices(data, start_date, end_date):
     return start_idx, end_idx
 
 
+def _window_indices_from_timestamps(timestamps, start_ts, end_exclusive_ts):
+    start_idx = bisect_right(timestamps, start_ts - 1)
+    end_idx = bisect_right(timestamps, end_exclusive_ts - 1)
+    return start_idx, end_idx
+
+
+def _timestamp_window_indices_inclusive(timestamps, start_ts, end_ts):
+    start_idx = bisect_right(timestamps, start_ts - 1)
+    end_idx = bisect_right(timestamps, end_ts)
+    return start_idx, end_idx
+
+
+def _beijing_window_indices_from_timestamps(timestamps, start_date, end_date):
+    start_ts = _beijing_timestamp_ms(start_date)
+    end_exclusive_ts = _beijing_timestamp_ms(end_date) + 24 * 60 * 60 * 1000
+    return _window_indices_from_timestamps(timestamps, start_ts, end_exclusive_ts)
+
+
 def _slice_by_timestamp_window(data, start_ts, end_ts):
     timestamps = [row["timestamp"] for row in data]
     start_idx = bisect_right(timestamps, start_ts - 1)
@@ -642,18 +660,15 @@ def _trade_reason_stats(trades):
     return counts
 
 
-def backtest_macd_aggressive(
-    strategy_func,
-    intraday_file,
-    hourly_file,
-    start_date,
-    end_date,
+def prepare_backtest_context(
     strategy_params,
-    exit_params=None,
+    *,
+    intraday_file=None,
+    hourly_file=None,
     sentiment_file=None,
     execution_file=None,
     funding_file=None,
-    include_diagnostics=False,
+    exit_params=None,
 ):
     exit_p = dict(EXIT_PARAMS)
     if exit_params:
@@ -667,32 +682,30 @@ def backtest_macd_aggressive(
 
     intraday_all = load_ohlcv_data(intraday_file)
     hourly_all = load_ohlcv_data(hourly_file)
-    intraday_start_idx, intraday_end_idx = _beijing_window_indices(intraday_all, start_date, end_date)
-    intraday_data = intraday_all[intraday_start_idx:intraday_end_idx]
-    if not intraday_data or not hourly_all:
-        raise ValueError(f"missing data for window {start_date}~{end_date}")
+    if not intraday_all or not hourly_all:
+        raise ValueError("missing source data")
+
+    intraday_timestamps = [row["timestamp"] for row in intraday_all]
+    hourly_timestamps = [row["timestamp"] for row in hourly_all]
 
     sentiment_rows = load_sentiment_data(sentiment_file) if Path(sentiment_file).exists() else []
     sentiment_state = _prepare_sentiment_state(sentiment_rows) if sentiment_rows else []
     sentiment_timestamps = [row["timestamp"] for row in sentiment_state]
+
     intraday_interval_ms = _infer_interval_ms(intraday_all, 15)
     hourly_interval_ms = _infer_interval_ms(hourly_all, 60)
-    start_ts = intraday_data[0]["timestamp"]
-    end_ts = intraday_data[-1]["timestamp"] + intraday_interval_ms
 
-    execution_rows = []
+    execution_all = []
     execution_timestamps = []
     if Path(execution_file).exists() and int(exit_p.get("execution_use_1m", 1)) > 0:
         execution_all = load_ohlcv_data(execution_file)
-        execution_rows = _slice_by_timestamp_window(execution_all, start_ts, end_ts + 60_000)
-        execution_timestamps = [row["timestamp"] for row in execution_rows]
+        execution_timestamps = [row["timestamp"] for row in execution_all]
 
-    funding_rows = []
+    funding_all = []
     funding_timestamps = []
     if Path(funding_file).exists() and int(exit_p.get("funding_fee_enabled", 1)) > 0:
         funding_all = load_funding_data(funding_file)
-        funding_rows = _slice_by_timestamp_window(funding_all, start_ts, end_ts)
-        funding_timestamps = [row["timestamp"] for row in funding_rows]
+        funding_timestamps = [row["timestamp"] for row in funding_all]
 
     hourly_state = _prepare_state(
         hourly_all,
@@ -724,6 +737,103 @@ def backtest_macd_aggressive(
     four_hour_interval_ms = _infer_interval_ms(four_hour_bars, 240) if four_hour_bars else 240 * 60_000
     hourly_close_timestamps = [row["timestamp"] + hourly_interval_ms for row in hourly_state]
     four_hour_close_timestamps = [row["timestamp"] + four_hour_interval_ms for row in four_hour_state]
+
+    return {
+        "intraday_all": intraday_all,
+        "hourly_all": hourly_all,
+        "intraday_timestamps": intraday_timestamps,
+        "hourly_timestamps": hourly_timestamps,
+        "intraday_interval_ms": intraday_interval_ms,
+        "hourly_interval_ms": hourly_interval_ms,
+        "intraday_state": intraday_state,
+        "hourly_state": hourly_state,
+        "hourly_close_timestamps": hourly_close_timestamps,
+        "four_hour_bars": four_hour_bars,
+        "four_hour_state": four_hour_state,
+        "four_hour_close_timestamps": four_hour_close_timestamps,
+        "sentiment_state": sentiment_state,
+        "sentiment_timestamps": sentiment_timestamps,
+        "execution_all": execution_all,
+        "execution_timestamps": execution_timestamps,
+        "funding_all": funding_all,
+        "funding_timestamps": funding_timestamps,
+    }
+
+
+def backtest_macd_aggressive(
+    strategy_func,
+    intraday_file,
+    hourly_file,
+    start_date,
+    end_date,
+    strategy_params,
+    exit_params=None,
+    sentiment_file=None,
+    execution_file=None,
+    funding_file=None,
+    include_diagnostics=False,
+    prepared_context=None,
+):
+    exit_p = dict(EXIT_PARAMS)
+    if exit_params:
+        exit_p.update(exit_params)
+
+    if prepared_context is None:
+        prepared_context = prepare_backtest_context(
+            strategy_params,
+            intraday_file=intraday_file,
+            hourly_file=hourly_file,
+            sentiment_file=sentiment_file,
+            execution_file=execution_file,
+            funding_file=funding_file,
+            exit_params=exit_p,
+        )
+
+    intraday_all = prepared_context["intraday_all"]
+    hourly_all = prepared_context["hourly_all"]
+    intraday_timestamps = prepared_context["intraday_timestamps"]
+    intraday_interval_ms = prepared_context["intraday_interval_ms"]
+    hourly_state = prepared_context["hourly_state"]
+    four_hour_state = prepared_context["four_hour_state"]
+    intraday_state = prepared_context["intraday_state"]
+    hourly_close_timestamps = prepared_context["hourly_close_timestamps"]
+    four_hour_close_timestamps = prepared_context["four_hour_close_timestamps"]
+    sentiment_state = prepared_context["sentiment_state"]
+    sentiment_timestamps = prepared_context["sentiment_timestamps"]
+
+    intraday_start_idx, intraday_end_idx = _beijing_window_indices_from_timestamps(intraday_timestamps, start_date, end_date)
+    intraday_data = intraday_all[intraday_start_idx:intraday_end_idx]
+    if not intraday_data or not hourly_all:
+        raise ValueError(f"missing data for window {start_date}~{end_date}")
+
+    start_ts = intraday_data[0]["timestamp"]
+    end_ts = intraday_data[-1]["timestamp"] + intraday_interval_ms
+
+    execution_rows = []
+    execution_timestamps = []
+    execution_all = prepared_context["execution_all"]
+    if execution_all:
+        full_execution_timestamps = prepared_context["execution_timestamps"]
+        execution_start_idx, execution_end_idx = _timestamp_window_indices_inclusive(
+            full_execution_timestamps,
+            start_ts,
+            end_ts + 60_000,
+        )
+        execution_rows = execution_all[execution_start_idx:execution_end_idx]
+        execution_timestamps = full_execution_timestamps[execution_start_idx:execution_end_idx]
+
+    funding_rows = []
+    funding_timestamps = []
+    funding_all = prepared_context["funding_all"]
+    if funding_all:
+        full_funding_timestamps = prepared_context["funding_timestamps"]
+        funding_start_idx, funding_end_idx = _timestamp_window_indices_inclusive(
+            full_funding_timestamps,
+            start_ts,
+            end_ts,
+        )
+        funding_rows = funding_all[funding_start_idx:funding_end_idx]
+        funding_timestamps = full_funding_timestamps[funding_start_idx:funding_end_idx]
 
     capital = 100000.0
     initial_capital = capital

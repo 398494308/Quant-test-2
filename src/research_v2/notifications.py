@@ -12,6 +12,51 @@ from research_v2.strategy_code import StrategyCandidate
 
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
+REGION_LABELS = {
+    "PARAMS": "参数",
+    "_is_sideways_regime": "横盘识别",
+    "_trend_quality_ok": "趋势质量",
+    "_trend_followthrough_ok": "跟随确认",
+    "strategy": "入场逻辑",
+}
+TAG_LABELS = {
+    "reduce_false_breakdown": "减少空头假破位",
+    "reduce_false_breakout": "减少多头假突破",
+    "breakdown_entry": "收紧空头入场",
+    "breakout_entry": "收紧多头入场",
+    "tighten_filter": "收紧过滤阈值",
+    "fee_drag_control": "控制手续费拖累",
+    "sideways_filter": "增强横盘过滤",
+    "short_trend_quality": "收紧做空趋势质量",
+    "short_followthrough": "收紧做空跟随确认",
+    "fourh_base_filter": "强化4小时底座过滤",
+    "hourly_stretch_guard": "过滤1小时过度拉伸",
+    "fourh_confirmation": "强化4小时确认",
+    "fourh_participation": "强化4小时参与度",
+    "close_through_guard": "强化收盘穿透确认",
+    "close_drive_filter": "过滤弱收盘破位",
+    "fresh_impulse_filter": "强化新鲜动量过滤",
+    "fresh_impulse_entry": "要求新鲜动量入场",
+    "stale_step_filter": "过滤滞后补票",
+    "wick_filter": "过滤长影线假信号",
+    "extension_trap_filter": "过滤过度延伸陷阱",
+    "distance_cap": "限制追价距离",
+    "broad_participation_filter": "增强广泛参与过滤",
+    "short_breakdown": "空头破位优化",
+    "trigger_efficiency": "强化触发效率",
+    "recoil_flush_filter": "过滤下刺回收",
+    "hourly_discount_guard": "加入小时级折价保护",
+    "short_entry_guard": "加入做空入场保护",
+    "support_grind_filter": "过滤支撑位磨损破位",
+    "compressed_bear_drift": "过滤压缩式空头漂移",
+    "bear_front_run": "过滤空头前冲假信号",
+    "discounted_marginal_expansion_guard": "过滤深度折价但扩张不足",
+    "discounted_reexpansion_gap": "过滤折价后二次扩张不足",
+    "thin_followthrough_guard": "过滤薄参与延续",
+    "short_impulse_params": "收紧做空动量参数",
+    "short_trigger_surface": "收紧做空触发表面",
+    "stale_cascade_guard": "过滤空头二次追击",
+}
 
 
 @dataclass(frozen=True)
@@ -82,6 +127,89 @@ def _single_line(text: str, limit: int = 160) -> str:
     return cleaned[: limit - 1] + "…"
 
 
+def _contains_cjk(text: str) -> bool:
+    return any("\u4e00" <= char <= "\u9fff" for char in text)
+
+
+def _localize_tag(tag: str) -> str:
+    if tag in TAG_LABELS:
+        return TAG_LABELS[tag]
+    tokens = [item for item in tag.split("_") if item]
+    token_labels = {
+        "short": "做空",
+        "long": "做多",
+        "breakdown": "破位",
+        "breakout": "突破",
+        "entry": "入场",
+        "trend": "趋势",
+        "quality": "质量",
+        "followthrough": "跟随",
+        "sideways": "横盘",
+        "filter": "过滤",
+        "guard": "保护",
+        "fee": "手续费",
+        "drag": "拖累",
+        "control": "控制",
+        "hourly": "1小时",
+        "fourh": "4小时",
+        "base": "底座",
+        "fresh": "新鲜",
+        "impulse": "动量",
+        "close": "收盘",
+        "through": "穿透",
+        "support": "支撑",
+        "compressed": "压缩",
+        "bear": "空头",
+        "recoil": "回抽",
+        "trigger": "触发",
+        "surface": "表面",
+        "tighten": "收紧",
+        "discounted": "深度折价",
+        "expansion": "扩张",
+        "reexpansion": "再扩张",
+        "marginal": "边缘",
+    }
+    localized = [token_labels[token] for token in tokens if token in token_labels]
+    if localized:
+        return "/".join(localized)
+    return "策略方向调整"
+
+
+def _localized_tags_text(tags: tuple[str, ...] | list[str]) -> str:
+    localized = [_localize_tag(tag) for tag in tags]
+    return _single_line(" / ".join(localized), limit=180)
+
+
+def _localized_regions_text(regions: tuple[str, ...] | list[str]) -> str:
+    localized = [REGION_LABELS.get(region, region) for region in regions]
+    return _single_line("、".join(localized), limit=120)
+
+
+def _candidate_hypothesis_text(candidate: StrategyCandidate) -> str:
+    if _contains_cjk(candidate.hypothesis):
+        return _single_line(candidate.hypothesis, limit=220)
+    return _single_line(
+        f"本轮围绕“{_localized_tags_text(candidate.change_tags)}”做小步迭代，重点调整{_localized_regions_text(candidate.edited_regions)}。",
+        limit=220,
+    )
+
+
+def _candidate_plan_text(candidate: StrategyCandidate) -> str:
+    if _contains_cjk(candidate.change_plan):
+        return _single_line(candidate.change_plan, limit=220)
+    return _single_line(
+        f"计划在{_localized_regions_text(candidate.edited_regions)}中继续收紧低质量信号，优先降低手续费拖累、无效交易和回撤。",
+        limit=220,
+    )
+
+
+def _candidate_effect_text(candidate: StrategyCandidate) -> str:
+    zh_effects = [_single_line(effect, limit=80) for effect in candidate.expected_effects if _contains_cjk(effect)]
+    if zh_effects:
+        return _single_line("；".join(zh_effects), limit=220)
+    return "预期减少无效交易，改善 Sortino、手续费拖累和回撤。"
+
+
 def build_discord_summary_message(
     *,
     title: str,
@@ -91,9 +219,9 @@ def build_discord_summary_message(
     candidate: StrategyCandidate | None = None,
 ) -> str:
     metrics = report.metrics
-    window_text = f"{eval_window_count}评估"
+    window_text = f"{eval_window_count} 个评估窗口"
     if validation_window_count > 0:
-        window_text += f" / {validation_window_count}验证"
+        window_text += f" / {validation_window_count} 个验证窗口"
     rows = [
         ("窗口", window_text),
         (
@@ -113,14 +241,16 @@ def build_discord_summary_message(
         "```text",
         _render_markdown_table(rows),
         "```",
-        f"Gate: {_single_line(report.gate_reason, limit=280)}",
+        f"门禁：{_single_line(report.gate_reason, limit=280)}",
     ]
     if candidate is not None:
         parts.extend(
             [
-                f"假设: {_single_line(candidate.hypothesis)}",
-                f"标签: {_single_line(', '.join(candidate.change_tags), limit=120)}",
-                f"计划: {_single_line(candidate.change_plan, limit=220)}",
+                f"方向：{_localized_tags_text(candidate.change_tags)}",
+                f"修改区域：{_localized_regions_text(candidate.edited_regions)}",
+                f"假设：{_candidate_hypothesis_text(candidate)}",
+                f"计划：{_candidate_plan_text(candidate)}",
+                f"预期：{_candidate_effect_text(candidate)}",
             ]
         )
     return "\n".join(parts)
