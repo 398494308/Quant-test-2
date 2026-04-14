@@ -10,6 +10,9 @@ state/*.pid
 state/*.lock
 state/*.stop
 reports/*.csv
+data/price/*.csv
+data/index/*.csv
+data/funding/*.csv
 dist/
 .git/
 .venv/

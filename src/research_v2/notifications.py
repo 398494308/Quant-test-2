@@ -87,19 +87,19 @@ def build_discord_summary_message(
     title: str,
     report: EvaluationReport,
     eval_window_count: int,
-    holdout_window_count: int,
+    validation_window_count: int,
     candidate: StrategyCandidate | None = None,
 ) -> str:
     metrics = report.metrics
     window_text = f"{eval_window_count}评估"
-    if holdout_window_count > 0:
-        window_text += f" / {holdout_window_count}留出"
+    if validation_window_count > 0:
+        window_text += f" / {validation_window_count}验证"
     rows = [
         ("窗口", window_text),
         (
             "收益",
             f"{metrics['eval_avg_return']:.2f}%"
-            + (f" / {metrics['holdout_avg_return']:.2f}%" if holdout_window_count > 0 else ""),
+            + (f" / {metrics['validation_avg_return']:.2f}%" if validation_window_count > 0 else ""),
         ),
         ("评分", f"{metrics['quality_score']:.2f} / {metrics['promotion_score']:.2f}"),
         ("最大回撤", f"{metrics['worst_drawdown']:.2f}%"),

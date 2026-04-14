@@ -87,20 +87,35 @@ def build_strategy_research_prompt(
 {strategy_source}
 ```
 
+门禁规则（触碰即淘汰）：
+- 总交易数 >= 30
+- eval 交易数 >= 24
+- 验证集交易数 >= 5
+- eval 正收益窗口占比 >= 30%
+- 最大回撤 <= 50%
+- 爆仓次数 = 0
+- 验证集平均收益 >= -10%
+- eval 与验证集落差 <= 30
+- 手续费拖累 <= 6%
+
+评分方式：
+- 评分 = eval + 验证集全部日收益率合并后的年化 Sortino Ratio
+- Sortino 只惩罚下行波动，不惩罚向上的大波动
+- 你看不到验证集的具体数字，但门禁会告诉你是否通过
+
 硬约束：
 - 只允许修改 `src/strategy_macd_aggressive.py`。
 - 只允许改这些区域：{", ".join(EDITABLE_REGIONS)}。
 - 保留 `PARAMS`、`strategy()`、`_is_sideways_regime()`、`_trend_quality_ok()`、`_trend_followthrough_ok()` 这些符号。
 - 不要引入网络、文件、随机数、外部依赖。
-- 不要为了刷单窗收益而牺牲留出表现。
 - 每轮只做一个明确假设，最多改 1 到 3 个区域。
 - 如果最近某个方向连续失败，不要继续重复。
 
 你要优先解决：
-- 留出收益偏弱
-- 横盘假突破
+- 提高 Sortino（减少下行波动、提高收益）
+- 横盘假突破导致的无效交易
 - 手续费拖累过高
-- 高回撤而非高质量收益
+- 高回撤
 
 输出要求：
 - 只输出 JSON。

@@ -116,11 +116,11 @@ def _aggregate_signal_stats(results: list[dict[str, Any]], group: str) -> list[s
     return lines
 
 
-def _build_window_lines(results: list[dict[str, Any]], include_holdout: bool) -> list[str]:
+def _build_window_lines(results: list[dict[str, Any]], include_validation: bool) -> list[str]:
     lines: list[str] = []
     for item in results:
         window = item["window"]
-        if window.group == "holdout" and not include_holdout:
+        if window.group == "validation" and not include_validation:
             continue
         result = item["result"]
         group_label = "评" if window.group == "eval" else "留"
@@ -141,16 +141,16 @@ def summarize_evaluation(
     **_kwargs: Any,
 ) -> EvaluationReport:
     eval_results = _window_payloads(results, "eval")
-    holdout_results = _window_payloads(results, "holdout")
+    validation_results = _window_payloads(results, "validation")
 
     eval_returns = [item["result"]["return"] for item in eval_results]
-    holdout_returns = [item["result"]["return"] for item in holdout_results]
+    validation_returns = [item["result"]["return"] for item in validation_results]
     eval_avg_return = _mean(eval_returns)
     eval_median_return = median(eval_returns) if eval_returns else 0.0
     eval_p25_return = _quantile(eval_returns, 0.25)
     eval_worst_return = min(eval_returns) if eval_returns else 0.0
-    holdout_avg_return = _mean(holdout_returns)
-    holdout_worst_return = min(holdout_returns) if holdout_returns else 0.0
+    validation_avg_return = _mean(validation_returns)
+    validation_worst_return = min(validation_returns) if validation_returns else 0.0
     eval_positive_ratio = _safe_ratio(sum(1 for value in eval_returns if value > 0.0), len(eval_returns))
     eval_std = _std(eval_returns)
 
@@ -159,11 +159,11 @@ def summarize_evaluation(
     liquidations = sum(int(item["result"].get("liquidations", 0)) for item in results)
     total_trades = sum(int(item["result"]["trades"]) for item in results)
     eval_trades = sum(int(item["result"]["trades"]) for item in eval_results)
-    holdout_trades = sum(int(item["result"]["trades"]) for item in holdout_results)
+    validation_trades = sum(int(item["result"]["trades"]) for item in validation_results)
 
     eval_daily_returns = _collect_daily_returns(results, "eval")
-    holdout_daily_returns = _collect_daily_returns(results, "holdout")
-    all_daily_returns = eval_daily_returns + holdout_daily_returns
+    validation_daily_returns = _collect_daily_returns(results, "validation")
+    all_daily_returns = eval_daily_returns + validation_daily_returns
     daily_sharpe = _annualized_sharpe(eval_daily_returns)
     daily_sortino = _annualized_sortino(eval_daily_returns)
 
@@ -173,12 +173,12 @@ def summarize_evaluation(
         default=0.0,
     )
 
-    holdout_gap = eval_avg_return - holdout_avg_return
+    validation_gap = eval_avg_return - validation_avg_return
 
     # ==================== 评分：纯 Sortino ====================
     # quality_score = eval 窗口的年化 Sortino（平时练习的风险收益比）
-    # promotion_score = eval + holdout 合并后的年化 Sortino
-    #   如果留出窗口表现差，会自然拉低 promotion_score，不需要额外惩罚
+    # promotion_score = eval + validation 合并后的年化 Sortino
+    #   如果验证窗口表现差，会自然拉低 promotion_score，不需要额外惩罚
     quality_score = daily_sortino
     promotion_score = _annualized_sortino(all_daily_returns)
 
@@ -187,18 +187,18 @@ def summarize_evaluation(
         gate_reasons.append(f"总交易不足({total_trades})")
     if eval_trades < gates.min_eval_trades:
         gate_reasons.append(f"评估交易不足({eval_trades})")
-    if holdout_trades < gates.min_holdout_trades:
-        gate_reasons.append(f"留出交易不足({holdout_trades})")
+    if validation_trades < gates.min_validation_trades:
+        gate_reasons.append(f"验证交易不足({validation_trades})")
     if eval_positive_ratio < gates.min_positive_ratio:
         gate_reasons.append(f"正收益窗比例偏低({eval_positive_ratio:.0%})")
     if worst_drawdown > gates.max_drawdown_pct:
         gate_reasons.append(f"最大回撤过大({worst_drawdown:.1f}%)")
     if liquidations > gates.max_liquidations:
         gate_reasons.append(f"爆仓次数过多({liquidations})")
-    if holdout_avg_return < gates.min_holdout_return:
-        gate_reasons.append(f"留出收益不足({holdout_avg_return:.2f}%)")
-    if holdout_gap > gates.max_eval_holdout_gap:
-        gate_reasons.append(f"评估/留出落差过大({holdout_gap:.2f})")
+    if validation_avg_return < gates.min_validation_return:
+        gate_reasons.append(f"验证收益不足({validation_avg_return:.2f}%)")
+    if validation_gap > gates.max_eval_validation_gap:
+        gate_reasons.append(f"评估/验证落差过大({validation_gap:.2f})")
     if avg_fee_drag > gates.max_fee_drag_pct:
         gate_reasons.append(f"手续费拖累过高({avg_fee_drag:.2f}%)")
 
@@ -211,7 +211,7 @@ def summarize_evaluation(
         f"评估平均收益: {eval_avg_return:.2f}%",
         f"评估中位收益: {eval_median_return:.2f}%",
         f"评估P25收益: {eval_p25_return:.2f}%",
-        f"留出收益: {holdout_avg_return:.2f}%",
+        f"验证收益: {validation_avg_return:.2f}%",
         f"日度 Sortino / Sharpe: {daily_sortino:.2f} / {daily_sharpe:.2f}",
         f"最大回撤: {worst_drawdown:.2f}%",
         f"手续费拖累: {avg_fee_drag:.2f}%",
@@ -220,17 +220,16 @@ def summarize_evaluation(
         f"Gate: {gate_reason}",
         "",
         "窗口明细:",
-        *_build_window_lines(results, include_holdout=True),
+        *_build_window_lines(results, include_validation=True),
     ]
     if weakest_signals:
         summary_lines.extend(["", "拖累较大的信号:", *weakest_signals])
 
     prompt_lines = [
-        f"当前基底质量分={quality_score:.2f}，晋级分={promotion_score:.2f}，gate={gate_reason}",
+        f"当前基底评估Sortino={quality_score:.2f}，综合Sortino={promotion_score:.2f}，gate={gate_reason}",
         f"评估平均收益={eval_avg_return:.2f}%，中位数={eval_median_return:.2f}%，P25={eval_p25_return:.2f}%",
-        f"留出收益={holdout_avg_return:.2f}%，评估-留出差值={holdout_gap:.2f}",
         f"日度Sortino={daily_sortino:.2f}，Sharpe={daily_sharpe:.2f}，最大回撤={worst_drawdown:.2f}%",
-        f"手续费拖累={avg_fee_drag:.2f}%，总交易={total_trades}，爆仓={liquidations}",
+        f"手续费拖累={avg_fee_drag:.2f}%，eval交易={eval_trades}，爆仓={liquidations}",
     ]
     if weakest_signals:
         prompt_lines.append("拖累信号: " + " | ".join(weakest_signals))
@@ -240,8 +239,8 @@ def summarize_evaluation(
         "eval_median_return": eval_median_return,
         "eval_p25_return": eval_p25_return,
         "eval_worst_return": eval_worst_return,
-        "holdout_avg_return": holdout_avg_return,
-        "holdout_worst_return": holdout_worst_return,
+        "validation_avg_return": validation_avg_return,
+        "validation_worst_return": validation_worst_return,
         "eval_positive_ratio": eval_positive_ratio,
         "eval_std": eval_std,
         "worst_drawdown": worst_drawdown,
@@ -249,11 +248,11 @@ def summarize_evaluation(
         "liquidations": float(liquidations),
         "total_trades": float(total_trades),
         "eval_trades": float(eval_trades),
-        "holdout_trades": float(holdout_trades),
+        "validation_trades": float(validation_trades),
         "daily_sharpe": daily_sharpe,
         "daily_sortino": daily_sortino,
         "profit_factor": profit_factor,
-        "holdout_gap": holdout_gap,
+        "validation_gap": validation_gap,
         "quality_score": quality_score,
         "promotion_score": promotion_score,
     }

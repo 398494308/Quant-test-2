@@ -59,19 +59,19 @@ class WindowConfig:
     eval_end_date: str
     eval_window_days: int
     eval_step_days: int
-    holdout_days: int
+    validation_days: int
 
 
 @dataclass(frozen=True)
 class GateConfig:
     min_total_trades: int
     min_eval_trades: int
-    min_holdout_trades: int
+    min_validation_trades: int
     min_positive_ratio: float
     max_drawdown_pct: float
     max_liquidations: int
-    min_holdout_return: float
-    max_eval_holdout_gap: float
+    min_validation_return: float
+    max_eval_validation_gap: float
     max_fee_drag_pct: float
 
 
@@ -85,6 +85,8 @@ class ResearchRuntimeConfig:
     failure_cooldown_seconds: int
     prompt_max_output_tokens: int
     max_recent_journal_entries: int
+    early_reject_after_windows: int
+    early_reject_sortino_threshold: float
 
 
 # ==================== 对外入口 ====================
@@ -111,18 +113,18 @@ def load_research_runtime_config(repo_root: Path) -> ResearchRuntimeConfig:
         eval_end_date=os.getenv("MACD_V2_EVAL_END_DATE", os.getenv("MACD_EVAL_END_DATE", "2026-03-31")),
         eval_window_days=_env_int("MACD_V2_EVAL_WINDOW_DAYS", 28),
         eval_step_days=_env_int("MACD_V2_EVAL_STEP_DAYS", 21),
-        holdout_days=_env_int("MACD_V2_HOLDOUT_DAYS", 28),
+        validation_days=_env_int("MACD_V2_VALIDATION_DAYS", 28),
     )
 
     gates = GateConfig(
         min_total_trades=_env_int("MACD_V2_MIN_TOTAL_TRADES", 30),
         min_eval_trades=_env_int("MACD_V2_MIN_EVAL_TRADES", 24),
-        min_holdout_trades=_env_int("MACD_V2_MIN_HOLDOUT_TRADES", 5),
+        min_validation_trades=_env_int("MACD_V2_MIN_VALIDATION_TRADES", 5),
         min_positive_ratio=_env_float("MACD_V2_MIN_POSITIVE_RATIO", 0.30),
         max_drawdown_pct=_env_float("MACD_V2_MAX_DRAWDOWN_PCT", 50.0),
         max_liquidations=_env_int("MACD_V2_MAX_LIQUIDATIONS", 0),
-        min_holdout_return=_env_float("MACD_V2_MIN_HOLDOUT_RETURN", -10.0),
-        max_eval_holdout_gap=_env_float("MACD_V2_MAX_EVAL_HOLDOUT_GAP", 30.0),
+        min_validation_return=_env_float("MACD_V2_MIN_VALIDATION_RETURN", -10.0),
+        max_eval_validation_gap=_env_float("MACD_V2_MAX_EVAL_VALIDATION_GAP", 30.0),
         max_fee_drag_pct=_env_float("MACD_V2_MAX_FEE_DRAG_PCT", 6.0),
     )
 
@@ -135,4 +137,6 @@ def load_research_runtime_config(repo_root: Path) -> ResearchRuntimeConfig:
         failure_cooldown_seconds=_env_int("MACD_V2_FAILURE_COOLDOWN_SECONDS", 60),
         prompt_max_output_tokens=_env_int("MACD_V2_PROMPT_MAX_OUTPUT_TOKENS", 12000),
         max_recent_journal_entries=_env_int("MACD_V2_MAX_RECENT_JOURNAL_ENTRIES", 12),
+        early_reject_after_windows=_env_int("MACD_V2_EARLY_REJECT_WINDOWS", 15),
+        early_reject_sortino_threshold=_env_float("MACD_V2_EARLY_REJECT_SORTINO", -1.0),
     )

@@ -29,7 +29,7 @@ import backtest_macd_aggressive as backtest_module
 import strategy_macd_aggressive as strategy_module
 from codex_exec_client import StrategyGenerationTransientError, build_json_text_format, generate_json_object
 from research_v2.config import ResearchRuntimeConfig, load_research_runtime_config
-from research_v2.evaluation import EvaluationReport, summarize_evaluation
+from research_v2.evaluation import EvaluationReport, summarize_evaluation, _annualized_sortino, _collect_daily_returns
 from research_v2.journal import append_journal_entry, build_journal_prompt_summary, has_recent_code_hash, load_journal_entries, maybe_compact
 from research_v2.notifications import build_discord_summary_message, load_discord_config, send_discord_message
 from research_v2.prompting import build_candidate_response_schema, build_strategy_research_prompt
@@ -53,7 +53,7 @@ RUNTIME = load_research_runtime_config(REPO_ROOT)
 WINDOWS = build_research_windows(RUNTIME.windows)
 DISCORD_CONFIG = load_discord_config()
 EVAL_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "eval")
-HOLDOUT_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "holdout")
+VALIDATION_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "validation")
 
 best_source = ""
 best_report: EvaluationReport | None = None
@@ -115,8 +115,16 @@ def reload_strategy_module() -> None:
 # ==================== 评估执行 ====================
 
 
-def _run_base_backtests() -> list[dict[str, Any]]:
+class EarlyRejection(Exception):
+    """前 N 个 eval 窗口 Sortino 太差，提前终止回测。"""
+
+
+def _run_base_backtests(allow_early_reject: bool = False) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
+    eval_count = 0
+    check_at = RUNTIME.early_reject_after_windows
+    threshold = RUNTIME.early_reject_sortino_threshold
+
     for window in WINDOWS:
         result = backtest_module.backtest_macd_aggressive(
             strategy_func=strategy_module.strategy,
@@ -129,11 +137,21 @@ def _run_base_backtests() -> list[dict[str, Any]]:
             include_diagnostics=True,
         )
         results.append({"window": window, "result": result})
+
+        if allow_early_reject and window.group == "eval":
+            eval_count += 1
+            if eval_count == check_at and check_at > 0:
+                daily = _collect_daily_returns(results, "eval")
+                sortino = _annualized_sortino(daily)
+                if sortino < threshold:
+                    raise EarlyRejection(
+                        f"前{check_at}个eval窗口Sortino={sortino:.2f} < {threshold}, 提前淘汰"
+                    )
     return results
 
 
-def evaluate_current_strategy() -> EvaluationReport:
-    base_results = _run_base_backtests()
+def evaluate_current_strategy(allow_early_reject: bool = False) -> EvaluationReport:
+    base_results = _run_base_backtests(allow_early_reject=allow_early_reject)
     return summarize_evaluation(base_results, RUNTIME.gates)
 
 
@@ -241,7 +259,7 @@ def initialize_best_state(force_rebuild: bool = False) -> None:
                 title="📌 研究器 v2 已加载最优基底",
                 report=best_report,
                 eval_window_count=EVAL_WINDOW_COUNT,
-                holdout_window_count=HOLDOUT_WINDOW_COUNT,
+                validation_window_count=VALIDATION_WINDOW_COUNT,
             ),
             context="initialize_saved_best",
         )
@@ -269,7 +287,7 @@ def initialize_best_state(force_rebuild: bool = False) -> None:
             title="📌 研究器 v2 基底初始化完成",
             report=best_report,
             eval_window_count=EVAL_WINDOW_COUNT,
-            holdout_window_count=HOLDOUT_WINDOW_COUNT,
+            validation_window_count=VALIDATION_WINDOW_COUNT,
         ),
         context="initialize_baseline",
     )
@@ -350,7 +368,13 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
     reload_strategy_module()
 
     try:
-        candidate_report = evaluate_current_strategy()
+        candidate_report = evaluate_current_strategy(allow_early_reject=True)
+    except EarlyRejection as exc:
+        write_strategy_source(RUNTIME.paths.strategy_file, best_source)
+        reload_strategy_module()
+        log_info(f"第 {iteration_id} 轮提前淘汰: {exc}")
+        write_heartbeat("iteration_early_rejected", message=f"iteration {iteration_id} early rejected: {exc}")
+        return "early_rejected"
     except StrategyGenerationTransientError:
         raise
     except Exception:
@@ -390,7 +414,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
                 title=f"🚀 研究器 v2 新最优 #{iteration_id}",
                 report=best_report,
                 eval_window_count=EVAL_WINDOW_COUNT,
-                holdout_window_count=HOLDOUT_WINDOW_COUNT,
+                validation_window_count=VALIDATION_WINDOW_COUNT,
                 candidate=candidate,
             ),
             context=f"accepted_iteration_{iteration_id}",

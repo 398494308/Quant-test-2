@@ -106,7 +106,7 @@ def _compact_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
 
     # 参数有效区间（从 accepted 中提取 metrics 范围）
     metric_keys = [
-        "eval_avg_return", "holdout_avg_return", "worst_drawdown",
+        "eval_avg_return", "validation_avg_return", "worst_drawdown",
         "avg_fee_drag", "daily_sharpe", "daily_sortino", "profit_factor",
     ]
     accepted_metric_ranges: dict[str, dict[str, float]] = {}

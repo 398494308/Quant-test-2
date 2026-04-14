@@ -13,9 +13,9 @@ DATA_DIR = REPO_ROOT / "data/price"
 FUNDING_DIR = REPO_ROOT / "data/funding"
 API_URL = "https://fapi.binance.com/fapi/v1/klines"
 OKX_FUNDING_API_URL = "https://www.okx.com/api/v5/public/funding-rate-history"
-LOCAL_FORWARD_15M = REPO_ROOT / "data/price/BTCUSDT_futures_15m_20250601_20260401.csv"
-LOCAL_FORWARD_1H = REPO_ROOT / "data/price/BTCUSDT_futures_1h_20250601_20260401.csv"
+DATA_START_STR = "2023-01-01"
 DATA_END_STR = "2026-04-01"
+FILE_TAG = f"{DATA_START_STR.replace('-', '')}_{DATA_END_STR.replace('-', '')}"
 
 
 def _download_klines(symbol, interval, start_str, end_str):
@@ -117,21 +117,13 @@ def _merge_rows(downloaded_rows, local_rows):
     return [merged[key] for key in sorted(merged)]
 
 
-def build_dataset(interval, local_forward_path=None, start_str="2024-06-01", bridge_end_str="2025-06-01", end_str=DATA_END_STR):
-    output_name = f"BTCUSDT_futures_{interval}_20240601_20260401.csv"
+def build_dataset(interval, start_str=DATA_START_STR, end_str=DATA_END_STR):
+    output_name = f"BTCUSDT_futures_{interval}_{FILE_TAG}.csv"
     output_path = DATA_DIR / output_name
-    if local_forward_path is None:
-        _stream_download_rows(output_path, "BTCUSDT", interval, start_str, end_str)
-        return
-
-    downloaded = _download_klines("BTCUSDT", interval, start_str, bridge_end_str)
-    local_rows = _read_csv_rows(local_forward_path)
-    merged_rows = _merge_rows(downloaded, local_rows)
-    _write_rows(output_path, merged_rows)
-    print(f"{output_path}: {len(merged_rows)} rows")
+    _stream_download_rows(output_path, "BTCUSDT", interval, start_str, end_str)
 
 
-def download_okx_funding(inst_id="BTC-USDT-SWAP", start_str="2024-06-01", end_str=DATA_END_STR):
+def download_okx_funding(inst_id="BTC-USDT-SWAP", start_str=DATA_START_STR, end_str=DATA_END_STR):
     start_ms = int(datetime.strptime(start_str, "%Y-%m-%d").timestamp() * 1000)
     end_ms = int(datetime.strptime(end_str, "%Y-%m-%d").timestamp() * 1000)
     rows_by_ts = {}
@@ -162,7 +154,7 @@ def download_okx_funding(inst_id="BTC-USDT-SWAP", start_str="2024-06-01", end_st
         cursor = oldest_ts
         time.sleep(0.18)
 
-    output_path = FUNDING_DIR / "OKX_BTC_USDT_SWAP_funding_20240601_20260401.csv"
+    output_path = FUNDING_DIR / f"OKX_BTC_USDT_SWAP_funding_{FILE_TAG}.csv"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", newline="") as handle:
         writer = csv.writer(handle)
@@ -173,8 +165,8 @@ def download_okx_funding(inst_id="BTC-USDT-SWAP", start_str="2024-06-01", end_st
 
 
 def main():
-    build_dataset("15m", LOCAL_FORWARD_15M)
-    build_dataset("1h", LOCAL_FORWARD_1H)
+    build_dataset("15m")
+    build_dataset("1h")
     build_dataset("1m")
     download_okx_funding()
 
