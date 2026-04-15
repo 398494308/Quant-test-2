@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import requests
 
-from research_v2.evaluation import EvaluationReport
+from research_v2.evaluation import EvaluationReport, overfit_reference_action, overfit_risk_level_from_score
 from research_v2.strategy_code import StrategyCandidate
 
 
@@ -219,6 +219,9 @@ def build_discord_summary_message(
     candidate: StrategyCandidate | None = None,
 ) -> str:
     metrics = report.metrics
+    overfit_score = float(metrics.get("overfit_risk_score", 0.0))
+    overfit_hard_fail = float(metrics.get("overfit_hard_fail", 0.0)) > 0.5
+    overfit_level = "严重" if overfit_hard_fail else overfit_risk_level_from_score(overfit_score)
     window_text = f"{eval_window_count} 个评估窗口"
     if validation_window_count > 0:
         window_text += f" / {validation_window_count} 个验证窗口"
@@ -234,6 +237,13 @@ def build_discord_summary_message(
         ("到来/陪跑/掉头", f"{metrics['arrival_capture_score']:.2f} / {metrics['escort_capture_score']:.2f} / {metrics['turn_adaptation_score']:.2f}"),
         ("多/空捕获", f"{metrics['bull_capture_score']:.2f} / {metrics['bear_capture_score']:.2f}"),
         ("命中率/趋势段", f"{metrics['segment_hit_rate']:.0%} / {int(metrics['major_segment_count'])}"),
+        ("过拟合风险", f"{overfit_level} / {overfit_score:.0f}"),
+        (
+            "集中度/覆盖率",
+            f"{metrics.get('overfit_top1_positive_share', 0.0):.0%} / "
+            f"{metrics.get('overfit_chain_positive_share', 0.0):.0%} / "
+            f"{metrics.get('overfit_coverage_ratio', 1.0):.0%}",
+        ),
         ("评估唯一路径", f"{int(metrics['eval_unique_trend_points'])} 个4h点"),
         ("最大回撤", f"{metrics['worst_drawdown']:.2f}%"),
         ("总交易", str(int(metrics["total_trades"]))),
@@ -255,6 +265,7 @@ def build_discord_summary_message(
                 f"假设：{_candidate_hypothesis_text(candidate)}",
                 f"计划：{_candidate_plan_text(candidate)}",
                 f"预期：{_candidate_effect_text(candidate)}",
+                f"过拟合结论：{overfit_reference_action(overfit_score, overfit_hard_fail)}",
             ]
         )
     return "\n".join(parts)

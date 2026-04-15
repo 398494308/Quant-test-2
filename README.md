@@ -15,11 +15,11 @@
 研究器每轮会做这几件事：
 
 1. 读取当前最优策略。
-2. 先把“方向风险表 + 历史压缩摘要 + 最近轮次表”喂给模型，再生成一个新候选。
+2. 先把“方向风险表 + 过拟合风险表 + 历史压缩摘要 + 最近轮次表”喂给模型，再生成一个新候选。
 3. 候选必须显式说明它最接近哪个失败方向簇，并给出 `novelty_proof` 证明这轮不是重复试错。
 4. 先对候选跑少量 `smoke` 窗口；若运行报错，会在同一轮把错误回传给模型修复，而不是直接进入下一轮。
 5. `smoke` 通过后再跑整套 `eval + validation` 窗口回测。
-6. 只有 `gate` 通过且 `promotion_score` 提升，才晋级为新的最优。
+6. 只有 `gate` 通过、未触发严重过拟合淘汰且 `promotion_score` 提升，才晋级为新的最优。
 7. 把每轮结果写进 journal，包含 `accepted / rejected / early_rejected / runtime_failed`，并按 20 轮做压缩记忆。
 
 当前评分口径：
@@ -43,12 +43,14 @@
 - 防重复探索仍然走 prompt 约束，不做系统层面的硬禁令。
 - prompt 开头会先明确说明：这是 `15m` 执行、`1h + 4h` 确认的 BTC 激进趋势策略，目标是抓大波段，而不是追求平滑收益。
 - prompt 第一屏现在会显示“方向风险表”，按方向簇聚合最近同评分口径下的失败、零增益和运行报错。
+- prompt 第一屏紧跟着会显示“过拟合风险表”，明确标出哪些轮次虽然分数不差，但更像依赖少数同类行情，应该降权参考。
 - 模型必须输出 `closest_failed_cluster` 与 `novelty_proof`，先解释为什么不是继续围绕同一失败簇做近邻微调。
 - 若最近连续 3 轮都属于低变化轮次，prompt 会强制进入“探索轮”，要求切换因子家族或编辑区域家族，而不是继续做近邻改写。
 - 每轮先跑 `smoke` 窗口，运行报错会在同一轮进入 repair loop，最多按配置尝试修复，再决定是否记为 `runtime_failed`。
 - `heartbeat` 会写出当前阶段和窗口进度，便于判断卡在 `smoke`、`full_eval` 还是修复。
 - `2026-04-15` 已按当前 `trend_capture_v1` 评分口径重新初始化 best state，避免旧分数挡住本该通过的候选。
 - 提前淘汰从旧的 Sortino 逻辑改成了部分窗口趋势捕获快照：趋势段够多且趋势捕获分、命中率都很差时，会提前结束该轮。
+- 评估阶段现在会额外计算过拟合风险：若结果过度依赖单一正向趋势段、同向连续段，或有效命中覆盖率过低且明显多空偏科，会直接被 gate 掉。
 
 ## 当前策略轮廓
 
@@ -80,24 +82,27 @@
 
 研究器运行时会把最新最优状态写到 `state/research_macd_aggressive_v2_best.json`。
 
-截至 `2026-04-15 19:11:46`（Asia/Shanghai），按当前 `trend_capture_v1` 评分口径重新评估，当前基底快照为：
+截至 `2026-04-15 22:37:12`（Asia/Shanghai），按当前 `trend_capture_v1` 评分口径重新评估，当前最优快照为：
 
-- `quality_score = 0.21`
-- `promotion_score = 0.28`
-- `eval_trend_capture_score = 0.11`
-- `validation_trend_capture_score = 0.22`
-- `combined_trend_capture_score = 0.14`
-- `combined_return_score = 0.60`
-- `eval_avg_return = 1.89%`
-- `validation_avg_return = 10.84%`
-- `worst_drawdown = 18.52%`
-- `total_trades = 98`
+- `quality_score = 0.58`
+- `promotion_score = 0.74`
+- `eval_trend_capture_score = 0.63`
+- `validation_trend_capture_score = 0.28`
+- `combined_trend_capture_score = 0.46`
+- `combined_return_score = 1.38`
+- `eval_avg_return = 0.24%`
+- `validation_avg_return = 89.37%`
+- `worst_drawdown = 34.93%`
+- `total_trades = 475`
 - `eval_major_segment_count = 11`
 - `validation_major_segment_count = 10`
-- `segment_hit_rate = 22.73%`
-- `bull_capture_score = 0.05`
-- `bear_capture_score = 0.27`
-- `gate = 评估命中率偏低；验证命中率偏低`
+- `segment_hit_rate = 54.55%`
+- `bull_capture_score = 0.33`
+- `bear_capture_score = 0.67`
+- `overfit_risk_score = 20`
+- `overfit_top1_positive_share = 14.40%`
+- `overfit_coverage_ratio = 100%`
+- `gate = 通过`
 
 ## 目录结构
 

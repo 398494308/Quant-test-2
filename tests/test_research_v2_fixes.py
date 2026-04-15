@@ -246,6 +246,86 @@ class EvaluationFixesTest(unittest.TestCase):
         self.assertEqual(report.metrics["validation_overlap_trend_points"], 0.0)
         self.assertTrue(report.gate_passed)
 
+    def test_summarize_evaluation_rejects_severe_overfit_concentration(self):
+        eval_window = type("Window", (), {"group": "eval", "label": "评估1", "start_date": "2026-01-01", "end_date": "2026-02-10"})()
+        validation_window = type("Window", (), {"group": "validation", "label": "验证1", "start_date": "2026-02-11", "end_date": "2026-03-10"})()
+        eval_points = [
+            {"timestamp": idx, "label": f"t{idx}", "market_close": close, "atr_ratio": 0.01, "strategy_equity": equity}
+            for idx, close, equity in [
+                (1, 100.0, 100000.0),
+                (2, 110.0, 118000.0),
+                (3, 125.0, 145000.0),
+                (4, 145.0, 182000.0),
+                (5, 165.0, 228000.0),
+                (6, 182.0, 286000.0),
+                (7, 175.0, 286500.0),
+                (8, 160.0, 287000.0),
+                (9, 142.0, 287500.0),
+                (10, 122.0, 288000.0),
+                (11, 102.0, 288500.0),
+                (12, 110.0, 289000.0),
+                (13, 125.0, 289200.0),
+                (14, 138.0, 289400.0),
+                (15, 149.0, 289600.0),
+            ]
+        ]
+        validation_points = [
+            {"timestamp": idx, "label": f"t{idx}", "market_close": close, "atr_ratio": 0.01, "strategy_equity": equity}
+            for idx, close, equity in [
+                (16, 140.0, 289700.0),
+                (17, 128.0, 289750.0),
+                (18, 116.0, 289800.0),
+                (19, 105.0, 289850.0),
+                (20, 95.0, 289900.0),
+                (21, 102.0, 289920.0),
+                (22, 112.0, 289940.0),
+            ]
+        ]
+        results = [
+            {
+                "window": eval_window,
+                "result": {
+                    "return": 180.0,
+                    "max_drawdown": 10.0,
+                    "trades": 9,
+                    "fee_drag_pct": 0.4,
+                    "liquidations": 0,
+                    "trend_capture_points": eval_points,
+                },
+            },
+            {
+                "window": validation_window,
+                "result": {
+                    "return": 0.3,
+                    "max_drawdown": 2.0,
+                    "trades": 2,
+                    "fee_drag_pct": 0.2,
+                    "liquidations": 0,
+                    "trend_capture_points": validation_points,
+                },
+            },
+        ]
+        gates = GateConfig(
+            min_eval_segments=0,
+            min_validation_segments=0,
+            min_eval_hit_rate=0.0,
+            min_validation_hit_rate=0.0,
+            min_eval_trend_score=-10.0,
+            min_validation_trend_score=-10.0,
+            max_capture_drop=100.0,
+            min_bull_capture=-10.0,
+            min_bear_capture=-10.0,
+            max_fee_drag_pct=100.0,
+        )
+
+        report = summarize_evaluation(results, gates)
+
+        self.assertFalse(report.gate_passed)
+        self.assertIn("过拟合风险", report.gate_reason)
+        self.assertGreater(report.metrics["overfit_risk_score"], 0.0)
+        self.assertGreater(report.metrics["overfit_top1_positive_share"], 0.60)
+        self.assertEqual(report.metrics["overfit_hard_fail"], 1.0)
+
 
 class StrategyValidationFixesTest(unittest.TestCase):
     def test_validate_strategy_source_rejects_reversed_param_relations(self):
@@ -356,6 +436,40 @@ class JournalPromptFixesTest(unittest.TestCase):
         self.assertIn("方向风险表", first_line)
         self.assertIn("ownership_cluster", summary)
         self.assertIn("EXHAUSTED", summary)
+
+    def test_journal_summary_emits_overfit_risk_board_after_direction_risk(self):
+        entries = [
+            {
+                "iteration": 7,
+                "candidate_id": "candidate_overfit",
+                "outcome": "accepted",
+                "stop_stage": "full_eval",
+                "promotion_score": 0.72,
+                "quality_score": 0.44,
+                "promotion_delta": 0.12,
+                "gate_reason": "通过",
+                "change_tags": ["long_breakout"],
+                "edited_regions": ["strategy"],
+                "hypothesis": "结果主要吃到少数强趋势段。",
+                "metrics": {
+                    "overfit_risk_score": 48.0,
+                    "overfit_top1_positive_share": 0.52,
+                    "overfit_chain_positive_share": 0.67,
+                    "overfit_coverage_ratio": 0.33,
+                    "overfit_bull_bear_gap": 0.72,
+                    "overfit_capture_drop_abs": 0.18,
+                },
+                "score_regime": "trend_capture_v1",
+            }
+        ]
+
+        summary = build_journal_prompt_summary(entries, limit=8)
+
+        direction_index = summary.index("方向风险表")
+        overfit_index = summary.index("过拟合风险表")
+        self.assertLess(direction_index, overfit_index)
+        self.assertIn("| 7 | 保留 | 0.72 | 高 | 48 |", summary)
+        self.assertIn("慎重参考", summary)
 
     def test_journal_summary_emits_exploration_trigger_after_three_low_change_rounds(self):
         entries = []

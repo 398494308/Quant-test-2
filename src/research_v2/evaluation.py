@@ -48,6 +48,15 @@ class TrendSegment:
 
 
 @dataclass(frozen=True)
+class SegmentScoreDetail:
+    direction: int
+    score: float
+    weight: float
+    duration_bars: int
+    avg_atr_ratio: float
+
+
+@dataclass(frozen=True)
 class TrendScoreReport:
     trend_score: float
     return_score: float
@@ -59,6 +68,47 @@ class TrendScoreReport:
     hit_rate: float
     segment_count: int
     path_return_pct: float
+    segment_details: tuple[SegmentScoreDetail, ...]
+
+
+@dataclass(frozen=True)
+class OverfitRiskReport:
+    risk_score: float
+    risk_level: str
+    top1_positive_share: float
+    max_chain_positive_share: float
+    duration_coverage_ratio: float
+    volatility_coverage_ratio: float
+    coverage_ratio: float
+    bull_bear_gap: float
+    weak_side_capture_score: float
+    capture_drop_abs: float
+    hard_fail: bool
+    hard_reasons: tuple[str, ...]
+
+
+HIT_SCORE_THRESHOLD = 0.25
+OVERFIT_WARN_SCORE = 20.0
+OVERFIT_HIGH_SCORE = 40.0
+OVERFIT_GATE_SCORE = 60.0
+OVERFIT_TOP1_WARN = 0.35
+OVERFIT_TOP1_HIGH = 0.50
+OVERFIT_TOP1_HARD = 0.60
+OVERFIT_CHAIN_WARN = 0.45
+OVERFIT_CHAIN_HIGH = 0.65
+OVERFIT_CHAIN_HARD = 0.75
+OVERFIT_COVERAGE_WARN = 0.67
+OVERFIT_COVERAGE_HIGH = 0.45
+OVERFIT_COVERAGE_HARD = 0.34
+OVERFIT_SIDE_GAP_WARN = 0.55
+OVERFIT_SIDE_GAP_HIGH = 0.85
+OVERFIT_WEAK_SIDE_WARN = 0.15
+OVERFIT_CAPTURE_DROP_WARN = 0.20
+OVERFIT_CAPTURE_DROP_HIGH = 0.35
+DURATION_SHORT_MAX_BARS = 96
+DURATION_MEDIUM_MAX_BARS = 288
+VOLATILITY_LOW_MAX_ATR_RATIO = 0.010
+VOLATILITY_MEDIUM_MAX_ATR_RATIO = 0.016
 
 
 # ==================== 基础统计 ====================
@@ -459,6 +509,7 @@ def _trend_score_report(points: list[dict[str, Any]]) -> TrendScoreReport:
             hit_rate=0.0,
             segment_count=0,
             path_return_pct=0.0,
+            segment_details=(),
         )
 
     segments = _detect_major_trend_segments(points)
@@ -475,6 +526,7 @@ def _trend_score_report(points: list[dict[str, Any]]) -> TrendScoreReport:
             hit_rate=0.0,
             segment_count=0,
             path_return_pct=path_return_pct,
+            segment_details=(),
         )
 
     arrival_pairs: list[tuple[float, float]] = []
@@ -483,6 +535,7 @@ def _trend_score_report(points: list[dict[str, Any]]) -> TrendScoreReport:
     bull_pairs: list[tuple[float, float]] = []
     bear_pairs: list[tuple[float, float]] = []
     segment_pairs: list[tuple[float, float]] = []
+    segment_details: list[SegmentScoreDetail] = []
     hit_count = 0
 
     for idx, segment in enumerate(segments):
@@ -532,7 +585,20 @@ def _trend_score_report(points: list[dict[str, Any]]) -> TrendScoreReport:
 
         segment_score = weighted_score / max(weighted_sum, 1e-9)
         segment_pairs.append((segment_score, segment.weight))
-        if segment_score >= 0.25:
+        avg_atr_ratio = _mean([
+            float(point.get("atr_ratio", 0.0))
+            for point in points[segment.start_idx:segment.end_idx + 1]
+        ])
+        segment_details.append(
+            SegmentScoreDetail(
+                direction=segment.direction,
+                score=segment_score,
+                weight=segment.weight,
+                duration_bars=segment.end_idx - segment.start_idx,
+                avg_atr_ratio=avg_atr_ratio,
+            )
+        )
+        if segment_score >= HIT_SCORE_THRESHOLD:
             hit_count += 1
         if segment.direction > 0:
             bull_pairs.append((segment_score, segment.weight))
@@ -551,6 +617,151 @@ def _trend_score_report(points: list[dict[str, Any]]) -> TrendScoreReport:
         hit_rate=_safe_ratio(hit_count, len(segments)),
         segment_count=len(segments),
         path_return_pct=path_return_pct,
+        segment_details=tuple(segment_details),
+    )
+
+
+def _duration_bucket(duration_bars: int) -> str:
+    if duration_bars < DURATION_SHORT_MAX_BARS:
+        return "short"
+    if duration_bars < DURATION_MEDIUM_MAX_BARS:
+        return "medium"
+    return "long"
+
+
+def _volatility_bucket(avg_atr_ratio: float) -> str:
+    if avg_atr_ratio < VOLATILITY_LOW_MAX_ATR_RATIO:
+        return "low"
+    if avg_atr_ratio < VOLATILITY_MEDIUM_MAX_ATR_RATIO:
+        return "medium"
+    return "high"
+
+
+def _band_score(value: float, warn_threshold: float, high_threshold: float) -> float:
+    if value > high_threshold:
+        return 20.0
+    if value > warn_threshold:
+        return 10.0
+    return 0.0
+
+
+def _reverse_band_score(value: float, warn_threshold: float, high_threshold: float) -> float:
+    if value < high_threshold:
+        return 20.0
+    if value < warn_threshold:
+        return 10.0
+    return 0.0
+
+
+def overfit_risk_level_from_score(score: float) -> str:
+    if score >= OVERFIT_GATE_SCORE:
+        return "严重"
+    if score >= OVERFIT_HIGH_SCORE:
+        return "高"
+    if score >= OVERFIT_WARN_SCORE:
+        return "观察"
+    return "低"
+
+
+def overfit_reference_action(score: float, hard_fail: bool) -> str:
+    if hard_fail or score >= OVERFIT_GATE_SCORE:
+        return "直接淘汰"
+    if score >= OVERFIT_HIGH_SCORE:
+        return "慎重参考"
+    if score >= OVERFIT_WARN_SCORE:
+        return "谨慎借鉴"
+    return "正常参考"
+
+
+def _overfit_risk_report(trend_report: TrendScoreReport, capture_drop: float) -> OverfitRiskReport:
+    details = list(trend_report.segment_details)
+    positive_contributions = [
+        max(0.0, detail.score) * max(detail.weight, 0.0)
+        for detail in details
+    ]
+    positive_total = sum(positive_contributions)
+    top1_positive_share = (
+        max(positive_contributions) / positive_total
+        if positive_total > 1e-9 else 0.0
+    )
+
+    max_chain_positive = 0.0
+    current_chain_positive = 0.0
+    current_direction: int | None = None
+    for detail, contribution in zip(details, positive_contributions):
+        if current_direction is None or detail.direction != current_direction:
+            max_chain_positive = max(max_chain_positive, current_chain_positive)
+            current_direction = detail.direction
+            current_chain_positive = contribution
+        else:
+            current_chain_positive += contribution
+    max_chain_positive = max(max_chain_positive, current_chain_positive)
+    max_chain_positive_share = (
+        max_chain_positive / positive_total
+        if positive_total > 1e-9 else 0.0
+    )
+
+    hit_details = [detail for detail in details if detail.score >= HIT_SCORE_THRESHOLD]
+    duration_populated = {_duration_bucket(detail.duration_bars) for detail in details}
+    duration_covered = {_duration_bucket(detail.duration_bars) for detail in hit_details}
+    duration_coverage_ratio = _safe_ratio(len(duration_covered), len(duration_populated), default=1.0)
+
+    volatility_populated = {_volatility_bucket(detail.avg_atr_ratio) for detail in details}
+    volatility_covered = {_volatility_bucket(detail.avg_atr_ratio) for detail in hit_details}
+    volatility_coverage_ratio = _safe_ratio(len(volatility_covered), len(volatility_populated), default=1.0)
+
+    coverage_parts = [
+        ratio for ratio, populated in (
+            (duration_coverage_ratio, duration_populated),
+            (volatility_coverage_ratio, volatility_populated),
+        )
+        if populated
+    ]
+    coverage_ratio = _mean(coverage_parts) if coverage_parts else 1.0
+
+    weak_side_capture_score = min(trend_report.bull_score, trend_report.bear_score)
+    bull_bear_gap = abs(trend_report.bull_score - trend_report.bear_score)
+    capture_drop_abs = abs(capture_drop)
+
+    risk_score = 0.0
+    if positive_total > 1e-9:
+        risk_score += _band_score(top1_positive_share, OVERFIT_TOP1_WARN, OVERFIT_TOP1_HIGH)
+        risk_score += _band_score(max_chain_positive_share, OVERFIT_CHAIN_WARN, OVERFIT_CHAIN_HIGH)
+    if hit_details:
+        risk_score += _reverse_band_score(coverage_ratio, OVERFIT_COVERAGE_WARN, OVERFIT_COVERAGE_HIGH)
+    if bull_bear_gap > OVERFIT_SIDE_GAP_HIGH and weak_side_capture_score < 0.0:
+        risk_score += 20.0
+    elif bull_bear_gap > OVERFIT_SIDE_GAP_WARN and weak_side_capture_score < OVERFIT_WEAK_SIDE_WARN:
+        risk_score += 10.0
+    if capture_drop_abs > OVERFIT_CAPTURE_DROP_HIGH:
+        risk_score += 20.0
+    elif capture_drop_abs > OVERFIT_CAPTURE_DROP_WARN:
+        risk_score += 10.0
+
+    hard_reasons: list[str] = []
+    if top1_positive_share > OVERFIT_TOP1_HARD:
+        hard_reasons.append(f"单段正向贡献占比过高({top1_positive_share:.0%})")
+    if max_chain_positive_share > OVERFIT_CHAIN_HARD:
+        hard_reasons.append(f"同向连续段贡献占比过高({max_chain_positive_share:.0%})")
+    if coverage_ratio < OVERFIT_COVERAGE_HARD and bull_bear_gap > OVERFIT_SIDE_GAP_HIGH:
+        hard_reasons.append(
+            f"有效覆盖率过低且多空偏科严重({coverage_ratio:.0%}, gap={bull_bear_gap:.2f})"
+        )
+
+    risk_score = min(100.0, risk_score)
+    return OverfitRiskReport(
+        risk_score=risk_score,
+        risk_level=overfit_risk_level_from_score(risk_score),
+        top1_positive_share=top1_positive_share,
+        max_chain_positive_share=max_chain_positive_share,
+        duration_coverage_ratio=duration_coverage_ratio,
+        volatility_coverage_ratio=volatility_coverage_ratio,
+        coverage_ratio=coverage_ratio,
+        bull_bear_gap=bull_bear_gap,
+        weak_side_capture_score=weak_side_capture_score,
+        capture_drop_abs=capture_drop_abs,
+        hard_fail=bool(hard_reasons),
+        hard_reasons=tuple(hard_reasons),
     )
 
 
@@ -604,6 +815,7 @@ def summarize_evaluation(
     quality_score = 0.70 * eval_trend_report.trend_score + 0.30 * eval_trend_report.return_score
     promotion_score = 0.70 * combined_trend_report.trend_score + 0.30 * combined_trend_report.return_score
     capture_drop = eval_trend_report.trend_score - validation_trend_report.trend_score
+    overfit_report = _overfit_risk_report(combined_trend_report, capture_drop)
 
     gate_reasons: list[str] = []
     if eval_trend_report.segment_count < gates.min_eval_segments:
@@ -626,6 +838,12 @@ def summarize_evaluation(
         gate_reasons.append(f"空头捕获偏低({combined_trend_report.bear_score:.2f})")
     if avg_fee_drag > gates.max_fee_drag_pct:
         gate_reasons.append(f"手续费拖累过高({avg_fee_drag:.2f}%)")
+    if overfit_report.hard_fail:
+        gate_reasons.append("严重过拟合风险(" + "；".join(overfit_report.hard_reasons) + ")")
+    elif overfit_report.risk_score >= OVERFIT_GATE_SCORE:
+        gate_reasons.append(
+            f"过拟合风险过高({overfit_report.risk_level} {overfit_report.risk_score:.0f})"
+        )
 
     gate_passed = not gate_reasons
     gate_reason = "通过" if gate_passed else "；".join(gate_reasons)
@@ -640,6 +858,14 @@ def summarize_evaluation(
         f"多头 / 空头捕获: {combined_trend_report.bull_score:.2f} / {combined_trend_report.bear_score:.2f}",
         f"评估趋势段 / 命中率: {eval_trend_report.segment_count} / {eval_trend_report.hit_rate:.0%}",
         f"验证趋势段 / 命中率: {validation_trend_report.segment_count} / {validation_trend_report.hit_rate:.0%}",
+        (
+            "过拟合风险: "
+            f"{overfit_report.risk_level}({overfit_report.risk_score:.0f})，"
+            f"单段正向贡献={overfit_report.top1_positive_share:.0%}，"
+            f"同向链贡献={overfit_report.max_chain_positive_share:.0%}，"
+            f"覆盖率={overfit_report.coverage_ratio:.0%}，"
+            f"多空落差={overfit_report.bull_bear_gap:.2f}"
+        ),
         f"评估路径收益 / 综合路径收益: {eval_trend_report.path_return_pct:.2f}% / {combined_trend_report.path_return_pct:.2f}%",
         f"评估平均收益 / 验证收益: {eval_avg_return:.2f}% / {validation_avg_return:.2f}%",
         f"评估中位收益 / P25 / 最差: {eval_median_return:.2f}% / {eval_p25_return:.2f}% / {eval_worst_return:.2f}%",
@@ -661,6 +887,13 @@ def summarize_evaluation(
         f"评估趋势捕获分={eval_trend_report.trend_score:.2f}，收益分={eval_trend_report.return_score:.2f}，趋势段={eval_trend_report.segment_count}，命中率={eval_trend_report.hit_rate:.0%}",
         f"综合到来/陪跑/掉头={combined_trend_report.arrival_score:.2f}/{combined_trend_report.escort_score:.2f}/{combined_trend_report.turn_score:.2f}",
         f"综合多头/空头捕获={combined_trend_report.bull_score:.2f}/{combined_trend_report.bear_score:.2f}，评估/验证捕获落差={capture_drop:.2f}",
+        (
+            f"过拟合风险={overfit_report.risk_level}({overfit_report.risk_score:.0f})，"
+            f"单段正向贡献={overfit_report.top1_positive_share:.0%}，"
+            f"同向链贡献={overfit_report.max_chain_positive_share:.0%}，"
+            f"覆盖率={overfit_report.coverage_ratio:.0%}，"
+            f"多空落差={overfit_report.bull_bear_gap:.2f}"
+        ),
         f"评估路径收益={eval_trend_report.path_return_pct:.2f}%，综合路径收益={combined_trend_report.path_return_pct:.2f}%，最大回撤={worst_drawdown:.2f}%",
         f"评估4h唯一路径点={eval_path.unique_points}，重叠点={eval_path.overlap_points}，被覆盖点={eval_path.dropped_points}",
         f"手续费拖累={avg_fee_drag:.2f}%，eval交易={eval_trades}，爆仓={liquidations}",
@@ -713,6 +946,16 @@ def summarize_evaluation(
         "validation_path_return_pct": validation_trend_report.path_return_pct,
         "combined_path_return_pct": combined_trend_report.path_return_pct,
         "capture_drop": capture_drop,
+        "overfit_risk_score": overfit_report.risk_score,
+        "overfit_top1_positive_share": overfit_report.top1_positive_share,
+        "overfit_chain_positive_share": overfit_report.max_chain_positive_share,
+        "overfit_duration_coverage_ratio": overfit_report.duration_coverage_ratio,
+        "overfit_volatility_coverage_ratio": overfit_report.volatility_coverage_ratio,
+        "overfit_coverage_ratio": overfit_report.coverage_ratio,
+        "overfit_bull_bear_gap": overfit_report.bull_bear_gap,
+        "overfit_weak_side_capture_score": overfit_report.weak_side_capture_score,
+        "overfit_capture_drop_abs": overfit_report.capture_drop_abs,
+        "overfit_hard_fail": 1.0 if overfit_report.hard_fail else 0.0,
         "quality_score": quality_score,
         "promotion_score": promotion_score,
     }

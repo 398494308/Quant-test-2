@@ -7,6 +7,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+from research_v2.evaluation import OVERFIT_WARN_SCORE, overfit_reference_action, overfit_risk_level_from_score
+
 
 # ==================== 常量 ====================
 
@@ -514,6 +516,43 @@ def _direction_risk_board(entries: list[dict[str, Any]], limit: int) -> list[str
     return lines
 
 
+def _overfit_risk_board(entries: list[dict[str, Any]], limit: int) -> list[str]:
+    flagged_rows: list[tuple[float, str]] = []
+    lines = [
+        "过拟合风险表（谨慎参考）:",
+        "| 轮次 | 结果 | promotion | 风险 | 分数 | top1+ | chain+ | 覆盖 | 多空偏科 | 落差 | 建议 |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for entry in entries:
+        risk_score = _metric_from_entry(entry, "overfit_risk_score")
+        hard_fail = _metric_from_entry(entry, "overfit_hard_fail") > 0.5
+        if not hard_fail and risk_score < OVERFIT_WARN_SCORE:
+            continue
+        round_label = entry.get("iteration")
+        if round_label in (None, "", 0):
+            round_label = "-"
+        outcome = _display_outcome(str(entry.get("outcome", "")))
+        promotion = _format_metric(entry.get("promotion_score"))
+        level = "严重" if hard_fail else overfit_risk_level_from_score(risk_score)
+        action = overfit_reference_action(risk_score, hard_fail)
+        sort_key = f"| {round_label} | {outcome} | {promotion} | {level} | {risk_score:.0f} | " \
+            f"{_metric_from_entry(entry, 'overfit_top1_positive_share'):.0%} | " \
+            f"{_metric_from_entry(entry, 'overfit_chain_positive_share'):.0%} | " \
+            f"{_metric_from_entry(entry, 'overfit_coverage_ratio'):.0%} | " \
+            f"{_metric_from_entry(entry, 'overfit_bull_bear_gap'):.2f} | " \
+            f"{_metric_from_entry(entry, 'overfit_capture_drop_abs'):.2f} | {action} |"
+        flagged_rows.append((risk_score + (1000.0 if hard_fail else 0.0), sort_key))
+
+    if not flagged_rows:
+        lines.append("| - | - | - | 低 | 0 | - | - | - | - | - | 最近未发现需要降权的高风险轮次 |")
+        return lines
+
+    for _, row in sorted(flagged_rows, key=lambda item: item[0], reverse=True)[:limit]:
+        lines.append(row)
+    lines.append("若某轮被标为 `高` / `严重`，不要把它当作可直接复用的成功模板；若仍要借鉴，必须说明这次如何打破它对少数行情的依赖。")
+    return lines
+
+
 def _metric_from_entry(entry: dict[str, Any], key: str) -> float:
     metrics = entry.get("metrics", {})
     if isinstance(metrics, dict):
@@ -751,6 +790,11 @@ def _empty_prompt_tables() -> list[str]:
         "| --- | --- | --- | --- | --- | --- | --- | --- |",
         "| - | 0 | 0 | 0 | 0 | 0.00 | OPEN | - |",
         "",
+        "过拟合风险表（谨慎参考）:",
+        "| 轮次 | 结果 | promotion | 风险 | 分数 | top1+ | chain+ | 覆盖 | 多空偏科 | 落差 | 建议 |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| - | - | - | 低 | 0 | - | - | - | - | - | 暂无需要降权的高风险轮次 |",
+        "",
         "最近未压缩轮次共 0 条：保留 0，未保留 0，提前淘汰 0，运行失败 0。",
         "最近未压缩轮次表:",
         "| 轮次 | 候选 | 结果 | 阶段 | promotion | quality | trend | return | hit | seg | bull | bear | gate | tags | regions | 摘要 |",
@@ -776,6 +820,11 @@ def build_journal_prompt_summary(entries: list[dict[str, Any]], limit: int = 6, 
         board_lines = _direction_risk_board(board_entries, limit=min(8, limit))
         if board_lines:
             parts.extend(board_lines)
+            parts.append("")
+
+        overfit_lines = _overfit_risk_board(board_entries, limit=min(8, limit))
+        if overfit_lines:
+            parts.extend(overfit_lines)
             parts.append("")
 
         exploration_lines = _exploration_trigger_lines(board_entries, limit=min(8, limit))
