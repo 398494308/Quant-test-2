@@ -229,7 +229,9 @@ def build_discord_summary_message(
             f"{metrics['eval_avg_return']:.2f}%"
             + (f" / {metrics['validation_avg_return']:.2f}%" if validation_window_count > 0 else ""),
         ),
-        ("评分", f"{metrics['quality_score']:.2f} / {metrics['promotion_score']:.2f}"),
+        ("评分(主/晋)", f"{metrics['quality_score']:.2f} / {metrics['promotion_score']:.2f}"),
+        ("窗口Sortino", f"{metrics['eval_window_sortino_p25']:.2f} / {metrics['eval_window_sortino_worst']:.2f}"),
+        ("评估唯一路径", f"{int(metrics['eval_unique_days'])} 天"),
         ("最大回撤", f"{metrics['worst_drawdown']:.2f}%"),
         ("正收益窗", f"{metrics['eval_positive_ratio']:.0%}"),
         ("总交易", str(int(metrics["total_trades"]))),

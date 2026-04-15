@@ -115,7 +115,9 @@ def build_strategy_research_prompt(
 - 手续费拖累 <= 6%
 
 评分方式：
-- 评分 = eval + 验证集全部日收益率合并后的年化 Sortino Ratio
+- `quality_score` = eval 非重叠 OOS 主路径的年化 Sortino Ratio
+- `promotion_score` = eval 非重叠 OOS 主路径 + 验证集日收益率合并后的年化 Sortino Ratio
+- rolling eval 窗口只用于稳定性诊断，不会重复加权同一天
 - Sortino 只惩罚下行波动，不惩罚向上的大波动
 - 你看不到验证集的具体数字，但门禁会告诉你是否通过
 

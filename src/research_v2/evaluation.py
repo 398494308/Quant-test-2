@@ -23,6 +23,14 @@ class EvaluationReport:
     prompt_summary_text: str
 
 
+@dataclass(frozen=True)
+class DailyReturnPath:
+    returns: list[float]
+    unique_days: int
+    overlap_days: int
+    dropped_points: int
+
+
 # ==================== 基础统计 ====================
 
 
@@ -90,22 +98,52 @@ def _window_payloads(results: list[dict[str, Any]], group: str) -> list[dict[str
     return [item for item in results if item["window"].group == group]
 
 
-def _collect_daily_returns(results: list[dict[str, Any]], group: str) -> list[float]:
-    collected_by_date: dict[str, list[float]] = {}
-    for item in _window_payloads(results, group):
-        return_points = item["result"].get("daily_return_points", [])
-        if return_points:
-            for point in return_points:
-                day = str(point.get("date", "")).strip()
-                if not day:
-                    continue
-                collected_by_date.setdefault(day, []).append(float(point.get("return", 0.0)))
-            continue
-        for index, value in enumerate(item["result"].get("daily_returns", [])):
-            collected_by_date.setdefault(f"{item['window'].label}:{index}", []).append(float(value))
+def _result_daily_return_points(result: dict[str, Any], fallback_prefix: str) -> list[tuple[str, float]]:
+    points: list[tuple[str, float]] = []
+    return_points = result.get("daily_return_points", [])
+    if return_points:
+        for point in return_points:
+            day = str(point.get("date", "")).strip()
+            if not day:
+                continue
+            points.append((day, float(point.get("return", 0.0))))
+        return points
+    return [
+        (f"{fallback_prefix}:{index}", float(value))
+        for index, value in enumerate(result.get("daily_returns", []))
+    ]
 
-    ordered_days = sorted(collected_by_date)
-    return [sum(collected_by_date[day]) / len(collected_by_date[day]) for day in ordered_days]
+
+def _collect_daily_path(results: list[dict[str, Any]], group: str) -> DailyReturnPath:
+    assigned_returns: dict[str, float] = {}
+    seen_counts: dict[str, int] = {}
+    point_count = 0
+    for item in _window_payloads(results, group):
+        for day, value in _result_daily_return_points(item["result"], item["window"].label):
+            assigned_returns[day] = value
+            seen_counts[day] = seen_counts.get(day, 0) + 1
+            point_count += 1
+
+    ordered_days = sorted(assigned_returns)
+    overlap_days = sum(1 for count in seen_counts.values() if count > 1)
+    return DailyReturnPath(
+        returns=[assigned_returns[day] for day in ordered_days],
+        unique_days=len(ordered_days),
+        overlap_days=overlap_days,
+        dropped_points=max(0, point_count - len(ordered_days)),
+    )
+
+
+def _collect_daily_returns(results: list[dict[str, Any]], group: str) -> list[float]:
+    return _collect_daily_path(results, group).returns
+
+
+def _window_sortino_scores(results: list[dict[str, Any]], group: str) -> list[float]:
+    scores: list[float] = []
+    for item in _window_payloads(results, group):
+        returns = [value for _, value in _result_daily_return_points(item["result"], item["window"].label)]
+        scores.append(_annualized_sortino(returns))
+    return scores
 
 
 def _aggregate_signal_stats(results: list[dict[str, Any]], group: str) -> list[str]:
@@ -172,11 +210,18 @@ def summarize_evaluation(
     eval_trades = sum(int(item["result"]["trades"]) for item in eval_results)
     validation_trades = sum(int(item["result"]["trades"]) for item in validation_results)
 
-    eval_daily_returns = _collect_daily_returns(results, "eval")
-    validation_daily_returns = _collect_daily_returns(results, "validation")
+    eval_path = _collect_daily_path(results, "eval")
+    validation_path = _collect_daily_path(results, "validation")
+    eval_daily_returns = eval_path.returns
+    validation_daily_returns = validation_path.returns
     all_daily_returns = eval_daily_returns + validation_daily_returns
     daily_sharpe = _annualized_sharpe(eval_daily_returns)
     daily_sortino = _annualized_sortino(eval_daily_returns)
+    eval_window_sortinos = _window_sortino_scores(results, "eval")
+    eval_window_sortino_avg = _mean(eval_window_sortinos)
+    eval_window_sortino_median = median(eval_window_sortinos) if eval_window_sortinos else 0.0
+    eval_window_sortino_p25 = _quantile(eval_window_sortinos, 0.25)
+    eval_window_sortino_worst = min(eval_window_sortinos) if eval_window_sortinos else 0.0
 
     profit_factor = _safe_ratio(
         sum(max(0.0, trade["pnl_amount"]) for item in eval_results for trade in item["result"].get("trades_detail", [])),
@@ -186,10 +231,10 @@ def summarize_evaluation(
 
     validation_gap = eval_avg_return - validation_avg_return
 
-    # ==================== 评分：纯 Sortino ====================
-    # quality_score = eval 窗口的年化 Sortino（平时练习的风险收益比）
-    # promotion_score = eval + validation 合并后的年化 Sortino
-    #   如果验证窗口表现差，会自然拉低 promotion_score，不需要额外惩罚
+    # ==================== 评分：非重叠 OOS 主路径 ====================
+    # quality_score = eval 非重叠 OOS 路径的年化 Sortino
+    # promotion_score = eval 非重叠 OOS + validation 的年化 Sortino
+    #   rolling windows 继续保留，但只作为鲁棒性诊断，不再重复加权同一天
     quality_score = daily_sortino
     promotion_score = _annualized_sortino(all_daily_returns)
 
@@ -223,7 +268,9 @@ def summarize_evaluation(
         f"评估中位收益: {eval_median_return:.2f}%",
         f"评估P25收益: {eval_p25_return:.2f}%",
         f"验证收益: {validation_avg_return:.2f}%",
-        f"日度 Sortino / Sharpe: {daily_sortino:.2f} / {daily_sharpe:.2f}",
+        f"主评分路径 Sortino / Sharpe: {daily_sortino:.2f} / {daily_sharpe:.2f}",
+        f"窗口 Sortino 均值 / P25 / 最差: {eval_window_sortino_avg:.2f} / {eval_window_sortino_p25:.2f} / {eval_window_sortino_worst:.2f}",
+        f"评估唯一路径日期 / 重叠日期 / 被覆盖点: {eval_path.unique_days} / {eval_path.overlap_days} / {eval_path.dropped_points}",
         f"最大回撤: {worst_drawdown:.2f}%",
         f"手续费拖累: {avg_fee_drag:.2f}%",
         f"总交易 / 爆仓: {total_trades} / {liquidations}",
@@ -237,9 +284,11 @@ def summarize_evaluation(
         summary_lines.extend(["", "拖累较大的信号:", *weakest_signals])
 
     prompt_lines = [
-        f"当前基底评估Sortino={quality_score:.2f}，综合Sortino={promotion_score:.2f}，gate={gate_reason}",
+        f"当前基底主评分Sortino={quality_score:.2f}，综合晋级Sortino={promotion_score:.2f}，gate={gate_reason}",
         f"评估平均收益={eval_avg_return:.2f}%，中位数={eval_median_return:.2f}%，P25={eval_p25_return:.2f}%",
-        f"日度Sortino={daily_sortino:.2f}，Sharpe={daily_sharpe:.2f}，最大回撤={worst_drawdown:.2f}%",
+        f"主评分口径=eval非重叠OOS路径；日度Sortino={daily_sortino:.2f}，Sharpe={daily_sharpe:.2f}，最大回撤={worst_drawdown:.2f}%",
+        f"窗口Sortino均值={eval_window_sortino_avg:.2f}，P25={eval_window_sortino_p25:.2f}，最差={eval_window_sortino_worst:.2f}",
+        f"eval唯一路径日期={eval_path.unique_days}，重叠日期={eval_path.overlap_days}，被覆盖点={eval_path.dropped_points}",
         f"手续费拖累={avg_fee_drag:.2f}%，eval交易={eval_trades}，爆仓={liquidations}",
     ]
     if weakest_signals:
@@ -262,6 +311,16 @@ def summarize_evaluation(
         "validation_trades": float(validation_trades),
         "daily_sharpe": daily_sharpe,
         "daily_sortino": daily_sortino,
+        "eval_unique_days": float(eval_path.unique_days),
+        "eval_overlap_days": float(eval_path.overlap_days),
+        "eval_overlap_points_dropped": float(eval_path.dropped_points),
+        "validation_unique_days": float(validation_path.unique_days),
+        "validation_overlap_days": float(validation_path.overlap_days),
+        "validation_overlap_points_dropped": float(validation_path.dropped_points),
+        "eval_window_sortino_avg": eval_window_sortino_avg,
+        "eval_window_sortino_median": eval_window_sortino_median,
+        "eval_window_sortino_p25": eval_window_sortino_p25,
+        "eval_window_sortino_worst": eval_window_sortino_worst,
         "profit_factor": profit_factor,
         "validation_gap": validation_gap,
         "quality_score": quality_score,

@@ -22,8 +22,9 @@
 
 当前评分口径：
 
-- `quality_score` = `eval` 日收益的年化 Sortino
-- `promotion_score` = `eval + validation` 合并后的年化 Sortino
+- `quality_score` = `eval` 非重叠 OOS 主路径日收益的年化 Sortino
+- `promotion_score` = `eval` 非重叠 OOS 主路径 + `validation` 合并后的年化 Sortino
+- rolling `eval` 窗口继续保留，但只做稳定性诊断，不再重复加权同一天
 
 当前窗口配置默认是：
 
@@ -61,16 +62,19 @@
 
 ## 当前最优快照
 
-最新最优状态写在 `state/research_macd_aggressive_v2_best.json`。
+研究器运行时会把最新最优状态写到 `state/research_macd_aggressive_v2_best.json`。
 
-截至 `2026-04-15`，当前最佳快照为：
+截至 `2026-04-15`，按当前非重叠 OOS 评分口径重新评估，当前最佳快照为：
 
-- `quality_score = 2.00`
-- `promotion_score = 1.67`
+- `quality_score = 2.04`
+- `promotion_score = 1.69`
 - `eval_avg_return = 1.89%`
 - `validation_avg_return = 10.84%`
 - `worst_drawdown = 18.52%`
 - `total_trades = 98`
+- `eval_unique_days = 609`
+- `eval_window_sortino_p25 = -1.43`
+- `eval_window_sortino_worst = -4.91`
 - `gate = 通过`
 
 ## 目录结构

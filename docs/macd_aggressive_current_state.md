@@ -35,7 +35,7 @@
 
 来源：
 
-- `state/research_macd_aggressive_v2_best.json`
+- 当前策略源码按最新评分口径重新评估
 
 截至 `2026-04-15`，当前最佳基底：
 
@@ -48,10 +48,16 @@
 - `total_trades = 98`
 - `eval_trades = 64`
 - `validation_trades = 34`
-- `daily_sharpe = 0.94`
-- `daily_sortino = 2.00`
-- `quality_score = 2.00`
-- `promotion_score = 1.67`
+- `daily_sharpe = 0.96`
+- `daily_sortino = 2.04`
+- `quality_score = 2.04`
+- `promotion_score = 1.69`
+- `eval_unique_days = 609`
+- `eval_overlap_days = 203`
+- `eval_overlap_points_dropped = 203`
+- `eval_window_sortino_avg = 0.49`
+- `eval_window_sortino_p25 = -1.43`
+- `eval_window_sortino_worst = -4.91`
 - `gate = 通过`
 
 ## 当前已确认修复
@@ -63,6 +69,7 @@
 - 入场滑点和初始止损现在共用同一基准价
 - 加仓后会同步重算风险锚点
 - 参数校验补上了关键关系约束
+- 重叠 `eval` 窗口的主评分改为非重叠 OOS 主路径，窗口结果仅保留为稳定性诊断
 
 ## 当前关注点
 
@@ -72,5 +79,6 @@
 
 - 已经能持续找到更优版本
 - 但研究方向仍然主要集中在做空破位质量、价格发现效率、4H 跟随确认这几个邻近主题
+- 主评分口径更干净后，窗口稳定性尾部仍偏弱，`eval_window_sortino_p25` 和最差窗口仍明显为负
 
 如果后续要继续推进，重点不该是回到旧版参数扫，而是继续提升研究器的方向多样性与记忆表达质量。

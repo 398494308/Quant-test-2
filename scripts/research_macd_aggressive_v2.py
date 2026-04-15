@@ -29,7 +29,7 @@ import backtest_macd_aggressive as backtest_module
 import strategy_macd_aggressive as strategy_module
 from codex_exec_client import StrategyGenerationTransientError, build_json_text_format, generate_json_object
 from research_v2.config import ResearchRuntimeConfig, load_research_runtime_config
-from research_v2.evaluation import EvaluationReport, summarize_evaluation, _annualized_sortino, _collect_daily_returns
+from research_v2.evaluation import EvaluationReport, summarize_evaluation, _annualized_sortino, _collect_daily_path
 from research_v2.journal import append_journal_entry, build_journal_prompt_summary, has_recent_code_hash, load_journal_entries, maybe_compact
 from research_v2.notifications import build_discord_summary_message, load_discord_config, send_discord_message
 from research_v2.prompting import build_candidate_response_schema, build_strategy_research_prompt
@@ -117,7 +117,7 @@ def reload_strategy_module() -> None:
 
 
 class EarlyRejection(Exception):
-    """前 N 个 eval 窗口 Sortino 太差，提前终止回测。"""
+    """前 N 个 eval 窗口的非重叠 OOS Sortino 太差，提前终止回测。"""
 
 
 def _run_base_backtests(allow_early_reject: bool = False) -> list[dict[str, Any]]:
@@ -149,11 +149,11 @@ def _run_base_backtests(allow_early_reject: bool = False) -> list[dict[str, Any]
         if allow_early_reject and window.group == "eval":
             eval_count += 1
             if eval_count == check_at and check_at > 0:
-                daily = _collect_daily_returns(results, "eval")
-                sortino = _annualized_sortino(daily)
+                eval_path = _collect_daily_path(results, "eval")
+                sortino = _annualized_sortino(eval_path.returns)
                 if sortino < threshold:
                     raise EarlyRejection(
-                        f"前{check_at}个eval窗口Sortino={sortino:.2f} < {threshold}, 提前淘汰"
+                        f"前{check_at}个eval窗口非重叠OOS Sortino={sortino:.2f} < {threshold}, 提前淘汰"
                     )
     return results
 

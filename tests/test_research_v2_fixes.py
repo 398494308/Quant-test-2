@@ -7,7 +7,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 import backtest_macd_aggressive as backtest
-from research_v2.evaluation import _collect_daily_returns
+from research_v2.config import GateConfig
+from research_v2.evaluation import _annualized_sortino, _collect_daily_path, summarize_evaluation
 from research_v2.strategy_code import StrategySourceError, validate_strategy_source
 
 
@@ -100,9 +101,9 @@ class BacktestFixesTest(unittest.TestCase):
 
 
 class EvaluationFixesTest(unittest.TestCase):
-    def test_collect_daily_returns_deduplicates_overlapping_days(self):
-        window1 = type("Window", (), {"group": "eval", "label": "评估1"})()
-        window2 = type("Window", (), {"group": "eval", "label": "评估2"})()
+    def test_collect_daily_path_assigns_overlapping_days_to_latest_window(self):
+        window1 = type("Window", (), {"group": "eval", "label": "评估1", "start_date": "2026-01-01", "end_date": "2026-01-02"})()
+        window2 = type("Window", (), {"group": "eval", "label": "评估2", "start_date": "2026-01-02", "end_date": "2026-01-03"})()
         results = [
             {
                 "window": window1,
@@ -124,8 +125,102 @@ class EvaluationFixesTest(unittest.TestCase):
             },
         ]
 
-        daily_returns = _collect_daily_returns(results, "eval")
-        self.assertEqual(daily_returns, [0.01, 0.03, -0.01])
+        path = _collect_daily_path(results, "eval")
+        self.assertEqual(path.returns, [0.01, 0.04, -0.01])
+        self.assertEqual(path.unique_days, 3)
+        self.assertEqual(path.overlap_days, 1)
+        self.assertEqual(path.dropped_points, 1)
+
+    def test_summarize_evaluation_scores_non_overlapping_oos_path(self):
+        eval_window1 = type("Window", (), {"group": "eval", "label": "评估1", "start_date": "2026-01-01", "end_date": "2026-01-05"})()
+        eval_window2 = type("Window", (), {"group": "eval", "label": "评估2", "start_date": "2026-01-04", "end_date": "2026-01-08"})()
+        validation_window = type("Window", (), {"group": "validation", "label": "验证1", "start_date": "2026-01-09", "end_date": "2026-01-10"})()
+        results = [
+            {
+                "window": eval_window1,
+                "result": {
+                    "return": 3.0,
+                    "max_drawdown": 5.0,
+                    "trades": 8,
+                    "fee_drag_pct": 0.5,
+                    "liquidations": 0,
+                    "trades_detail": [
+                        {"pnl_amount": 30.0},
+                        {"pnl_amount": -10.0},
+                    ],
+                    "daily_return_points": [
+                        {"date": "2026-01-01", "return": 0.01},
+                        {"date": "2026-01-02", "return": 0.01},
+                        {"date": "2026-01-03", "return": -0.01},
+                        {"date": "2026-01-04", "return": 0.02},
+                        {"date": "2026-01-05", "return": 0.01},
+                    ],
+                },
+            },
+            {
+                "window": eval_window2,
+                "result": {
+                    "return": 4.0,
+                    "max_drawdown": 6.0,
+                    "trades": 7,
+                    "fee_drag_pct": 0.8,
+                    "liquidations": 0,
+                    "trades_detail": [
+                        {"pnl_amount": 35.0},
+                        {"pnl_amount": -15.0},
+                    ],
+                    "daily_return_points": [
+                        {"date": "2026-01-04", "return": 0.03},
+                        {"date": "2026-01-05", "return": 0.04},
+                        {"date": "2026-01-06", "return": -0.02},
+                        {"date": "2026-01-07", "return": 0.01},
+                        {"date": "2026-01-08", "return": 0.00},
+                    ],
+                },
+            },
+            {
+                "window": validation_window,
+                "result": {
+                    "return": 2.0,
+                    "max_drawdown": 4.0,
+                    "trades": 6,
+                    "fee_drag_pct": 0.2,
+                    "liquidations": 0,
+                    "trades_detail": [
+                        {"pnl_amount": 20.0},
+                        {"pnl_amount": -5.0},
+                    ],
+                    "daily_return_points": [
+                        {"date": "2026-01-09", "return": 0.02},
+                        {"date": "2026-01-10", "return": 0.01},
+                    ],
+                },
+            },
+        ]
+        gates = GateConfig(
+            min_total_trades=0,
+            min_eval_trades=0,
+            min_validation_trades=0,
+            min_positive_ratio=0.0,
+            max_drawdown_pct=100.0,
+            max_liquidations=0,
+            min_validation_return=-100.0,
+            max_eval_validation_gap=100.0,
+            max_fee_drag_pct=100.0,
+        )
+
+        report = summarize_evaluation(results, gates)
+        expected_eval_returns = [0.01, 0.01, -0.01, 0.03, 0.04, -0.02, 0.01, 0.00]
+        expected_all_returns = expected_eval_returns + [0.02, 0.01]
+
+        self.assertAlmostEqual(report.metrics["daily_sortino"], _annualized_sortino(expected_eval_returns))
+        self.assertAlmostEqual(report.metrics["quality_score"], _annualized_sortino(expected_eval_returns))
+        self.assertAlmostEqual(report.metrics["promotion_score"], _annualized_sortino(expected_all_returns))
+        self.assertEqual(report.metrics["eval_unique_days"], 8.0)
+        self.assertEqual(report.metrics["eval_overlap_days"], 2.0)
+        self.assertEqual(report.metrics["eval_overlap_points_dropped"], 2.0)
+        self.assertEqual(report.metrics["validation_overlap_days"], 0.0)
+        self.assertTrue(report.gate_passed)
 
 
 class StrategyValidationFixesTest(unittest.TestCase):

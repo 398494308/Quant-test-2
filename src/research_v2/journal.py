@@ -134,6 +134,7 @@ def _compact_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
     metric_keys = [
         "eval_avg_return", "validation_avg_return", "worst_drawdown",
         "avg_fee_drag", "daily_sharpe", "daily_sortino", "profit_factor",
+        "eval_window_sortino_p25", "eval_window_sortino_worst",
     ]
     accepted_metric_ranges: dict[str, dict[str, float]] = {}
     if accepted:

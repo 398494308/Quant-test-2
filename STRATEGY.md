@@ -100,7 +100,13 @@
 - 文件：`scripts/research_macd_aggressive_v2.py`
 - 允许模型直接改写策略源码
 - 但会经过源码校验、参数边界校验和研究历史去重
-- 评分核心是 `Sortino + gate`
+- 评分核心是 `非重叠 OOS Sortino + gate`
+
+当前主评分口径：
+
+- `quality_score` 看 `eval` 非重叠 OOS 主路径
+- `promotion_score` 看 `eval` 非重叠 OOS 主路径 + `validation`
+- rolling 窗口的 `Sortino` 均值、P25、最差值只做鲁棒性诊断，不直接重复加权到主分里
 
 参数校验除范围外，也会检查关键关系：
 
