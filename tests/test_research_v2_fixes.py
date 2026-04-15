@@ -334,6 +334,45 @@ class JournalPromptFixesTest(unittest.TestCase):
         self.assertIn("ownership_cluster", summary)
         self.assertIn("EXHAUSTED", summary)
 
+    def test_journal_summary_emits_exploration_trigger_after_three_low_change_rounds(self):
+        entries = []
+        for idx in range(3):
+            entries.append(
+                {
+                    "iteration": idx + 1,
+                    "candidate_id": f"candidate_{idx}",
+                    "outcome": "rejected",
+                    "stop_stage": "full_eval",
+                    "promotion_score": 1.69,
+                    "quality_score": 2.04,
+                    "promotion_delta": 0.0,
+                    "gate_reason": "通过",
+                    "change_tags": ["reload_impulse_filter", "short_trend_quality"],
+                    "edited_regions": ["strategy"],
+                    "closest_failed_cluster": "impulse_persistence",
+                    "hypothesis": "连续几轮都只是成熟空头的近邻微调",
+                    "core_factors": [
+                        {
+                            "name": "continuation_energy_decay",
+                            "thesis": "成熟空头尾段的弱续跌更容易拖累手续费。",
+                            "current_signal": "最近几轮都在同一解释框架里打转。",
+                        }
+                    ],
+                    "metrics": {
+                        "total_trades": 98.0,
+                        "avg_fee_drag": 0.76,
+                        "eval_window_sortino_p25": -1.43,
+                    },
+                    "score_regime": "non_overlapping_oos_v1",
+                }
+            )
+
+        summary = build_journal_prompt_summary(entries, limit=8)
+
+        self.assertIn("探索触发（必须执行）", summary)
+        self.assertIn("impulse_persistence", summary)
+        self.assertIn("continuation_energy_decay", summary)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -113,6 +113,7 @@
 - prompt 第一屏先显示方向风险表，按方向簇聚合近期失败、零增益和运行报错。
 - 防重复探索主要靠 prompt 约束，不做系统层面的硬性方向封禁。
 - 候选必须输出 `closest_failed_cluster` 与 `novelty_proof`，说明本轮为什么不是重复试错。
+- 若最近连续 3 轮都属于低变化轮次，prompt 会强制把下一轮视为“探索轮”，优先切换因子家族或编辑区域家族。
 - 每轮先跑少量 `smoke` 窗口；若代码运行报错，会在同一轮把错误回传给模型做 repair，而不是直接开始下一轮。
 - 若 repair 次数耗尽，这轮会被记成 `runtime_failed`，同样进入 journal 和记忆压缩。
 - `heartbeat` 会持续写出当前阶段和窗口索引，便于定位是卡在 `smoke`、`full_eval` 还是 repair。

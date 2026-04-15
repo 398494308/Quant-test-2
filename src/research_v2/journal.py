@@ -21,6 +21,13 @@ CLUSTER_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("sideways_cluster", ("sideways", "tighten_filter", "hourly_discount", "discounted_stall", "hourly_stretch")),
     ("trigger_efficiency_cluster", ("trigger_efficiency", "breakdown_entry", "breakout_entry", "reduce_false_breakdown", "reduce_false_breakout")),
 )
+LOW_CHANGE_STREAK = 3
+LOW_CHANGE_PROMOTION_DELTA_EPS = 0.02
+LOW_CHANGE_PROMOTION_SCORE_SPAN = 0.05
+LOW_CHANGE_QUALITY_SCORE_SPAN = 0.08
+LOW_CHANGE_TOTAL_TRADES_SPAN = 6.0
+LOW_CHANGE_FEE_DRAG_SPAN = 0.20
+LOW_CHANGE_WINDOW_P25_SPAN = 0.50
 
 
 # ==================== 基础读写 ====================
@@ -505,6 +512,84 @@ def _direction_risk_board(entries: list[dict[str, Any]], limit: int) -> list[str
     return lines
 
 
+def _metric_from_entry(entry: dict[str, Any], key: str) -> float:
+    metrics = entry.get("metrics", {})
+    if isinstance(metrics, dict):
+        return _score_value(metrics.get(key))
+    return 0.0
+
+
+def _span(values: list[float]) -> float:
+    return max(values) - min(values) if values else 0.0
+
+
+def _low_change_tail(entries: list[dict[str, Any]], streak: int = LOW_CHANGE_STREAK) -> list[dict[str, Any]]:
+    eligible = [
+        entry for entry in entries
+        if str(entry.get("outcome", "")) in {"accepted", "rejected"}
+    ]
+    if len(eligible) < streak:
+        return []
+    tail = eligible[-streak:]
+    if any(str(entry.get("gate_reason", "")).strip() != "通过" for entry in tail):
+        return []
+    if any(abs(_score_value(entry.get("promotion_delta"))) > LOW_CHANGE_PROMOTION_DELTA_EPS for entry in tail):
+        return []
+    if _span([_score_value(entry.get("promotion_score")) for entry in tail]) > LOW_CHANGE_PROMOTION_SCORE_SPAN:
+        return []
+    if _span([_score_value(entry.get("quality_score")) for entry in tail]) > LOW_CHANGE_QUALITY_SCORE_SPAN:
+        return []
+    if _span([_metric_from_entry(entry, "total_trades") for entry in tail]) > LOW_CHANGE_TOTAL_TRADES_SPAN:
+        return []
+    if _span([_metric_from_entry(entry, "avg_fee_drag") for entry in tail]) > LOW_CHANGE_FEE_DRAG_SPAN:
+        return []
+    if _span([_metric_from_entry(entry, "eval_window_sortino_p25") for entry in tail]) > LOW_CHANGE_WINDOW_P25_SPAN:
+        return []
+    return tail
+
+
+def _exploration_trigger_lines(entries: list[dict[str, Any]], limit: int) -> list[str]:
+    tail = _low_change_tail(entries)
+    if not tail:
+        return []
+
+    clusters: list[str] = []
+    factors: list[str] = []
+    tags: list[str] = []
+    regions: list[str] = []
+    for entry in tail:
+        cluster = str(entry.get("closest_failed_cluster", "")).strip() or cluster_for_tags(entry.get("change_tags", []))
+        if cluster and cluster not in clusters:
+            clusters.append(cluster)
+        for factor in entry.get("core_factors", []):
+            if not isinstance(factor, dict):
+                continue
+            name = str(factor.get("name", "")).strip()
+            if name and name not in factors:
+                factors.append(name)
+        for tag in entry.get("change_tags", []):
+            tag_text = str(tag).strip()
+            if tag_text and tag_text not in tags:
+                tags.append(tag_text)
+        for region in entry.get("edited_regions", []):
+            region_text = str(region).strip()
+            if region_text and region_text not in regions:
+                regions.append(region_text)
+
+    lines = [
+        "探索触发（必须执行）:",
+        f"最近 {LOW_CHANGE_STREAK} 轮都属于低变化轮次：晋级分没有实质提升，且 quality / trades / fee_drag / 窗口P25 基本不变。",
+        f"- 近期近邻方向簇：{', '.join(clusters[:limit]) or '-'}",
+        f"- 近期近邻标签：{', '.join(tags[:limit]) or '-'}",
+        f"- 近期近邻核心因子：{', '.join(factors[:limit]) or '-'}",
+        f"- 近期高频编辑区域：{', '.join(regions[:limit]) or '-'}",
+        "- 下一轮必须作为探索轮，不要继续沿用上述主因子解释或其近邻改写。",
+        "- 探索轮必须至少做到以下之一：切换到不同核心因子家族；切换到不同 edited region family；若继续相近方向，必须明确说明将改变哪类交易路径。",
+        "- 探索轮允许结果变差，但不能只是换措辞；应尽量让 total_trades、avg_fee_drag、eval_window_sortino_p25 这类关键诊断至少两项出现明显变化。",
+    ]
+    return lines
+
+
 # ==================== 摘要生成 ====================
 
 
@@ -658,6 +743,11 @@ def build_journal_prompt_summary(entries: list[dict[str, Any]], limit: int = 6, 
         board_lines = _direction_risk_board(board_entries, limit=min(8, limit))
         if board_lines:
             parts.extend(board_lines)
+            parts.append("")
+
+        exploration_lines = _exploration_trigger_lines(board_entries, limit=min(8, limit))
+        if exploration_lines:
+            parts.extend(exploration_lines)
             parts.append("")
 
         accepted_count = sum(1 for entry in recent_entries if entry.get("outcome") == "accepted")

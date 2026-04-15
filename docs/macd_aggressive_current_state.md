@@ -69,6 +69,7 @@
 - prompt 第一屏现在先给模型看“方向风险表”，按方向簇聚合近期失败、零增益、运行报错和最佳 `promotion_delta`。
 - 方向簇标签分为 `OPEN / WARM / ACTIVE_WINNER / SATURATED / EXHAUSTED / RUNTIME_RISK`，用于提示模型哪些方向已经接近被试空。
 - 候选必须输出 `closest_failed_cluster` 与 `novelty_proof`，先解释与最近失败方向的差异，再允许进入评估。
+- 若最近连续 3 轮都只是低变化零增益微调，prompt 会触发“探索轮”，强制要求切换因子家族或编辑区域家族，避免继续在同簇里换说法。
 - 每轮先跑 `smoke` 窗口，运行报错会在同一轮走 repair loop；修复次数耗尽才记成 `runtime_failed`。
 - `heartbeat` 会带上当前阶段和窗口索引，方便排查是卡在 `smoke_test`、`full_eval` 还是 `candidate_repairing`。
 - 压缩历史除了标签统计外，也会保留方向簇摘要，避免 20 轮压缩后丢失长期失败记忆。
