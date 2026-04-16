@@ -62,7 +62,6 @@ def build_candidate_response_schema() -> dict[str, Any]:
                 "minItems": 0,
                 "maxItems": 4,
             },
-            "strategy_code": {"type": "string"},
         },
         "required": [
             "candidate_id",
@@ -74,7 +73,6 @@ def build_candidate_response_schema() -> dict[str, Any]:
             "edited_regions",
             "expected_effects",
             "core_factors",
-            "strategy_code",
         ],
         "additionalProperties": False,
     }
@@ -85,7 +83,6 @@ def build_candidate_response_schema() -> dict[str, Any]:
 
 def build_strategy_research_prompt(
     *,
-    strategy_source: str,
     evaluation_summary: str,
     journal_summary: str,
     previous_best_score: float,
@@ -107,10 +104,11 @@ def build_strategy_research_prompt(
 历史研究记忆：
 {journal_summary}
 
-当前策略源码：
-```python
-{strategy_source}
-```
+工作区说明：
+- 当前工作区里已经有目标文件 `src/strategy_macd_aggressive.py`
+- 你必须先阅读并直接修改这个文件，再输出最终 JSON
+- 不要把源码贴回 JSON；主进程会直接读取你改好的文件
+- 除 `src/strategy_macd_aggressive.py` 外，不要创建、修改或删除其他文件
 
 门禁规则（触碰即淘汰）：
 - eval 大趋势段数 >= 8
@@ -165,7 +163,6 @@ def build_strategy_research_prompt(
 
 输出要求：
 - 只输出 JSON。
-- `strategy_code` 字段里放完整的最新策略文件源码，不要 markdown。
 - `change_tags` 用简短标签描述方向，比如 `sideways_filter`, `breakout_entry`, `tighten_filter`, `reduce_false_breakout`。
 - `closest_failed_cluster` 必须填写你认为最接近的最近失败方向簇；如果确实是新方向，也要写出最接近的旧簇名。
 - `novelty_proof` 必须使用简体中文，明确说明“本轮与最近失败方向的差异、预计会改变的交易路径、为什么不属于重复试错”。
@@ -177,8 +174,6 @@ def build_strategy_research_prompt(
 
 def build_strategy_runtime_repair_prompt(
     *,
-    strategy_source: str,
-    failed_candidate_code: str,
     candidate_id: str,
     hypothesis: str,
     change_plan: str,
@@ -204,15 +199,11 @@ def build_strategy_runtime_repair_prompt(
 - closest_failed_cluster: {closest_failed_cluster}
 - novelty_proof: {novelty_proof}
 
-当前基底策略源码：
-```python
-{strategy_source}
-```
-
-刚才失败的候选源码：
-```python
-{failed_candidate_code}
-```
+工作区说明：
+- 当前工作区里的 `src/strategy_macd_aggressive.py` 已经是刚才失败的候选版本
+- 你必须直接在该文件上原地修复
+- 不要把源码贴回 JSON；主进程会直接读取你改好的文件
+- 除 `src/strategy_macd_aggressive.py` 外，不要创建、修改或删除其他文件
 
 运行错误：
 {error_message}
@@ -228,6 +219,5 @@ def build_strategy_runtime_repair_prompt(
 
 输出要求：
 - 仍然只输出 JSON。
-- `strategy_code` 提供完整策略源码。
 - `novelty_proof` 可以在原说明基础上补一句“本次修复仅修正运行错误，不改变主假设”。
 """

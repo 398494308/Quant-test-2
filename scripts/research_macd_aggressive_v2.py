@@ -9,14 +9,17 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib
 import json
 import logging
 import os
 import shutil
 import sys
+import tempfile
 import time
 import traceback
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -28,7 +31,12 @@ sys.path.insert(0, str(SRC_DIR))
 
 import backtest_macd_aggressive as backtest_module
 import strategy_macd_aggressive as strategy_module
-from codex_exec_client import StrategyGenerationTransientError, build_json_text_format, generate_json_object
+from codex_exec_client import (
+    StrategyGenerationTransientError,
+    build_json_text_format,
+    generate_json_object,
+    load_strategy_client_config,
+)
 from research_v2.config import ResearchRuntimeConfig, load_research_runtime_config
 from research_v2.charting import PerformanceChartPaths, charts_available, render_performance_chart
 from research_v2.evaluation import EvaluationReport, partial_eval_gate_snapshot, summarize_evaluation
@@ -41,7 +49,7 @@ from research_v2.journal import (
     maybe_compact,
 )
 from research_v2.notifications import build_discord_summary_message, load_discord_config, send_discord_message
-from research_v2.prompting import build_candidate_response_schema, build_strategy_research_prompt
+from research_v2.prompting import EDITABLE_REGIONS, build_candidate_response_schema, build_strategy_research_prompt
 from research_v2.prompting import build_strategy_runtime_repair_prompt
 from research_v2.strategy_code import (
     StrategyCandidate,
@@ -51,6 +59,7 @@ from research_v2.strategy_code import (
     load_strategy_source,
     normalize_strategy_source,
     source_hash,
+    validate_editable_region_boundaries,
     validate_strategy_source,
     write_strategy_source,
 )
@@ -66,6 +75,7 @@ DISCORD_CONFIG = load_discord_config()
 EVAL_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "eval")
 VALIDATION_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "validation")
 SCORE_REGIME = "trend_capture_v1"
+MODEL_WORKSPACE_STRATEGY_PATH = Path("src/strategy_macd_aggressive.py")
 
 best_source = ""
 best_report: EvaluationReport | None = None
@@ -155,6 +165,20 @@ def reload_strategy_module() -> None:
     global strategy_module
     importlib.invalidate_caches()
     importlib.reload(strategy_module)
+
+
+def _model_client_config():
+    return replace(load_strategy_client_config(), sandbox="workspace-write")
+
+
+@contextlib.contextmanager
+def _temporary_cwd(path: Path):
+    previous = Path.cwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(previous)
 
 
 # ==================== 评估执行 ====================
@@ -425,7 +449,12 @@ def smoke_test_current_strategy() -> None:
 # ==================== 候选策略生成 ====================
 
 
-def _candidate_from_payload(payload: dict[str, Any]) -> StrategyCandidate:
+def _candidate_from_payload(
+    payload: dict[str, Any],
+    *,
+    workspace_strategy_file: Path,
+    base_source: str,
+) -> StrategyCandidate:
     core_factors: list[StrategyCoreFactor] = []
     for item in payload.get("core_factors", []):
         if not isinstance(item, dict):
@@ -442,6 +471,11 @@ def _candidate_from_payload(payload: dict[str, Any]) -> StrategyCandidate:
                 current_signal=current_signal,
             )
         )
+    if not workspace_strategy_file.exists():
+        raise StrategySourceError(f"workspace strategy file missing: {workspace_strategy_file}")
+    strategy_code = normalize_strategy_source(load_strategy_source(workspace_strategy_file))
+    validate_strategy_source(strategy_code)
+    validate_editable_region_boundaries(base_source, strategy_code, EDITABLE_REGIONS)
     candidate = StrategyCandidate(
         candidate_id=str(payload["candidate_id"]).strip() or f"candidate-{int(time.time())}",
         hypothesis=str(payload["hypothesis"]).strip(),
@@ -452,7 +486,7 @@ def _candidate_from_payload(payload: dict[str, Any]) -> StrategyCandidate:
         edited_regions=tuple(str(item).strip() for item in payload["edited_regions"] if str(item).strip()),
         expected_effects=tuple(str(item).strip() for item in payload["expected_effects"] if str(item).strip()),
         core_factors=tuple(core_factors),
-        strategy_code=normalize_strategy_source(str(payload["strategy_code"])),
+        strategy_code=strategy_code,
     )
     if not candidate.change_tags:
         raise StrategySourceError("candidate missing change_tags")
@@ -462,38 +496,48 @@ def _candidate_from_payload(payload: dict[str, Any]) -> StrategyCandidate:
         raise StrategySourceError("candidate missing closest_failed_cluster")
     if not candidate.novelty_proof:
         raise StrategySourceError("candidate missing novelty_proof")
-    validate_strategy_source(candidate.strategy_code)
     return candidate
 
 
-def _build_model_candidate(base_source: str, journal_entries: list[dict[str, Any]]) -> StrategyCandidate:
+def _build_model_candidate(
+    base_source: str,
+    journal_entries: list[dict[str, Any]],
+    *,
+    workspace_root: Path,
+) -> StrategyCandidate:
     report = best_report
     if report is None:
         raise StrategySourceError("best report is not initialized")
 
     prompt = build_strategy_research_prompt(
-        strategy_source=base_source,
         evaluation_summary=report.prompt_summary_text,
         journal_summary=build_journal_prompt_summary(journal_entries, limit=RUNTIME.max_recent_journal_entries, journal_path=RUNTIME.paths.journal_file),
         previous_best_score=report.metrics["promotion_score"],
     )
-    payload = generate_json_object(
-        prompt=prompt,
-        system_prompt=(
-            "你是严谨的量化研究员。"
-            "只输出 JSON，不要解释，不要 markdown。"
-            "你必须提供完整策略文件源码。"
-            "除 candidate_id 与 change_tags 外，其余说明字段必须使用简体中文。"
-        ),
-        max_output_tokens=RUNTIME.prompt_max_output_tokens,
-        text_format=build_json_text_format(
-            schema=build_candidate_response_schema(),
-            schema_name="macd_aggressive_strategy_candidate_v2",
-            strict=True,
-        ),
-        progress_callback=_build_model_progress_callback("model_generate"),
+    with _temporary_cwd(workspace_root):
+        payload = generate_json_object(
+            prompt=prompt,
+            system_prompt=(
+                "你是严谨的量化研究员。"
+                "只输出 JSON，不要解释，不要 markdown。"
+                "你必须先阅读并直接修改工作区中的 src/strategy_macd_aggressive.py，再输出 JSON。"
+                "不要在 JSON 中返回源码。"
+                "除 candidate_id 与 change_tags 外，其余说明字段必须使用简体中文。"
+            ),
+            max_output_tokens=RUNTIME.prompt_max_output_tokens,
+            config=_model_client_config(),
+            text_format=build_json_text_format(
+                schema=build_candidate_response_schema(),
+                schema_name="macd_aggressive_strategy_candidate_v2",
+                strict=True,
+            ),
+            progress_callback=_build_model_progress_callback("model_generate"),
+        )
+    return _candidate_from_payload(
+        payload,
+        workspace_strategy_file=workspace_root / MODEL_WORKSPACE_STRATEGY_PATH,
+        base_source=base_source,
     )
-    return _candidate_from_payload(payload)
 
 
 def _repair_model_candidate(
@@ -502,10 +546,9 @@ def _repair_model_candidate(
     failed_candidate: StrategyCandidate,
     error_message: str,
     repair_attempt: int,
+    workspace_root: Path,
 ) -> StrategyCandidate:
     prompt = build_strategy_runtime_repair_prompt(
-        strategy_source=base_source,
-        failed_candidate_code=failed_candidate.strategy_code,
         candidate_id=failed_candidate.candidate_id,
         hypothesis=failed_candidate.hypothesis,
         change_plan=failed_candidate.change_plan,
@@ -517,26 +560,34 @@ def _repair_model_candidate(
         error_message=error_message,
         repair_attempt=repair_attempt,
     )
-    payload = generate_json_object(
-        prompt=prompt,
-        system_prompt=(
-            "你是严谨的量化研究员。"
-            "只输出 JSON，不要解释，不要 markdown。"
-            "你正在修复同一轮候选代码，不要切换研究方向。"
-            "除 candidate_id 与 change_tags 外，其余说明字段必须使用简体中文。"
-        ),
-        max_output_tokens=RUNTIME.prompt_max_output_tokens,
-        text_format=build_json_text_format(
-            schema=build_candidate_response_schema(),
-            schema_name="macd_aggressive_strategy_candidate_repair_v2",
-            strict=True,
-        ),
-        progress_callback=_build_model_progress_callback(
-            "model_repair",
-            repair_attempt=repair_attempt,
-        ),
+    with _temporary_cwd(workspace_root):
+        payload = generate_json_object(
+            prompt=prompt,
+            system_prompt=(
+                "你是严谨的量化研究员。"
+                "只输出 JSON，不要解释，不要 markdown。"
+                "你正在修复同一轮候选代码，不要切换研究方向。"
+                "你必须直接修改工作区中的 src/strategy_macd_aggressive.py。"
+                "不要在 JSON 中返回源码。"
+                "除 candidate_id 与 change_tags 外，其余说明字段必须使用简体中文。"
+            ),
+            max_output_tokens=RUNTIME.prompt_max_output_tokens,
+            config=_model_client_config(),
+            text_format=build_json_text_format(
+                schema=build_candidate_response_schema(),
+                schema_name="macd_aggressive_strategy_candidate_repair_v2",
+                strict=True,
+            ),
+            progress_callback=_build_model_progress_callback(
+                "model_repair",
+                repair_attempt=repair_attempt,
+            ),
+        )
+    repaired = _candidate_from_payload(
+        payload,
+        workspace_strategy_file=workspace_root / MODEL_WORKSPACE_STRATEGY_PATH,
+        base_source=base_source,
     )
-    repaired = _candidate_from_payload(payload)
     if not repaired.candidate_id:
         repaired = StrategyCandidate(
             candidate_id=failed_candidate.candidate_id,
@@ -553,10 +604,10 @@ def _repair_model_candidate(
     return repaired
 
 
-def build_strategy_candidate(base_source: str) -> StrategyCandidate:
+def build_strategy_candidate(base_source: str, *, workspace_root: Path) -> StrategyCandidate:
     journal_entries = load_journal_entries(RUNTIME.paths.journal_file)
     try:
-        return _build_model_candidate(base_source, journal_entries)
+        return _build_model_candidate(base_source, journal_entries, workspace_root=workspace_root)
     except StrategyGenerationTransientError:
         raise
     except Exception:
@@ -725,7 +776,12 @@ def _evaluate_candidate(candidate: StrategyCandidate) -> EvaluationReport:
         raise CandidateRuntimeFailure("full_eval", exc) from exc
 
 
-def _candidate_with_repair(base_source: str, candidate: StrategyCandidate) -> tuple[StrategyCandidate, EvaluationReport]:
+def _candidate_with_repair(
+    base_source: str,
+    candidate: StrategyCandidate,
+    *,
+    workspace_root: Path,
+) -> tuple[StrategyCandidate, EvaluationReport]:
     current = candidate
     errors: list[str] = []
     for attempt in range(0, max(0, RUNTIME.max_repair_attempts) + 1):
@@ -758,6 +814,7 @@ def _candidate_with_repair(base_source: str, candidate: StrategyCandidate) -> tu
                 failed_candidate=current,
                 error_message="\n".join(errors[-3:]),
                 repair_attempt=attempt + 1,
+                workspace_root=workspace_root,
             )
     raise CandidateRepairExhausted(current, errors)
 
@@ -782,83 +839,93 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
         )
         return "evaluation_only"
 
-    candidate = build_strategy_candidate(best_source)
-    candidate_hash = source_hash(candidate.strategy_code)
-    journal_entries = load_journal_entries(RUNTIME.paths.journal_file)
+    with tempfile.TemporaryDirectory(prefix="macd-v2-workspace-") as temp_dir:
+        workspace_root = Path(temp_dir)
+        workspace_strategy_file = workspace_root / MODEL_WORKSPACE_STRATEGY_PATH
+        workspace_strategy_file.parent.mkdir(parents=True, exist_ok=True)
+        write_strategy_source(workspace_strategy_file, best_source)
 
-    if candidate_hash == source_hash(best_source):
-        log_info(f"第 {iteration_id} 轮跳过: 候选源码与当前最优完全相同")
-        write_heartbeat("iteration_skipped", message=f"iteration {iteration_id} duplicate source")
-        return "duplicate_skipped"
-    if has_recent_code_hash(journal_entries, candidate_hash):
-        log_info(f"第 {iteration_id} 轮跳过: 候选源码命中最近研究历史")
-        write_heartbeat("iteration_skipped", message=f"iteration {iteration_id} duplicate journal hash")
-        return "duplicate_skipped"
+        candidate = build_strategy_candidate(best_source, workspace_root=workspace_root)
+        candidate_hash = source_hash(candidate.strategy_code)
+        journal_entries = load_journal_entries(RUNTIME.paths.journal_file)
 
-    diff_summary = build_diff_summary(best_source, candidate.strategy_code, limit=12)
-    if not diff_summary:
-        log_info(f"第 {iteration_id} 轮跳过: 候选没有产生有效 diff")
-        write_heartbeat("iteration_skipped", message=f"iteration {iteration_id} empty diff")
-        return "duplicate_skipped"
+        if candidate_hash == source_hash(best_source):
+            log_info(f"第 {iteration_id} 轮跳过: 候选源码与当前最优完全相同")
+            write_heartbeat("iteration_skipped", message=f"iteration {iteration_id} duplicate source")
+            return "duplicate_skipped"
+        if has_recent_code_hash(journal_entries, candidate_hash):
+            log_info(f"第 {iteration_id} 轮跳过: 候选源码命中最近研究历史")
+            write_heartbeat("iteration_skipped", message=f"iteration {iteration_id} duplicate journal hash")
+            return "duplicate_skipped"
 
-    try:
-        candidate, candidate_report = _candidate_with_repair(best_source, candidate)
-    except EarlyRejection as exc:
-        write_strategy_source(RUNTIME.paths.strategy_file, best_source)
-        reload_strategy_module()
-        append_journal_entry(
-            RUNTIME.paths.journal_file,
-            _build_journal_entry(
-                iteration_id=iteration_id,
-                candidate=candidate,
-                base_source=best_source,
-                candidate_report=None,
-                outcome="early_rejected",
-                stop_stage="early_reject",
-                gate_reason="前段趋势捕获过差",
-                note=str(exc),
-            ),
-        )
-        if maybe_compact(RUNTIME.paths.journal_file):
-            log_info("研究日志已压缩")
-        log_info(f"第 {iteration_id} 轮提前淘汰: {exc}")
-        write_heartbeat(
-            "iteration_early_rejected",
-            message=f"iteration {iteration_id} early rejected: {exc}",
-            gate="前段趋势捕获过差",
-        )
-        return "early_rejected"
-    except CandidateRepairExhausted as exc:
-        write_strategy_source(RUNTIME.paths.strategy_file, best_source)
-        reload_strategy_module()
-        append_journal_entry(
-            RUNTIME.paths.journal_file,
-            _build_journal_entry(
-                iteration_id=iteration_id,
-                candidate=exc.candidate,
-                base_source=best_source,
-                candidate_report=None,
-                outcome="runtime_failed",
-                stop_stage="runtime_error",
-                gate_reason="运行失败",
-                note="；".join(exc.errors),
-            ),
-        )
-        if maybe_compact(RUNTIME.paths.journal_file):
-            log_info("研究日志已压缩")
-        log_info(f"第 {iteration_id} 轮运行失败并已记录: {exc}")
-        write_heartbeat(
-            "iteration_runtime_failed",
-            message=f"iteration {iteration_id} runtime failed",
-            error=str(exc),
-        )
-        return "runtime_failed"
-    except StrategyGenerationTransientError:
-        raise
-    except Exception:
-        write_strategy_source(RUNTIME.paths.strategy_file, best_source)
-        reload_strategy_module()
-        raise
+        diff_summary = build_diff_summary(best_source, candidate.strategy_code, limit=12)
+        if not diff_summary:
+            log_info(f"第 {iteration_id} 轮跳过: 候选没有产生有效 diff")
+            write_heartbeat("iteration_skipped", message=f"iteration {iteration_id} empty diff")
+            return "duplicate_skipped"
+
+        try:
+            candidate, candidate_report = _candidate_with_repair(
+                best_source,
+                candidate,
+                workspace_root=workspace_root,
+            )
+        except EarlyRejection as exc:
+            write_strategy_source(RUNTIME.paths.strategy_file, best_source)
+            reload_strategy_module()
+            append_journal_entry(
+                RUNTIME.paths.journal_file,
+                _build_journal_entry(
+                    iteration_id=iteration_id,
+                    candidate=candidate,
+                    base_source=best_source,
+                    candidate_report=None,
+                    outcome="early_rejected",
+                    stop_stage="early_reject",
+                    gate_reason="前段趋势捕获过差",
+                    note=str(exc),
+                ),
+            )
+            if maybe_compact(RUNTIME.paths.journal_file):
+                log_info("研究日志已压缩")
+            log_info(f"第 {iteration_id} 轮提前淘汰: {exc}")
+            write_heartbeat(
+                "iteration_early_rejected",
+                message=f"iteration {iteration_id} early rejected: {exc}",
+                gate="前段趋势捕获过差",
+            )
+            return "early_rejected"
+        except CandidateRepairExhausted as exc:
+            write_strategy_source(RUNTIME.paths.strategy_file, best_source)
+            reload_strategy_module()
+            append_journal_entry(
+                RUNTIME.paths.journal_file,
+                _build_journal_entry(
+                    iteration_id=iteration_id,
+                    candidate=exc.candidate,
+                    base_source=best_source,
+                    candidate_report=None,
+                    outcome="runtime_failed",
+                    stop_stage="runtime_error",
+                    gate_reason="运行失败",
+                    note="；".join(exc.errors),
+                ),
+            )
+            if maybe_compact(RUNTIME.paths.journal_file):
+                log_info("研究日志已压缩")
+            log_info(f"第 {iteration_id} 轮运行失败并已记录: {exc}")
+            write_heartbeat(
+                "iteration_runtime_failed",
+                message=f"iteration {iteration_id} runtime failed",
+                error=str(exc),
+            )
+            return "runtime_failed"
+        except StrategyGenerationTransientError:
+            raise
+        except Exception:
+            write_strategy_source(RUNTIME.paths.strategy_file, best_source)
+            reload_strategy_module()
+            raise
 
     entry_base = _build_journal_entry(
         iteration_id=iteration_id,

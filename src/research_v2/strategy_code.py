@@ -137,6 +137,66 @@ def build_diff_summary(old_source: str, new_source: str, limit: int = 24) -> lis
     return filtered[:limit]
 
 
+def _offset_for_line_column(line_offsets: list[int], lineno: int, column: int) -> int:
+    return line_offsets[lineno - 1] + column
+
+
+def _editable_spans(source: str, editable_regions: tuple[str, ...]) -> list[tuple[int, int, str]]:
+    normalized = normalize_strategy_source(source)
+    tree = ast.parse(normalized)
+    line_offsets = [0]
+    for line in normalized.splitlines(keepends=True):
+        line_offsets.append(line_offsets[-1] + len(line))
+
+    spans: list[tuple[int, int, str]] = []
+    if "PARAMS" in editable_regions:
+        match = PARAM_BLOCK_PATTERN.search(normalized)
+        if match is None:
+            raise StrategySourceError("missing PARAMS block markers")
+        spans.append((match.start(), match.end(), "PARAMS"))
+
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        if node.name not in editable_regions:
+            continue
+        start = _offset_for_line_column(line_offsets, node.lineno, node.col_offset)
+        end_lineno = getattr(node, "end_lineno", node.lineno)
+        end_col_offset = getattr(node, "end_col_offset", node.col_offset)
+        end = _offset_for_line_column(line_offsets, end_lineno, end_col_offset)
+        spans.append((start, end, node.name))
+
+    spans.sort(key=lambda item: item[0])
+    return spans
+
+
+def _mask_editable_regions(source: str, editable_regions: tuple[str, ...]) -> str:
+    normalized = normalize_strategy_source(source)
+    parts: list[str] = []
+    cursor = 0
+    for start, end, region_name in _editable_spans(normalized, editable_regions):
+        if start < cursor:
+            raise StrategySourceError(f"overlapping editable regions around {region_name}")
+        parts.append(normalized[cursor:start])
+        parts.append(f"<<EDITABLE:{region_name}>>")
+        cursor = end
+    parts.append(normalized[cursor:])
+    return "".join(parts)
+
+
+def validate_editable_region_boundaries(
+    base_source: str,
+    candidate_source: str,
+    editable_regions: tuple[str, ...],
+) -> None:
+    base_masked = _mask_editable_regions(base_source, editable_regions)
+    candidate_masked = _mask_editable_regions(candidate_source, editable_regions)
+    if base_masked != candidate_masked:
+        raise StrategySourceError(
+            "candidate modified content outside editable regions"
+        )
+
+
 def validate_strategy_source(source: str) -> None:
     normalized = normalize_strategy_source(source)
     try:

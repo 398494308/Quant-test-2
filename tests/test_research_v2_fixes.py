@@ -25,7 +25,12 @@ from research_v2.journal import (
     cluster_key_for_entry,
 )
 from research_v2.notifications import build_discord_summary_message
-from research_v2.strategy_code import StrategySourceError, validate_strategy_source
+from research_v2.prompting import EDITABLE_REGIONS
+from research_v2.strategy_code import (
+    StrategySourceError,
+    validate_editable_region_boundaries,
+    validate_strategy_source,
+)
 
 
 class BacktestFixesTest(unittest.TestCase):
@@ -406,6 +411,57 @@ def strategy(*args, **kwargs):
 """
         with self.assertRaises(StrategySourceError):
             validate_strategy_source(source)
+
+    def test_validate_editable_boundaries_rejects_non_editable_changes(self):
+        base_source = """
+# PARAMS_START
+PARAMS = {'intraday_adx_min': 10, 'hourly_adx_min': 10, 'fourh_adx_min': 10, 'breakout_adx_min': 10, 'breakdown_adx_min': 10, 'breakout_lookback': 10, 'breakdown_lookback': 10, 'breakout_rsi_min': 40, 'breakout_rsi_max': 60, 'breakdown_rsi_min': 20, 'breakdown_rsi_max': 60, 'breakout_volume_ratio_min': 1.0, 'breakdown_volume_ratio_min': 1.0, 'breakout_body_ratio_min': 0.3, 'breakdown_body_ratio_min': 0.3, 'breakout_close_pos_min': 0.5, 'breakdown_close_pos_max': 0.5, 'intraday_ema_fast': 9, 'intraday_ema_slow': 20, 'hourly_ema_fast': 10, 'hourly_ema_slow': 20, 'fourh_ema_fast': 10, 'fourh_ema_slow': 20, 'macd_fast': 12, 'macd_slow': 26, 'macd_signal': 9, 'volume_lookback': 10}
+# PARAMS_END
+
+def helper():
+    return 1
+
+def _is_sideways_regime(*args, **kwargs):
+    return False
+
+def _trend_quality_ok(*args, **kwargs):
+    return True
+
+def _trend_followthrough_ok(*args, **kwargs):
+    return True
+
+def strategy(*args, **kwargs):
+    return helper()
+"""
+        candidate_source = base_source.replace("return 1", "return 2", 1)
+
+        with self.assertRaises(StrategySourceError):
+            validate_editable_region_boundaries(base_source, candidate_source, EDITABLE_REGIONS)
+
+    def test_validate_editable_boundaries_allows_strategy_change(self):
+        base_source = """
+# PARAMS_START
+PARAMS = {'intraday_adx_min': 10, 'hourly_adx_min': 10, 'fourh_adx_min': 10, 'breakout_adx_min': 10, 'breakdown_adx_min': 10, 'breakout_lookback': 10, 'breakdown_lookback': 10, 'breakout_rsi_min': 40, 'breakout_rsi_max': 60, 'breakdown_rsi_min': 20, 'breakdown_rsi_max': 60, 'breakout_volume_ratio_min': 1.0, 'breakdown_volume_ratio_min': 1.0, 'breakout_body_ratio_min': 0.3, 'breakdown_body_ratio_min': 0.3, 'breakout_close_pos_min': 0.5, 'breakdown_close_pos_max': 0.5, 'intraday_ema_fast': 9, 'intraday_ema_slow': 20, 'hourly_ema_fast': 10, 'hourly_ema_slow': 20, 'fourh_ema_fast': 10, 'fourh_ema_slow': 20, 'macd_fast': 12, 'macd_slow': 26, 'macd_signal': 9, 'volume_lookback': 10}
+# PARAMS_END
+
+def helper():
+    return 1
+
+def _is_sideways_regime(*args, **kwargs):
+    return False
+
+def _trend_quality_ok(*args, **kwargs):
+    return True
+
+def _trend_followthrough_ok(*args, **kwargs):
+    return True
+
+def strategy(*args, **kwargs):
+    return helper()
+"""
+        candidate_source = base_source.replace("return helper()", "return None", 1)
+
+        validate_editable_region_boundaries(base_source, candidate_source, EDITABLE_REGIONS)
 
 
 class JournalPromptFixesTest(unittest.TestCase):
