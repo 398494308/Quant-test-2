@@ -141,6 +141,9 @@ def build_strategy_research_prompt(
 - 保留 `PARAMS`、`strategy()`、`_is_sideways_regime()`、`_trend_quality_ok()`、`_trend_followthrough_ok()` 这些符号。
 - 不要引入网络、文件、随机数、外部依赖。
 - 每轮只做一个明确假设，最多改 1 到 3 个区域。
+- 不要为了显得“有改动”而重写无关逻辑、批量改名、做大面积格式化，或新增与本轮假设无关的分支。
+- 禁止 hard code 针对单个日期、单个窗口、单段行情、固定价格路径或历史结果表做特判。
+- 代码必须保持简洁、结构化、可读；优先最小必要改动，避免重复条件、冗余 helper、臃肿嵌套和一次性补丁式写法。
 - 你必须先阅读最前面的方向风险表。
 - 你还必须阅读紧随其后的过拟合风险表。
 - 不要把带有 `SATURATED` / `EXHAUSTED` 标签的方向簇作为本轮主方向。
@@ -220,6 +223,8 @@ def build_strategy_runtime_repair_prompt(
 - 除非原标签明显不准确，否则尽量保持 `change_tags`、`edited_regions`、`closest_failed_cluster` 不变。
 - 只允许修改 `src/strategy_macd_aggressive.py` 可编辑区域。
 - 不要引入网络、文件、随机数、外部依赖。
+- 不要趁修复机会重写无关逻辑，也不要 hard code 针对单个窗口或单段行情的特判。
+- 修复后的代码仍必须保持简洁、结构化、可读，避免补丁式堆条件。
 
 输出要求：
 - 仍然只输出 JSON。
