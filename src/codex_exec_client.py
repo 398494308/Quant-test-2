@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 class StrategyGenerationError(RuntimeError):
@@ -18,6 +20,13 @@ class StrategyGenerationError(RuntimeError):
 
 class StrategyGenerationTransientError(StrategyGenerationError):
     """Raised when Codex appears temporarily unavailable or times out."""
+
+
+ProgressCallback = Callable[[dict[str, Any]], None]
+
+_PROGRESS_POLL_SECONDS = 15.0
+_TERM_GRACE_SECONDS = 3.0
+_KILL_GRACE_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -53,7 +62,7 @@ def load_strategy_client_config() -> StrategyClientConfig:
         model=os.getenv("CODEX_MODEL", os.getenv("OPENAI_MODEL", "gpt-5.4")).strip() or "gpt-5.4",
         reasoning_effort=os.getenv("CODEX_REASONING_EFFORT", "medium").strip() or "medium",
         sandbox=os.getenv("CODEX_SANDBOX", "read-only").strip() or "read-only",
-        timeout_seconds=int(os.getenv("CODEX_TIMEOUT_SECONDS", "900")),
+        timeout_seconds=int(os.getenv("CODEX_TIMEOUT_SECONDS", "420")),
         use_ephemeral=_env_flag("CODEX_EPHEMERAL", True),
     )
 
@@ -135,6 +144,49 @@ def _read_output_message(path: Path, stdout: str) -> str:
     return stdout.strip()
 
 
+def _emit_progress(callback: ProgressCallback | None, **payload: Any) -> None:
+    if callback is None:
+        return
+    try:
+        callback(payload)
+    except Exception:
+        # Heartbeat/reporting failures should not break strategy generation.
+        return
+
+
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except Exception:
+        try:
+            process.terminate()
+        except Exception:
+            return
+    try:
+        process.wait(timeout=_TERM_GRACE_SECONDS)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            return
+    try:
+        process.wait(timeout=_KILL_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        return
+
+
 def generate_json_object(
     prompt: str,
     system_prompt: str,
@@ -142,6 +194,7 @@ def generate_json_object(
     timeout: float | tuple[float, float] | None = None,
     config: StrategyClientConfig | None = None,
     text_format: dict[str, Any] | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     del max_output_tokens, timeout
 
@@ -186,28 +239,79 @@ def generate_json_object(
             ]
         )
         full_prompt = _build_codex_prompt(prompt, system_prompt)
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        started_at = time.monotonic()
+        deadline = started_at + float(client_config.timeout_seconds)
+        input_text: str | None = full_prompt
         try:
-            completed = subprocess.run(
-                command,
-                input=full_prompt,
-                text=True,
-                capture_output=True,
-                timeout=client_config.timeout_seconds,
-                check=False,
+            _emit_progress(
+                progress_callback,
+                event="started",
+                pid=process.pid,
+                timeout_seconds=client_config.timeout_seconds,
+                model=client_config.model,
+                reasoning_effort=client_config.reasoning_effort,
             )
-        except subprocess.TimeoutExpired as exc:
-            raise StrategyGenerationTransientError(
-                f"codex exec timed out after {client_config.timeout_seconds}s"
-            ) from exc
+            while True:
+                remaining_seconds = deadline - time.monotonic()
+                if remaining_seconds <= 0:
+                    _terminate_process_tree(process)
+                    elapsed_seconds = int(max(0.0, time.monotonic() - started_at))
+                    _emit_progress(
+                        progress_callback,
+                        event="timeout",
+                        pid=process.pid,
+                        elapsed_seconds=elapsed_seconds,
+                        timeout_seconds=client_config.timeout_seconds,
+                    )
+                    raise StrategyGenerationTransientError(
+                        f"codex exec timed out after {client_config.timeout_seconds}s"
+                    )
+                try:
+                    stdout, stderr = process.communicate(
+                        input=input_text,
+                        timeout=min(_PROGRESS_POLL_SECONDS, remaining_seconds),
+                    )
+                    break
+                except subprocess.TimeoutExpired:
+                    input_text = None
+                    _emit_progress(
+                        progress_callback,
+                        event="heartbeat",
+                        pid=process.pid,
+                        elapsed_seconds=int(max(0.0, time.monotonic() - started_at)),
+                        timeout_seconds=client_config.timeout_seconds,
+                        model=client_config.model,
+                        reasoning_effort=client_config.reasoning_effort,
+                    )
+        except Exception:
+            _terminate_process_tree(process)
+            raise
 
-        stdout = completed.stdout or ""
-        stderr = completed.stderr or ""
-        if completed.returncode != 0:
+        _emit_progress(
+            progress_callback,
+            event="completed",
+            pid=process.pid,
+            elapsed_seconds=int(max(0.0, time.monotonic() - started_at)),
+            timeout_seconds=client_config.timeout_seconds,
+            returncode=process.returncode,
+        )
+
+        stdout = stdout or ""
+        stderr = stderr or ""
+        if process.returncode != 0:
             message = (
-                f"codex exec failed with exit code {completed.returncode}: "
+                f"codex exec failed with exit code {process.returncode}: "
                 f"{_tail(stderr or stdout or 'no output')}"
             )
-            if _is_retryable_error(stderr):
+            if _is_retryable_error(stderr or stdout):
                 raise StrategyGenerationTransientError(message)
             raise StrategyGenerationError(message)
 

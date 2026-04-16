@@ -115,6 +115,39 @@ def write_heartbeat(status: str, **extra: Any) -> None:
     temp_path.replace(RUNTIME.paths.heartbeat_file)
 
 
+def _build_model_progress_callback(phase: str, *, repair_attempt: int | None = None):
+    def callback(payload: dict[str, Any]) -> None:
+        event = str(payload.get("event", "")).strip() or "heartbeat"
+        timeout_seconds = int(payload.get("timeout_seconds", 0) or 0)
+        elapsed_seconds = int(payload.get("elapsed_seconds", 0) or 0)
+
+        message = f"iteration {iteration_counter} {phase}"
+        if event == "started":
+            message += " started"
+        elif event == "heartbeat" and timeout_seconds > 0:
+            message += f" waiting {elapsed_seconds}s/{timeout_seconds}s"
+        elif event == "timeout" and timeout_seconds > 0:
+            message += f" timeout {timeout_seconds}s"
+        elif event == "completed":
+            message += " completed"
+
+        heartbeat_payload: dict[str, Any] = {
+            "message": message,
+            "phase": phase,
+            "provider_pid": payload.get("pid"),
+            "timeout_seconds": timeout_seconds,
+            "elapsed_seconds": elapsed_seconds,
+            "provider_model": payload.get("model"),
+            "provider_reasoning_effort": payload.get("reasoning_effort"),
+        }
+        if repair_attempt is not None:
+            heartbeat_payload["repair_attempt"] = repair_attempt
+
+        write_heartbeat("model_waiting", **heartbeat_payload)
+
+    return callback
+
+
 # ==================== 模块热加载 ====================
 
 
@@ -458,6 +491,7 @@ def _build_model_candidate(base_source: str, journal_entries: list[dict[str, Any
             schema_name="macd_aggressive_strategy_candidate_v2",
             strict=True,
         ),
+        progress_callback=_build_model_progress_callback("model_generate"),
     )
     return _candidate_from_payload(payload)
 
@@ -496,6 +530,10 @@ def _repair_model_candidate(
             schema=build_candidate_response_schema(),
             schema_name="macd_aggressive_strategy_candidate_repair_v2",
             strict=True,
+        ),
+        progress_callback=_build_model_progress_callback(
+            "model_repair",
+            repair_attempt=repair_attempt,
         ),
     )
     repaired = _candidate_from_payload(payload)
@@ -956,7 +994,8 @@ def main() -> int:
             outcome = run_iteration(iteration_counter, use_model_optimization=True)
         except StrategyGenerationTransientError as exc:
             log_info(
-                f"⚠️ 第 {iteration_counter} 轮延后: provider transient failure, "
+                f"⚠️ 第 {iteration_counter} 轮延后: provider transient failure "
+                f"({str(exc).splitlines()[0]}), "
                 f"{RUNTIME.provider_recovery_wait_seconds} 秒后重试"
             )
             write_heartbeat(

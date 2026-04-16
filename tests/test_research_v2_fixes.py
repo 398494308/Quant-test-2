@@ -1,7 +1,10 @@
+import json
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -9,6 +12,7 @@ sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 import backtest_macd_aggressive as backtest
+from codex_exec_client import StrategyClientConfig, StrategyGenerationTransientError, generate_json_object
 from scripts.research_macd_aggressive_v2 import select_smoke_windows
 from research_v2.config import GateConfig
 from research_v2.evaluation import EvaluationReport, _collect_daily_path, _collect_trend_path, _trend_score_report, summarize_evaluation
@@ -628,6 +632,115 @@ class SmokeWindowSelectionTest(unittest.TestCase):
         selected = select_smoke_windows(windows, 3)
 
         self.assertEqual([window.label for window in selected], ["评估1", "验证1", "评估3"])
+
+
+class CodexExecClientTest(unittest.TestCase):
+    def test_generate_json_object_emits_progress_heartbeats(self):
+        events: list[dict[str, object]] = []
+
+        class FakePopen:
+            def __init__(self, *args, **kwargs):
+                self.pid = 43210
+                self.returncode = 0
+                self.communicate_calls = 0
+
+            def communicate(self, input=None, timeout=None):
+                self.communicate_calls += 1
+                if self.communicate_calls < 3:
+                    raise subprocess.TimeoutExpired(cmd="codex", timeout=timeout)
+                return (json.dumps({"ok": True}), "")
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        config = StrategyClientConfig(
+            codex_bin="codex",
+            model="gpt-5.4",
+            reasoning_effort="medium",
+            sandbox="read-only",
+            timeout_seconds=90,
+            use_ephemeral=True,
+        )
+
+        with mock.patch("codex_exec_client.shutil.which", return_value="/usr/local/bin/codex"):
+            with mock.patch("codex_exec_client.subprocess.Popen", return_value=FakePopen()):
+                payload = generate_json_object(
+                    prompt="test",
+                    system_prompt="system",
+                    config=config,
+                    text_format={
+                        "type": "json_schema",
+                        "schema": {
+                            "type": "object",
+                            "properties": {"ok": {"type": "boolean"}},
+                            "required": ["ok"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    progress_callback=events.append,
+                )
+
+        self.assertEqual(payload, {"ok": True})
+        self.assertEqual(events[0]["event"], "started")
+        self.assertIn("heartbeat", [event["event"] for event in events])
+        self.assertEqual(events[-1]["event"], "completed")
+
+    def test_generate_json_object_kills_process_group_after_timeout(self):
+        class FakePopen:
+            def __init__(self, *args, **kwargs):
+                self.pid = 54321
+                self.returncode = None
+
+            def communicate(self, input=None, timeout=None):
+                raise subprocess.TimeoutExpired(cmd="codex", timeout=timeout)
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = -15
+
+            def kill(self):
+                self.returncode = -9
+
+            def wait(self, timeout=None):
+                self.returncode = -15
+                return self.returncode
+
+        config = StrategyClientConfig(
+            codex_bin="codex",
+            model="gpt-5.4",
+            reasoning_effort="medium",
+            sandbox="read-only",
+            timeout_seconds=30,
+            use_ephemeral=True,
+        )
+        monotonic_values = iter([0.0, 5.0, 15.0, 31.0, 31.5, 32.0])
+
+        with mock.patch("codex_exec_client.shutil.which", return_value="/usr/local/bin/codex"):
+            with mock.patch("codex_exec_client.subprocess.Popen", return_value=FakePopen()):
+                with mock.patch("codex_exec_client.time.monotonic", side_effect=lambda: next(monotonic_values)):
+                    with mock.patch("codex_exec_client.os.killpg") as killpg:
+                        with self.assertRaises(StrategyGenerationTransientError):
+                            generate_json_object(
+                                prompt="test",
+                                system_prompt="system",
+                                config=config,
+                                text_format={
+                                    "type": "json_schema",
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {"ok": {"type": "boolean"}},
+                                        "required": ["ok"],
+                                        "additionalProperties": False,
+                                    },
+                                },
+                            )
+
+        self.assertGreaterEqual(killpg.call_count, 1)
 
 
 class DiscordSummaryFormattingTest(unittest.TestCase):

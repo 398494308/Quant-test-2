@@ -51,6 +51,22 @@ parts = [
     f"heartbeat={payload.get('status', 'unknown')}",
     f"iter={payload.get('iteration', 0)}",
 ]
+phase = payload.get("phase")
+if phase:
+    parts.append(f"phase={phase}")
+current_window = payload.get("current_window")
+if current_window:
+    parts.append(f"window={current_window}")
+elapsed_seconds = payload.get("elapsed_seconds")
+timeout_seconds = payload.get("timeout_seconds")
+if elapsed_seconds is not None and timeout_seconds:
+    try:
+        parts.append(f"wait={int(elapsed_seconds)}/{int(timeout_seconds)}s")
+    except Exception:
+        pass
+repair_attempt = payload.get("repair_attempt")
+if repair_attempt is not None:
+    parts.append(f"repair={repair_attempt}")
 if age_seconds is not None:
     parts.append(f"age={age_seconds}s")
 print(" ".join(parts))

@@ -50,6 +50,8 @@
 - 每轮先跑 `smoke` 窗口，运行报错会在同一轮进入 repair loop，最多按配置尝试修复，再决定是否记为 `runtime_failed`。
 - `smoke` 抽样现在默认会覆盖 `validation`；在 `smoke_window_count=3` 时，默认是“早期 eval + validation + 中段 eval”，不再只测 `eval`。
 - `heartbeat` 会写出当前阶段和窗口进度，便于判断卡在 `smoke`、`full_eval` 还是修复。
+- 模型生成和 repair 阶段现在也会持续刷新 `heartbeat`，状态里能直接看到 `model_generate / model_repair`、等待秒数和超时上限。
+- `codex exec` 默认单次超时已从 `900s` 收紧到 `420s`；超时后会回收整组 provider 子进程，避免留下孤儿进程一直占着 CPU / 内存。
 - `2026-04-15` 已按当前 `trend_capture_v1` 评分口径重新初始化 best state，避免旧分数挡住本该通过的候选。
 - 提前淘汰从旧的 Sortino 逻辑改成了部分窗口趋势捕获快照：趋势段够多且趋势捕获分、命中率都很差时，会提前结束该轮。
 - 评估阶段现在会额外计算过拟合风险：若结果过度依赖单一正向趋势段、同向连续段，或有效命中覆盖率过低且明显多空偏科，会直接被 gate 掉。
@@ -144,6 +146,18 @@ tests/             最小回归测试
 - `MACD_V2_EARLY_REJECT_HIT_RATE`
 - `MACD_V2_SMOKE_WINDOW_COUNT`
 - `MACD_V2_MAX_REPAIR_ATTEMPTS`
+- `CODEX_TIMEOUT_SECONDS`
+
+现在 `bash scripts/manage_research_macd_aggressive_v2.sh status` 除了会显示轮次，还会带上：
+
+- `phase`
+  当前处在哪个阶段，比如 `model_generate`、`model_repair`、`smoke_test`、`full_eval`。
+
+- `window`
+  当前正在跑哪个窗口；如果是整段连续回测，会显示 `全段连续`。
+
+- `wait`
+  只有在等模型返回时才会出现，表示“已经等了多久 / 最多等多久”。
 
 ## Discord 播报说明
 
@@ -245,6 +259,12 @@ Discord 里的主表目前会显示这些字段。下面尽量用直白的话解
 - 下图红区是策略相对自己历史峰值的回撤。
 - Discord 默认附验证窗口图，方便直接看 holdout 表现。
 - 全段连续图会额外保存到 `reports/research_v2_charts/`，用于本地复盘整段历史走势。
+
+如果你看到很久没有新结果，先看 `status`：
+
+- 如果是 `phase=model_generate` 或 `phase=model_repair`，说明卡在模型返回，`wait` 会告诉你已经等了多久。
+- 如果 `wait` 接近 `CODEX_TIMEOUT_SECONDS` 还没回来，这轮通常会自动记成 `provider transient failure`，清理 provider 子进程后再重试。
+- 如果是 `phase=smoke_test`、`full_eval` 或 `new_best_charting`，那就是在跑回测或画图，不是 provider 卡住。
 
 - `方向`
   这轮主要改的是哪类方向，比如更偏多头入场、横盘过滤、做空确认之类。
