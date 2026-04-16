@@ -4,12 +4,20 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 import backtest_macd_aggressive as backtest
+from scripts.research_macd_aggressive_v2 import select_smoke_windows
 from research_v2.config import GateConfig
 from research_v2.evaluation import _collect_daily_path, _collect_trend_path, _trend_score_report, summarize_evaluation
-from research_v2.journal import _format_compact_for_prompt, build_journal_prompt_summary, cluster_for_tags
+from research_v2.journal import (
+    _format_compact_for_prompt,
+    build_journal_prompt_summary,
+    cluster_for_tags,
+    cluster_key_for_components,
+    cluster_key_for_entry,
+)
 from research_v2.strategy_code import StrategySourceError, validate_strategy_source
 
 
@@ -382,10 +390,29 @@ class JournalPromptFixesTest(unittest.TestCase):
     def test_cluster_for_tags_groups_ownership_variants(self):
         self.assertEqual(cluster_for_tags(["acceptance_continuity", "ownership_transfer"]), "ownership_cluster")
 
+    def test_cluster_key_prefers_stable_canonical_cluster(self):
+        self.assertEqual(
+            cluster_key_for_components("arrival_reallocation", ["ownership_takeover", "continuation_prune"]),
+            "ownership_cluster",
+        )
+        self.assertEqual(
+            cluster_key_for_components("ownership_cluster", ["position_state_takeover"]),
+            "ownership_cluster",
+        )
+
+    def test_cluster_key_for_entry_uses_stored_cluster_when_present(self):
+        entry = {
+            "cluster_key": "ownership_cluster",
+            "closest_failed_cluster": "arrival_reallocation",
+            "change_tags": ["ownership_takeover"],
+        }
+        self.assertEqual(cluster_key_for_entry(entry), "ownership_cluster")
+
     def test_compact_prompt_includes_cluster_risk_summary(self):
         compact_data = {
             "rounds": [
                 {
+                    "score_regime": "trend_capture_v1",
                     "entry_count": 20,
                     "accepted_count": 0,
                     "rejected_count": 20,
@@ -405,10 +432,55 @@ class JournalPromptFixesTest(unittest.TestCase):
             ]
         }
 
-        summary = "\n".join(_format_compact_for_prompt(compact_data, limit=6))
+        summary = "\n".join(_format_compact_for_prompt(compact_data, limit=6, score_regime="trend_capture_v1"))
         self.assertIn("历史方向簇摘要", summary)
         self.assertIn("ownership_cluster", summary)
         self.assertIn("EXHAUSTED", summary)
+
+    def test_compact_prompt_filters_rounds_by_score_regime(self):
+        compact_data = {
+            "rounds": [
+                {
+                    "score_regime": "old_regime",
+                    "entry_count": 20,
+                    "accepted_count": 10,
+                    "rejected_count": 10,
+                    "early_rejected_count": 0,
+                    "runtime_failed_count": 0,
+                    "cluster_summary": {
+                        "sideways_cluster": {
+                            "attempts": 3,
+                            "failures": 2,
+                            "zero_delta": 1,
+                            "runtime_errors": 0,
+                            "best_delta": 0.1,
+                        }
+                    },
+                },
+                {
+                    "score_regime": "trend_capture_v1",
+                    "entry_count": 20,
+                    "accepted_count": 0,
+                    "rejected_count": 20,
+                    "early_rejected_count": 0,
+                    "runtime_failed_count": 1,
+                    "cluster_summary": {
+                        "ownership_cluster": {
+                            "attempts": 6,
+                            "failures": 6,
+                            "zero_delta": 6,
+                            "runtime_errors": 0,
+                            "best_delta": 0.0,
+                        }
+                    },
+                },
+            ]
+        }
+
+        summary = "\n".join(_format_compact_for_prompt(compact_data, limit=6, score_regime="trend_capture_v1"))
+        self.assertIn("ownership_cluster", summary)
+        self.assertNotIn("sideways_cluster", summary)
+        self.assertIn("已跳过 1 段非当前评分口径", summary)
 
     def test_journal_summary_puts_direction_risk_board_first(self):
         entries = []
@@ -519,6 +591,25 @@ class JournalPromptFixesTest(unittest.TestCase):
         self.assertIn("方向风险表", summary)
         self.assertIn("最近未压缩轮次表", summary)
         self.assertIn("等待新历史", summary)
+
+
+class SmokeWindowSelectionTest(unittest.TestCase):
+    def test_select_smoke_windows_includes_validation_when_count_is_three(self):
+        Window = type("Window", (), {})
+        windows = []
+        for idx in range(1, 6):
+            window = Window()
+            window.group = "eval"
+            window.label = f"评估{idx}"
+            windows.append(window)
+        validation = Window()
+        validation.group = "validation"
+        validation.label = "验证1"
+        windows.append(validation)
+
+        selected = select_smoke_windows(windows, 3)
+
+        self.assertEqual([window.label for window in selected], ["评估1", "验证1", "评估3"])
 
 
 if __name__ == "__main__":

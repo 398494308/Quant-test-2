@@ -30,7 +30,14 @@ import strategy_macd_aggressive as strategy_module
 from codex_exec_client import StrategyGenerationTransientError, build_json_text_format, generate_json_object
 from research_v2.config import ResearchRuntimeConfig, load_research_runtime_config
 from research_v2.evaluation import EvaluationReport, partial_eval_gate_snapshot, summarize_evaluation
-from research_v2.journal import append_journal_entry, build_journal_prompt_summary, has_recent_code_hash, load_journal_entries, maybe_compact
+from research_v2.journal import (
+    append_journal_entry,
+    build_journal_prompt_summary,
+    cluster_key_for_components,
+    has_recent_code_hash,
+    load_journal_entries,
+    maybe_compact,
+)
 from research_v2.notifications import build_discord_summary_message, load_discord_config, send_discord_message
 from research_v2.prompting import build_candidate_response_schema, build_strategy_research_prompt
 from research_v2.prompting import build_strategy_runtime_repair_prompt
@@ -140,19 +147,32 @@ class CandidateRepairExhausted(Exception):
         super().__init__(errors[-1] if errors else "candidate repair exhausted")
 
 
-def _selected_smoke_windows() -> list[Any]:
-    eval_windows = [window for window in WINDOWS if window.group == "eval"]
-    validation_windows = [window for window in WINDOWS if window.group == "validation"]
-    selected = []
+def select_smoke_windows(windows: list[Any], smoke_window_count: int) -> list[Any]:
+    if smoke_window_count <= 0:
+        return []
+    eval_windows = [window for window in windows if window.group == "eval"]
+    validation_windows = [window for window in windows if window.group == "validation"]
+    candidates: list[Any] = []
     if eval_windows:
-        candidate_indexes = [0, len(eval_windows) // 2, len(eval_windows) - 1]
-        for index in candidate_indexes:
-            window = eval_windows[index]
-            if window not in selected:
-                selected.append(window)
-    if validation_windows and len(selected) < max(1, RUNTIME.smoke_window_count):
-        selected.append(validation_windows[0])
-    return selected[: max(1, RUNTIME.smoke_window_count)]
+        candidates.append(eval_windows[0])
+    if validation_windows:
+        candidates.append(validation_windows[0])
+    if eval_windows:
+        candidates.append(eval_windows[len(eval_windows) // 2])
+    if len(eval_windows) > 1:
+        candidates.append(eval_windows[-1])
+
+    selected: list[Any] = []
+    for window in candidates:
+        if window not in selected:
+            selected.append(window)
+        if len(selected) >= smoke_window_count:
+            break
+    return selected[:smoke_window_count]
+
+
+def _selected_smoke_windows() -> list[Any]:
+    return select_smoke_windows(WINDOWS, RUNTIME.smoke_window_count)
 
 
 def _run_base_backtests(
@@ -482,6 +502,10 @@ def _build_journal_entry(
             }
             for factor in candidate.core_factors
         ],
+        "cluster_key": cluster_key_for_components(
+            candidate.closest_failed_cluster,
+            candidate.change_tags,
+        ),
         "quality_score": quality_score,
         "promotion_score": promotion_score,
         "promotion_delta": promotion_score - base_promotion if promotion_score is not None else None,

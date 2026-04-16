@@ -83,11 +83,14 @@
 - prompt 第一屏现在先给模型看“方向风险表”，按方向簇聚合近期失败、零增益、运行报错和最佳 `promotion_delta`。
 - prompt 第一屏会在方向风险表之后追加“过拟合风险表”，把高风险轮次单独标出来，提醒模型谨慎参考。
 - 方向簇标签分为 `OPEN / WARM / ACTIVE_WINNER / SATURATED / EXHAUSTED / RUNTIME_RISK`，用于提示模型哪些方向已经接近被试空。
+- 方向记忆现在统一使用 `cluster_key`：优先采用稳定的失败簇名；如果模型写的是临时近邻名字，就回退到系统识别的广义方向簇，避免同一方向仅因 tag 改名就被拆成新簇。
 - 候选必须输出 `closest_failed_cluster` 与 `novelty_proof`，先解释与最近失败方向的差异，再允许进入评估。
 - 若最近连续 3 轮都只是低变化零增益微调，prompt 会触发“探索轮”，强制要求切换因子家族或编辑区域家族，避免继续在同簇里换说法。
 - 每轮先跑 `smoke` 窗口，运行报错会在同一轮走 repair loop；修复次数耗尽才记成 `runtime_failed`。
+- `smoke` 抽样现在默认会覆盖 `validation`；在 `MACD_V2_SMOKE_WINDOW_COUNT=3` 时，当前逻辑默认抽“早期 eval + validation + 中段 eval”。
 - `heartbeat` 会带上当前阶段和窗口索引，方便排查是卡在 `smoke_test`、`full_eval` 还是 `candidate_repairing`。
 - 压缩历史除了标签统计外，也会保留方向簇摘要，避免 20 轮压缩后丢失长期失败记忆。
+- compact 历史现在会写入 `score_regime`，prompt 只会读取当前评分口径下的 compact 摘要；旧版未标记口径的 compact 轮次默认跳过，防止长期历史污染。
 - 提前淘汰改成了趋势捕获快照：窗口数足够、趋势段数足够且趋势捕获分和命中率都明显偏差时，才会提前结束这轮。
 - 评估新增了过拟合风险诊断：会看单段正向贡献占比、同向连续段贡献占比、有效覆盖率、多空偏科和 eval/validation 落差；严重时直接 gate。
 
@@ -99,6 +102,12 @@
 - `MACD_V2_EARLY_REJECT_HIT_RATE=0.05`
 - `MACD_V2_SMOKE_WINDOW_COUNT=3`
 - `MACD_V2_MAX_REPAIR_ATTEMPTS=2`
+
+对应当前 smoke 选窗行为：
+
+- `评估1 2023-07-01 ~ 2023-07-28`
+- `验证1 2025-03-01 ~ 2026-03-31`
+- `评估15 2024-04-20 ~ 2024-05-17`
 
 ## 当前已确认修复
 

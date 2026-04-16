@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ CLUSTER_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("sideways_cluster", ("sideways", "tighten_filter", "hourly_discount", "discounted_stall", "hourly_stretch")),
     ("trigger_efficiency_cluster", ("trigger_efficiency", "breakdown_entry", "breakout_entry", "reduce_false_breakdown", "reduce_false_breakout")),
 )
+CANONICAL_CLUSTER_NAMES = {cluster_name for cluster_name, _ in CLUSTER_KEYWORDS}
 LOW_CHANGE_STREAK = 3
 LOW_CHANGE_PROMOTION_DELTA_EPS = 0.02
 LOW_CHANGE_PROMOTION_SCORE_SPAN = 0.05
@@ -115,6 +117,44 @@ def cluster_for_tags(tags: list[str] | tuple[str, ...]) -> str:
     return normalized[0] if normalized else "unclassified"
 
 
+def _normalize_cluster_name(raw: Any) -> str:
+    text = str(raw or "").strip().lower()
+    if not text:
+        return ""
+    text = text.split("（", 1)[0].split("(", 1)[0].strip()
+    text = re.sub(r"[^a-z0-9_]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    if text in {"", "open", "unknown", "none", "null", "na"}:
+        return ""
+    return text
+
+
+def cluster_key_for_components(closest_failed_cluster: Any, change_tags: list[str] | tuple[str, ...]) -> str:
+    declared = _normalize_cluster_name(closest_failed_cluster)
+    inferred = cluster_for_tags(change_tags)
+    if declared and declared == inferred:
+        return declared
+    if declared in CANONICAL_CLUSTER_NAMES:
+        return declared
+    if inferred in CANONICAL_CLUSTER_NAMES:
+        return inferred
+    return declared or inferred
+
+
+def cluster_key_for_entry(entry: dict[str, Any]) -> str:
+    stored = _normalize_cluster_name(entry.get("cluster_key", ""))
+    if stored:
+        return stored
+    return cluster_key_for_components(
+        entry.get("closest_failed_cluster", ""),
+        entry.get("change_tags", []),
+    )
+
+
+def _entry_score_regime(entry: dict[str, Any]) -> str:
+    return str(entry.get("score_regime", "")).strip()
+
+
 def _risk_label(*, attempts: int, failures: int, zero_delta: int, runtime_errors: int, best_delta: float) -> str:
     if runtime_errors > 0:
         return "RUNTIME_RISK"
@@ -203,7 +243,7 @@ def _compact_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
 
     cluster_summary: dict[str, dict[str, Any]] = {}
     for entry in entries:
-        cluster = cluster_for_tags(entry.get("change_tags", []))
+        cluster = cluster_key_for_entry(entry)
         outcome = _outcome_bucket(str(entry.get("outcome", "")))
         promotion_delta = _score_value(entry.get("promotion_delta"))
         bucket = cluster_summary.setdefault(
@@ -229,6 +269,7 @@ def _compact_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
 
     return {
         "entry_count": len(entries),
+        "score_regime": _entry_score_regime(entries[-1]),
         "accepted_count": len(accepted),
         "rejected_count": len(rejected),
         "early_rejected_count": early_rejected_count,
@@ -278,11 +319,28 @@ def maybe_compact(journal_path: Path) -> bool:
     if not batch:
         return False
 
-    batch_summary = _compact_entries(batch)
-    batch_summary["range"] = f"entry {compacted_up_to + 1} ~ {compact_end}"
-
     rounds = existing_compact.get("rounds", [])
-    rounds.append(batch_summary)
+    segment_start = compacted_up_to
+    current_regime = _entry_score_regime(batch[0])
+    segment_entries: list[dict[str, Any]] = []
+    for offset, entry in enumerate(batch):
+        entry_regime = _entry_score_regime(entry)
+        absolute_index = compacted_up_to + offset
+        if segment_entries and entry_regime != current_regime:
+            batch_summary = _compact_entries(segment_entries)
+            batch_summary["range"] = f"entry {segment_start + 1} ~ {absolute_index}"
+            batch_summary["score_regime"] = current_regime
+            rounds.append(batch_summary)
+            segment_entries = []
+            segment_start = absolute_index
+            current_regime = entry_regime
+        segment_entries.append(entry)
+
+    if segment_entries:
+        batch_summary = _compact_entries(segment_entries)
+        batch_summary["range"] = f"entry {segment_start + 1} ~ {compact_end}"
+        batch_summary["score_regime"] = current_regime
+        rounds.append(batch_summary)
 
     _save_compact(journal_path, {
         "compacted_up_to": compact_end,
@@ -292,13 +350,26 @@ def maybe_compact(journal_path: Path) -> bool:
     return True
 
 
-def _format_compact_for_prompt(compact_data: dict[str, Any], limit: int) -> list[str]:
+def _format_compact_for_prompt(
+    compact_data: dict[str, Any],
+    limit: int,
+    *,
+    score_regime: str = "",
+) -> list[str]:
     """把压缩数据转成 AI 可读的文本。"""
-    rounds = compact_data.get("rounds", [])
+    all_rounds = compact_data.get("rounds", [])
+    if score_regime:
+        rounds = [
+            round_data for round_data in all_rounds
+            if str(round_data.get("score_regime", "")).strip() == score_regime
+        ]
+    else:
+        rounds = list(all_rounds)
     if not rounds:
         return []
 
     lines = ["历史经验压缩摘要:"]
+    skipped_rounds = len(all_rounds) - len(rounds)
     total_accepted = sum(r.get("accepted_count", 0) for r in rounds)
     total_rejected = sum(r.get("rejected_count", 0) for r in rounds)
     total_early_rejected = sum(r.get("early_rejected_count", 0) for r in rounds)
@@ -310,6 +381,8 @@ def _format_compact_for_prompt(compact_data: dict[str, Any], limit: int) -> list
         f"运行失败 {total_runtime_failed} 次，通过率 {total_accepted / total_entries:.0%}"
         if total_entries else "无历史"
     )
+    if score_regime and skipped_rounds > 0:
+        lines.append(f"已跳过 {skipped_rounds} 段非当前评分口径或旧版未标记口径的压缩历史。")
 
     merged_clusters: dict[str, dict[str, Any]] = defaultdict(
         lambda: {"attempts": 0, "failures": 0, "zero_delta": 0, "runtime_errors": 0, "best_delta": 0.0}
@@ -448,7 +521,7 @@ def _direction_risk_board(entries: list[dict[str, Any]], limit: int) -> list[str
 
     buckets: dict[str, dict[str, Any]] = {}
     for entry in entries:
-        cluster = cluster_for_tags(entry.get("change_tags", []))
+        cluster = cluster_key_for_entry(entry)
         outcome = _outcome_bucket(str(entry.get("outcome", "")))
         promotion_delta = _score_value(entry.get("promotion_delta"))
         bucket = buckets.setdefault(
@@ -605,7 +678,7 @@ def _exploration_trigger_lines(entries: list[dict[str, Any]], limit: int) -> lis
     tags: list[str] = []
     regions: list[str] = []
     for entry in tail:
-        cluster = str(entry.get("closest_failed_cluster", "")).strip() or cluster_for_tags(entry.get("change_tags", []))
+        cluster = cluster_key_for_entry(entry)
         if cluster and cluster not in clusters:
             clusters.append(cluster)
         for factor in entry.get("core_factors", []):
@@ -816,7 +889,8 @@ def build_journal_prompt_summary(entries: list[dict[str, Any]], limit: int = 6, 
             entry for entry in recent_entries
             if not latest_regime or str(entry.get("score_regime", "") or latest_regime) == latest_regime
         ]
-        board_entries = same_regime_recent or recent_entries
+        display_entries = same_regime_recent or recent_entries
+        board_entries = display_entries
         board_lines = _direction_risk_board(board_entries, limit=min(8, limit))
         if board_lines:
             parts.extend(board_lines)
@@ -832,30 +906,34 @@ def build_journal_prompt_summary(entries: list[dict[str, Any]], limit: int = 6, 
             parts.extend(exploration_lines)
             parts.append("")
 
-        accepted_count = sum(1 for entry in recent_entries if entry.get("outcome") == "accepted")
-        rejected_count = sum(1 for entry in recent_entries if entry.get("outcome") == "rejected")
-        early_rejected_count = sum(1 for entry in recent_entries if entry.get("outcome") == "early_rejected")
-        runtime_failed_count = sum(1 for entry in recent_entries if entry.get("outcome") == "runtime_failed")
+        accepted_count = sum(1 for entry in display_entries if entry.get("outcome") == "accepted")
+        rejected_count = sum(1 for entry in display_entries if entry.get("outcome") == "rejected")
+        early_rejected_count = sum(1 for entry in display_entries if entry.get("outcome") == "early_rejected")
+        runtime_failed_count = sum(1 for entry in display_entries if entry.get("outcome") == "runtime_failed")
         parts.append(
-            f"最近未压缩轮次共 {len(recent_entries)} 条："
+            f"最近未压缩轮次共 {len(display_entries)} 条："
             f"保留 {accepted_count}，未保留 {rejected_count}，"
             f"提前淘汰 {early_rejected_count}，运行失败 {runtime_failed_count}。"
         )
-        failure_tag_lines = _recent_failure_tag_lines(recent_entries, limit=min(8, limit))
+        failure_tag_lines = _recent_failure_tag_lines(display_entries, limit=min(8, limit))
         if failure_tag_lines:
             parts.append("最近高频失败标签:")
             parts.extend(failure_tag_lines)
-        core_factor_columns = _recent_core_factor_columns(recent_entries, limit=min(4, limit))
-        core_factor_lines = _recent_core_factor_lines(recent_entries, core_factor_columns)
+        core_factor_columns = _recent_core_factor_columns(display_entries, limit=min(4, limit))
+        core_factor_lines = _recent_core_factor_lines(display_entries, core_factor_columns)
         if core_factor_lines:
             parts.extend(core_factor_lines)
         parts.append("最近未压缩轮次表:")
-        parts.extend(_format_recent_rounds_table(recent_entries, recent_start, core_factor_columns))
+        parts.extend(_format_recent_rounds_table(display_entries, recent_start, core_factor_columns))
 
     # 压缩历史放在近期方向风险之后，避免长历史淹没最近连续失败。
     if journal_path is not None:
         compact_data = load_compact(journal_path)
-        compact_lines = _format_compact_for_prompt(compact_data, limit=min(8, limit))
+        compact_lines = _format_compact_for_prompt(
+            compact_data,
+            limit=min(8, limit),
+            score_regime=_latest_score_regime(entries),
+        )
         if compact_lines:
             if parts:
                 parts.append("")
