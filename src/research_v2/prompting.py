@@ -105,6 +105,11 @@ def build_strategy_research_prompt(
 历史研究记忆：
 {journal_summary}
 
+记忆使用规则：
+- 当前评分口径 `trend_capture_v4` 的近期轮次、方向风险表和过拟合风险表，是本轮唯一主参考。
+- 如果历史记忆里出现“旧评分口径弱参考”，只能把它当成因子家族或方向假设的弱启发。
+- 禁止把旧口径的分数、gate 通过/失败结论或旧 best，直接当成当前口径下仍然有效的证据。
+
 工作区说明：
 - 当前工作区里已经有目标文件 `src/strategy_macd_aggressive.py`
 - 你必须先阅读并直接修改这个文件，再输出最终 JSON

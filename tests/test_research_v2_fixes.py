@@ -858,7 +858,9 @@ class JournalPromptFixesTest(unittest.TestCase):
 
         self.assertIn("方向风险表", summary)
         self.assertIn("等待新历史", summary)
-        self.assertNotIn("old_regime", summary)
+        self.assertIn("旧评分口径弱参考", summary)
+        self.assertIn("trend_capture_v2", summary)
+        self.assertNotIn("| 1 | old_regime |", summary)
 
     def test_journal_summary_keeps_empty_table_after_reset(self):
         summary = build_journal_prompt_summary([], limit=8)
@@ -866,6 +868,112 @@ class JournalPromptFixesTest(unittest.TestCase):
         self.assertIn("方向风险表", summary)
         self.assertIn("最近未压缩轮次表", summary)
         self.assertIn("等待新历史", summary)
+
+    def test_journal_summary_keeps_current_regime_recent_rows_after_global_compaction(self):
+        entries = []
+        for idx in range(30):
+            entries.append(
+                {
+                    "iteration": idx + 1,
+                    "candidate_id": f"legacy_{idx}",
+                    "outcome": "rejected",
+                    "stop_stage": "full_eval",
+                    "promotion_score": 0.10,
+                    "quality_score": 0.10,
+                    "promotion_delta": 0.0,
+                    "gate_reason": "通过",
+                    "change_tags": ["legacy_breakout"],
+                    "edited_regions": ["strategy"],
+                    "hypothesis": "旧口径历史。",
+                    "score_regime": "trend_capture_v1",
+                }
+            )
+        for idx in range(5):
+            entries.append(
+                {
+                    "iteration": 31 + idx,
+                    "candidate_id": f"current_{idx}",
+                    "outcome": "rejected",
+                    "stop_stage": "full_eval",
+                    "promotion_score": 0.40,
+                    "quality_score": 0.50,
+                    "promotion_delta": 0.0,
+                    "gate_reason": "通过",
+                    "change_tags": ["current_breakout"],
+                    "edited_regions": ["strategy"],
+                    "hypothesis": "当前 v4 历史。",
+                    "score_regime": "trend_capture_v4",
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            journal_path = Path(tmpdir) / "journal.jsonl"
+            with journal_path.open("w") as handle:
+                for entry in entries:
+                    handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            journal_path.with_suffix(".compact.json").write_text(
+                json.dumps(
+                    {
+                        "compacted_up_to": 30,
+                        "total_compacted_entries": 30,
+                        "rounds": [],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+
+            summary = build_journal_prompt_summary(
+                entries,
+                limit=8,
+                journal_path=journal_path,
+                current_score_regime="trend_capture_v4",
+            )
+
+        self.assertIn("最近未压缩轮次共 5 条", summary)
+        self.assertIn("current_0", summary)
+        self.assertIn("current_4", summary)
+        self.assertNotIn("legacy_29", summary)
+
+    def test_journal_summary_appends_legacy_regime_as_secondary_reference(self):
+        entries = [
+            {
+                "iteration": 1,
+                "candidate_id": "legacy_pass",
+                "outcome": "accepted",
+                "stop_stage": "full_eval",
+                "promotion_score": 0.75,
+                "quality_score": 0.65,
+                "promotion_delta": 0.08,
+                "gate_reason": "通过",
+                "change_tags": ["legacy_breakout"],
+                "edited_regions": ["strategy"],
+                "hypothesis": "旧口径下可参考的方向。",
+                "score_regime": "trend_capture_v1",
+            },
+            {
+                "iteration": 2,
+                "candidate_id": "current_fail",
+                "outcome": "rejected",
+                "stop_stage": "full_eval",
+                "promotion_score": 0.40,
+                "quality_score": 0.45,
+                "promotion_delta": 0.0,
+                "gate_reason": "通过",
+                "change_tags": ["current_breakout"],
+                "edited_regions": ["strategy"],
+                "hypothesis": "当前口径主参考。",
+                "score_regime": "trend_capture_v4",
+            },
+        ]
+
+        summary = build_journal_prompt_summary(entries, limit=8, current_score_regime="trend_capture_v4")
+
+        self.assertIn("方向风险表", summary)
+        self.assertIn("current_breakout", summary)
+        self.assertIn("旧评分口径弱参考", summary)
+        self.assertIn("trend_capture_v1", summary)
+        self.assertIn("legacy_breakout", summary)
 
 
 class SmokeWindowSelectionTest(unittest.TestCase):

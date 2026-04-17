@@ -35,6 +35,9 @@ LOW_CHANGE_HIT_RATE_SPAN = 0.08
 LOW_CHANGE_SIDE_CAPTURE_SPAN = 0.12
 LOW_CHANGE_TOTAL_TRADES_SPAN = 6.0
 LOW_CHANGE_FEE_DRAG_SPAN = 0.20
+LEGACY_REFERENCE_REGIME_LIMIT = 3
+LEGACY_REFERENCE_TAG_LIMIT = 3
+LEGACY_REFERENCE_CLUSTER_LIMIT = 2
 
 
 # ==================== 基础读写 ====================
@@ -518,6 +521,15 @@ def _latest_score_regime(entries: list[dict[str, Any]]) -> str:
     return ""
 
 
+def _entries_for_score_regime(entries: list[dict[str, Any]], score_regime: str) -> list[dict[str, Any]]:
+    if not score_regime:
+        return list(entries)
+    return [
+        entry for entry in entries
+        if _entry_score_regime(entry) == score_regime
+    ]
+
+
 def _direction_risk_board(entries: list[dict[str, Any]], limit: int) -> list[str]:
     if not entries:
         return []
@@ -763,15 +775,25 @@ def _exploration_trigger_lines(entries: list[dict[str, Any]], limit: int) -> lis
 def _uncompacted_recent_entries(
     entries: list[dict[str, Any]],
     journal_path: Path | None,
+    *,
+    score_regime: str = "",
 ) -> tuple[list[dict[str, Any]], int]:
     if not entries:
         return [], 0
     if journal_path is None:
         start_index = max(0, len(entries) - COMPACT_INTERVAL)
-        return entries[start_index:], start_index
-    compacted_up_to = int(load_compact(journal_path).get("compacted_up_to", 0) or 0)
-    compacted_up_to = max(0, min(compacted_up_to, len(entries)))
-    return entries[compacted_up_to:], compacted_up_to
+        recent_entries = entries[start_index:]
+    else:
+        compacted_up_to = int(load_compact(journal_path).get("compacted_up_to", 0) or 0)
+        compacted_up_to = max(0, min(compacted_up_to, len(entries)))
+        start_index = compacted_up_to
+        recent_entries = entries[compacted_up_to:]
+    if score_regime:
+        recent_entries = [
+            entry for entry in recent_entries
+            if _entry_score_regime(entry) == score_regime
+        ]
+    return recent_entries, start_index
 
 
 def _format_metric(value: Any) -> str:
@@ -930,80 +952,202 @@ def _empty_prompt_tables() -> list[str]:
     ]
 
 
+def _legacy_regime_reference_lines(
+    entries: list[dict[str, Any]],
+    *,
+    current_score_regime: str,
+    limit: int,
+) -> list[str]:
+    if not current_score_regime:
+        return []
+
+    legacy_entries = [
+        entry for entry in entries
+        if _entry_score_regime(entry) and _entry_score_regime(entry) != current_score_regime
+    ]
+    if not legacy_entries:
+        return []
+
+    entries_by_regime: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for entry in legacy_entries:
+        entries_by_regime[_entry_score_regime(entry)].append(entry)
+
+    lines = [
+        "旧评分口径弱参考（不可主导本轮）:",
+        f"- 当前主参考只能是 `{current_score_regime}` 的近期轮次、方向风险表和过拟合风险表。",
+        "- 旧口径只可作为因子家族或方向假设的弱启发；禁止把旧分数、旧 gate 结论或旧 best 直接当成当前有效证据。",
+        "- 如果旧口径结论与当前口径近期失败记忆冲突，一律以当前口径为准。",
+    ]
+
+    ranked_regimes = sorted(
+        entries_by_regime.items(),
+        key=lambda item: (-len(item[1]), item[0]),
+    )
+    for regime, regime_entries in ranked_regimes[:limit]:
+        accepted_count = sum(
+            1 for entry in regime_entries
+            if _outcome_bucket(str(entry.get("outcome", ""))) == "accepted"
+        )
+        rejected_count = sum(
+            1 for entry in regime_entries
+            if _outcome_bucket(str(entry.get("outcome", ""))) == "rejected"
+        )
+
+        tag_stats: dict[str, dict[str, Any]] = defaultdict(
+            lambda: {"accepted": 0, "rejected": 0, "scores": []}
+        )
+        cluster_stats: dict[str, dict[str, Any]] = defaultdict(
+            lambda: {"attempts": 0, "failures": 0, "zero_delta": 0, "runtime_errors": 0, "best_delta": 0.0}
+        )
+        for entry in regime_entries:
+            outcome = _outcome_bucket(str(entry.get("outcome", "")))
+            promotion_delta = _score_value(entry.get("promotion_delta"))
+            promotion_score = _score_value(entry.get("promotion_score"))
+            for tag in entry.get("change_tags", []):
+                bucket = tag_stats[str(tag)]
+                if outcome in {"accepted", "rejected"}:
+                    bucket[outcome] = bucket.get(outcome, 0) + 1
+                bucket["scores"].append(promotion_score)
+
+            cluster = cluster_key_for_entry(entry)
+            cluster_bucket = cluster_stats[cluster]
+            cluster_bucket["attempts"] += 1
+            if outcome == "rejected":
+                cluster_bucket["failures"] += 1
+            if abs(promotion_delta) <= 1e-9:
+                cluster_bucket["zero_delta"] += 1
+            if str(entry.get("outcome", "")) == "runtime_failed":
+                cluster_bucket["runtime_errors"] += 1
+            cluster_bucket["best_delta"] = max(cluster_bucket["best_delta"], promotion_delta)
+
+        reference_tags = sorted(
+            (
+                (tag, stats)
+                for tag, stats in tag_stats.items()
+                if stats.get("accepted", 0) > 0
+            ),
+            key=lambda item: (
+                item[1]["accepted"] - item[1]["rejected"],
+                item[1]["accepted"],
+                -item[1]["rejected"],
+                _mean(item[1]["scores"]),
+            ),
+            reverse=True,
+        )
+        reference_text = ", ".join(
+            f"{tag}(通{stats['accepted']}/败{stats['rejected']})"
+            for tag, stats in reference_tags[:LEGACY_REFERENCE_TAG_LIMIT]
+        ) or "-"
+
+        ranked_clusters = sorted(
+            cluster_stats.items(),
+            key=lambda item: (
+                {"EXHAUSTED": 0, "SATURATED": 1, "RUNTIME_RISK": 2, "WARM": 3, "ACTIVE_WINNER": 4, "OPEN": 5}[
+                    _risk_label(
+                        attempts=int(item[1]["attempts"]),
+                        failures=int(item[1]["failures"]),
+                        zero_delta=int(item[1]["zero_delta"]),
+                        runtime_errors=int(item[1]["runtime_errors"]),
+                        best_delta=float(item[1]["best_delta"]),
+                    )
+                ],
+                -int(item[1]["attempts"]),
+                -int(item[1]["failures"]),
+            ),
+        )
+        cluster_text = ", ".join(
+            f"{cluster}({ _risk_label(attempts=int(stats['attempts']), failures=int(stats['failures']), zero_delta=int(stats['zero_delta']), runtime_errors=int(stats['runtime_errors']), best_delta=float(stats['best_delta'])) })"
+            for cluster, stats in ranked_clusters[:LEGACY_REFERENCE_CLUSTER_LIMIT]
+        ) or "-"
+
+        lines.append(
+            f"- {regime}: 历史 {len(regime_entries)} 轮，保留 {accepted_count}，失败 {rejected_count}；"
+            f"可弱参考标签={reference_text}；高失败簇={cluster_text}"
+        )
+
+    return lines
+
+
 def build_journal_prompt_summary(
     entries: list[dict[str, Any]],
     limit: int = 6,
     journal_path: Path | None = None,
     current_score_regime: str = "",
 ) -> str:
-    if current_score_regime:
-        entries = [
-            entry for entry in entries
-            if str(entry.get("score_regime", "")).strip() == current_score_regime
-        ]
+    all_entries = list(entries)
+    active_score_regime = current_score_regime or _latest_score_regime(all_entries)
+    current_entries = _entries_for_score_regime(all_entries, active_score_regime)
     parts: list[str] = []
-    if not entries:
+    if not current_entries:
         parts.extend(_empty_prompt_tables())
-        return "\n".join(parts)
-
-    recent_entries, recent_start = _uncompacted_recent_entries(entries, journal_path)
-    if recent_entries:
-        latest_regime = _latest_score_regime(entries)
-        same_regime_recent = [
-            entry for entry in recent_entries
-            if not latest_regime or str(entry.get("score_regime", "") or latest_regime) == latest_regime
-        ]
-        display_entries = same_regime_recent or recent_entries
-        board_entries = display_entries
-        board_lines = _direction_risk_board(board_entries, limit=min(8, limit))
-        if board_lines:
-            parts.extend(board_lines)
-            parts.append("")
-
-        overfit_lines = _overfit_risk_board(board_entries, limit=min(8, limit))
-        if overfit_lines:
-            parts.extend(overfit_lines)
-            parts.append("")
-
-        exploration_lines = _exploration_trigger_lines(board_entries, limit=min(8, limit))
-        if exploration_lines:
-            parts.extend(exploration_lines)
-            parts.append("")
-
-        accepted_count = sum(1 for entry in display_entries if entry.get("outcome") == "accepted")
-        rejected_count = sum(1 for entry in display_entries if entry.get("outcome") == "rejected")
-        duplicate_skipped_count = sum(1 for entry in display_entries if entry.get("outcome") == "duplicate_skipped")
-        early_rejected_count = sum(1 for entry in display_entries if entry.get("outcome") == "early_rejected")
-        runtime_failed_count = sum(1 for entry in display_entries if entry.get("outcome") == "runtime_failed")
-        parts.append(
-            f"最近未压缩轮次共 {len(display_entries)} 条："
-            f"保留 {accepted_count}，未保留 {rejected_count}，"
-            f"重复跳过 {duplicate_skipped_count}，"
-            f"提前淘汰 {early_rejected_count}，运行失败 {runtime_failed_count}。"
+    else:
+        recent_entries, recent_start = _uncompacted_recent_entries(
+            all_entries,
+            journal_path,
+            score_regime=active_score_regime,
         )
-        failure_tag_lines = _recent_failure_tag_lines(display_entries, limit=min(8, limit))
-        if failure_tag_lines:
-            parts.append("最近高频失败标签:")
-            parts.extend(failure_tag_lines)
-        core_factor_columns = _recent_core_factor_columns(display_entries, limit=min(4, limit))
-        core_factor_lines = _recent_core_factor_lines(display_entries, core_factor_columns)
-        if core_factor_lines:
-            parts.extend(core_factor_lines)
-        parts.append("最近未压缩轮次表:")
-        parts.extend(_format_recent_rounds_table(display_entries, recent_start, core_factor_columns))
-
-    # 压缩历史放在近期方向风险之后，避免长历史淹没最近连续失败。
-    if journal_path is not None:
-        compact_data = load_compact(journal_path)
-        compact_lines = _format_compact_for_prompt(
-            compact_data,
-            limit=min(8, limit),
-            score_regime=_latest_score_regime(entries),
-        )
-        if compact_lines:
-            if parts:
+        if recent_entries:
+            display_entries = recent_entries
+            board_entries = display_entries
+            board_lines = _direction_risk_board(board_entries, limit=min(8, limit))
+            if board_lines:
+                parts.extend(board_lines)
                 parts.append("")
-            parts.extend(compact_lines)
+
+            overfit_lines = _overfit_risk_board(board_entries, limit=min(8, limit))
+            if overfit_lines:
+                parts.extend(overfit_lines)
+                parts.append("")
+
+            exploration_lines = _exploration_trigger_lines(board_entries, limit=min(8, limit))
+            if exploration_lines:
+                parts.extend(exploration_lines)
+                parts.append("")
+
+            accepted_count = sum(1 for entry in display_entries if entry.get("outcome") == "accepted")
+            rejected_count = sum(1 for entry in display_entries if entry.get("outcome") == "rejected")
+            duplicate_skipped_count = sum(1 for entry in display_entries if entry.get("outcome") == "duplicate_skipped")
+            early_rejected_count = sum(1 for entry in display_entries if entry.get("outcome") == "early_rejected")
+            runtime_failed_count = sum(1 for entry in display_entries if entry.get("outcome") == "runtime_failed")
+            parts.append(
+                f"最近未压缩轮次共 {len(display_entries)} 条："
+                f"保留 {accepted_count}，未保留 {rejected_count}，"
+                f"重复跳过 {duplicate_skipped_count}，"
+                f"提前淘汰 {early_rejected_count}，运行失败 {runtime_failed_count}。"
+            )
+            failure_tag_lines = _recent_failure_tag_lines(display_entries, limit=min(8, limit))
+            if failure_tag_lines:
+                parts.append("最近高频失败标签:")
+                parts.extend(failure_tag_lines)
+            core_factor_columns = _recent_core_factor_columns(display_entries, limit=min(4, limit))
+            core_factor_lines = _recent_core_factor_lines(display_entries, core_factor_columns)
+            if core_factor_lines:
+                parts.extend(core_factor_lines)
+            parts.append("最近未压缩轮次表:")
+            parts.extend(_format_recent_rounds_table(display_entries, recent_start, core_factor_columns))
+
+        # 压缩历史放在近期方向风险之后，避免长历史淹没最近连续失败。
+        if journal_path is not None:
+            compact_data = load_compact(journal_path)
+            compact_lines = _format_compact_for_prompt(
+                compact_data,
+                limit=min(8, limit),
+                score_regime=active_score_regime,
+            )
+            if compact_lines:
+                if parts:
+                    parts.append("")
+                parts.extend(compact_lines)
+
+    legacy_lines = _legacy_regime_reference_lines(
+        all_entries,
+        current_score_regime=active_score_regime,
+        limit=min(LEGACY_REFERENCE_REGIME_LIMIT, limit),
+    )
+    if legacy_lines:
+        if parts:
+            parts.append("")
+        parts.extend(legacy_lines)
 
     return "\n".join(parts) if parts else "暂无研究历史。"
 
