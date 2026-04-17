@@ -259,6 +259,7 @@ class EvaluationFixesTest(unittest.TestCase):
             min_bull_capture=-10.0,
             min_bear_capture=-10.0,
             max_fee_drag_pct=100.0,
+            max_promotion_gap=100.0,
         )
 
         expected_eval_points = _collect_trend_path(results, "eval").points
@@ -284,6 +285,7 @@ class EvaluationFixesTest(unittest.TestCase):
             full_period_result=full_period_result,
         )
         expected_eval_report = _trend_score_report(expected_eval_points)
+        expected_validation_report = _trend_score_report(expected_validation_points)
         expected_full_period_report = _trend_score_report(full_period_result["trend_capture_points"])
 
         self.assertAlmostEqual(report.metrics["eval_trend_capture_score"], expected_eval_report.trend_score)
@@ -295,8 +297,13 @@ class EvaluationFixesTest(unittest.TestCase):
         )
         self.assertAlmostEqual(
             report.metrics["promotion_score"],
-            0.70 * expected_full_period_report.trend_score + 0.30 * expected_full_period_report.return_score,
+            0.70 * expected_validation_report.trend_score + 0.30 * expected_validation_report.return_score,
         )
+        self.assertAlmostEqual(
+            report.metrics["promotion_gap"],
+            report.metrics["quality_score"] - report.metrics["promotion_score"],
+        )
+        self.assertEqual(report.metrics["validation_block_count_used"], 0.0)
         self.assertEqual(report.metrics["eval_unique_trend_points"], 15.0)
         self.assertEqual(report.metrics["eval_overlap_trend_points"], 2.0)
         self.assertEqual(report.metrics["eval_overlap_trend_points_dropped"], 2.0)
@@ -304,6 +311,91 @@ class EvaluationFixesTest(unittest.TestCase):
         self.assertEqual(report.metrics["full_period_return_pct"], 12.34)
         self.assertAlmostEqual(report.metrics["combined_path_return_pct"], expected_full_period_report.path_return_pct)
         self.assertTrue(report.gate_passed)
+
+    def test_summarize_evaluation_rejects_large_quality_promotion_gap(self):
+        eval_window = type("Window", (), {"group": "eval", "label": "评估1", "start_date": "2026-01-01", "end_date": "2026-01-12"})()
+        validation_window = type("Window", (), {"group": "validation", "label": "验证1", "start_date": "2026-01-13", "end_date": "2026-01-23"})()
+        eval_points = [
+            {"timestamp": idx, "label": f"e{idx}", "market_close": close, "atr_ratio": 0.01, "strategy_equity": equity}
+            for idx, close, equity in [
+                (1, 100.0, 100000.0),
+                (2, 105.0, 104000.0),
+                (3, 111.0, 110000.0),
+                (4, 118.0, 118000.0),
+                (5, 124.0, 126000.0),
+                (6, 122.0, 125000.0),
+                (7, 116.0, 123000.0),
+                (8, 108.0, 130000.0),
+                (9, 98.0, 138000.0),
+                (10, 93.0, 143000.0),
+                (11, 97.0, 142500.0),
+                (12, 104.0, 141000.0),
+            ]
+        ]
+        validation_points = [
+            {"timestamp": idx, "label": f"v{idx}", "market_close": close, "atr_ratio": 0.01, "strategy_equity": equity}
+            for idx, close, equity in [
+                (13, 104.0, 141000.0),
+                (14, 101.0, 140000.0),
+                (15, 99.0, 139000.0),
+                (16, 96.0, 138000.0),
+                (17, 94.0, 137000.0),
+                (18, 97.0, 136500.0),
+                (19, 101.0, 136000.0),
+                (20, 105.0, 135500.0),
+                (21, 103.0, 135000.0),
+                (22, 100.0, 134500.0),
+                (23, 98.0, 134000.0),
+            ]
+        ]
+        results = [
+            {
+                "window": eval_window,
+                "result": {
+                    "return": 20.0,
+                    "max_drawdown": 7.0,
+                    "trades": 5,
+                    "fee_drag_pct": 0.3,
+                    "liquidations": 0,
+                    "trend_capture_points": eval_points,
+                },
+            },
+            {
+                "window": validation_window,
+                "result": {
+                    "return": -2.0,
+                    "max_drawdown": 4.0,
+                    "trades": 4,
+                    "fee_drag_pct": 0.2,
+                    "liquidations": 0,
+                    "trend_capture_points": validation_points,
+                },
+            },
+        ]
+        gates = GateConfig(
+            min_eval_segments=0,
+            min_validation_segments=0,
+            min_eval_hit_rate=0.0,
+            min_validation_hit_rate=0.0,
+            min_eval_trend_score=-10.0,
+            min_validation_trend_score=-10.0,
+            max_capture_drop=100.0,
+            min_bull_capture=-10.0,
+            min_bear_capture=-10.0,
+            max_fee_drag_pct=100.0,
+            max_promotion_gap=0.05,
+        )
+
+        report = summarize_evaluation(
+            results,
+            gates,
+            eval_continuous_result={"return": 20.0, "max_drawdown": 7.0, "trend_capture_points": eval_points},
+            validation_continuous_result={"return": -2.0, "max_drawdown": 4.0, "trend_capture_points": validation_points},
+            full_period_result={"return": 18.0, "max_drawdown": 8.0, "trend_capture_points": eval_points + validation_points},
+        )
+
+        self.assertFalse(report.gate_passed)
+        self.assertIn("综合分落差过大", report.gate_reason)
 
     def test_summarize_evaluation_rejects_severe_overfit_concentration(self):
         eval_window = type("Window", (), {"group": "eval", "label": "评估1", "start_date": "2026-01-01", "end_date": "2026-02-10"})()
@@ -962,8 +1054,14 @@ class DiscordSummaryFormattingTest(unittest.TestCase):
                 "eval_major_segment_count": 11.0,
                 "validation_major_segment_count": 10.0,
                 "capture_drop": 0.26,
+                "promotion_gap": 0.16,
                 "quality_score": 0.55,
                 "promotion_score": 0.71,
+                "validation_block_score_mean": 0.42,
+                "validation_block_score_std": 0.11,
+                "validation_block_score_min": 0.21,
+                "validation_block_fail_count": 0.0,
+                "validation_block_count_used": 3.0,
                 "combined_trend_capture_score": 0.48,
                 "combined_return_score": 1.22,
                 "arrival_capture_score": 0.08,
@@ -1008,6 +1106,8 @@ class DiscordSummaryFormattingTest(unittest.TestCase):
         self.assertIn("全段连续收益", message)
         self.assertIn("评估连续收益", message)
         self.assertIn("验证连续收益", message)
+        self.assertIn("验证分块均值/std", message)
+        self.assertIn("验证最差块/负块数", message)
         self.assertIn("评估窗口均值收益", message)
         self.assertIn("全段趋势/收益分", message)
         self.assertNotIn("验证整段收益", message)

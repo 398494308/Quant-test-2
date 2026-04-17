@@ -73,6 +73,11 @@ class GateConfig:
     min_bull_capture: float
     min_bear_capture: float
     max_fee_drag_pct: float
+    validation_block_count: int = 3
+    max_promotion_gap: float = 0.35
+    max_validation_block_std: float = 0.30
+    min_validation_block_floor: float = -0.20
+    max_validation_block_failures: int = 1
 
 
 @dataclass(frozen=True)
@@ -91,6 +96,7 @@ class ResearchRuntimeConfig:
     early_reject_hit_rate_threshold: float
     smoke_window_count: int
     max_repair_attempts: int
+    promotion_min_delta: float
 
 
 # ==================== 对外入口 ====================
@@ -131,6 +137,11 @@ def load_research_runtime_config(repo_root: Path) -> ResearchRuntimeConfig:
         min_bull_capture=_env_float("MACD_V2_MIN_BULL_CAPTURE", -0.10),
         min_bear_capture=_env_float("MACD_V2_MIN_BEAR_CAPTURE", -0.10),
         max_fee_drag_pct=_env_float("MACD_V2_MAX_FEE_DRAG_PCT", 8.0),
+        validation_block_count=_env_int("MACD_V2_VALIDATION_BLOCK_COUNT", 3),
+        max_promotion_gap=_env_float("MACD_V2_MAX_PROMOTION_GAP", 0.35),
+        max_validation_block_std=_env_float("MACD_V2_MAX_VALIDATION_BLOCK_STD", 0.30),
+        min_validation_block_floor=_env_float("MACD_V2_MIN_VALIDATION_BLOCK_FLOOR", -0.20),
+        max_validation_block_failures=_env_int("MACD_V2_MAX_VALIDATION_BLOCK_FAILURES", 1),
     )
 
     return ResearchRuntimeConfig(
@@ -148,4 +159,5 @@ def load_research_runtime_config(repo_root: Path) -> ResearchRuntimeConfig:
         early_reject_hit_rate_threshold=_env_float("MACD_V2_EARLY_REJECT_HIT_RATE", 0.15),
         smoke_window_count=_env_int("MACD_V2_SMOKE_WINDOW_COUNT", 3),
         max_repair_attempts=_env_int("MACD_V2_MAX_REPAIR_ATTEMPTS", 2),
+        promotion_min_delta=_env_float("MACD_V2_PROMOTION_MIN_DELTA", 0.02),
     )

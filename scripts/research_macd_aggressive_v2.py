@@ -74,7 +74,7 @@ WINDOWS = build_research_windows(RUNTIME.windows)
 DISCORD_CONFIG = load_discord_config()
 EVAL_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "eval")
 VALIDATION_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "validation")
-SCORE_REGIME = "trend_capture_v3"
+SCORE_REGIME = "trend_capture_v4"
 MODEL_WORKSPACE_STRATEGY_PATH = Path("src/strategy_macd_aggressive.py")
 
 best_source = ""
@@ -838,6 +838,23 @@ def _build_journal_entry(
     }
 
 
+def _promotion_acceptance_decision(report: EvaluationReport) -> tuple[bool, str]:
+    if best_report is None:
+        return False, "best state is not initialized"
+    if not report.gate_passed:
+        return False, report.gate_reason
+
+    current_best_score = float(best_report.metrics["promotion_score"])
+    candidate_score = float(report.metrics["promotion_score"])
+    promotion_delta = candidate_score - current_best_score
+    if promotion_delta <= RUNTIME.promotion_min_delta:
+        return (
+            False,
+            f"晋级分提升不足({promotion_delta:.2f} <= {RUNTIME.promotion_min_delta:.2f})",
+        )
+    return True, "通过"
+
+
 def _record_duplicate_skip(
     *,
     iteration_id: int,
@@ -1063,16 +1080,22 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
             reload_strategy_module()
             raise
 
+    accepted, decision_reason = _promotion_acceptance_decision(candidate_report)
+    entry_note = ""
+    if not accepted and candidate_report.gate_passed:
+        entry_note = decision_reason
+
     entry_base = _build_journal_entry(
         iteration_id=iteration_id,
         candidate=candidate,
         base_source=best_source,
         candidate_report=candidate_report,
-        outcome="accepted" if candidate_report.gate_passed and candidate_report.metrics["promotion_score"] > best_report.metrics["promotion_score"] else "rejected",
+        outcome="accepted" if accepted else "rejected",
         stop_stage="full_eval",
+        note=entry_note,
     )
 
-    if candidate_report.gate_passed and candidate_report.metrics["promotion_score"] > best_report.metrics["promotion_score"]:
+    if accepted:
         best_source = candidate.strategy_code
         best_report = candidate_report
         _persist_best_state(best_source, best_report)
@@ -1128,14 +1151,14 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
         f"第 {iteration_id} 轮未保留: "
         f"quality={candidate_report.metrics['quality_score']:.2f}, "
         f"promotion={candidate_report.metrics['promotion_score']:.2f}, "
-        f"gate={candidate_report.gate_reason}"
+        f"reason={decision_reason}"
     )
     write_heartbeat(
         "iteration_rejected",
         message=f"iteration {iteration_id} rejected",
         promotion=candidate_report.metrics["promotion_score"],
         quality=candidate_report.metrics["quality_score"],
-        gate=candidate_report.gate_reason,
+        gate=decision_reason,
     )
     return "rejected"
 

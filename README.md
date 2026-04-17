@@ -22,18 +22,19 @@
 6. 主进程会校验候选只改了 `PARAMS / _is_sideways_regime / _trend_quality_ok / _trend_followthrough_ok / strategy` 这些允许区域。
 7. 先对候选跑少量 `smoke` 窗口；若运行报错，会在同一轮把错误回传给模型修复，而不是直接进入下一轮。
 8. `smoke` 通过后再跑整套 `eval + validation` 窗口回测。
-9. 只有 `gate` 通过、未触发严重过拟合淘汰且 `promotion_score` 提升，才晋级为新的最优。
+9. 只有 `gate` 通过、未触发严重过拟合淘汰且 `promotion_score` 至少比当前最优提高 `0.02`，才晋级为新的最优。
 10. 把每轮结果写进 journal，包含 `accepted / rejected / duplicate_skipped / early_rejected / runtime_failed`；即使候选和当前最优完全相同，或没有有效 diff，也会记入历史并参与探索计数；journal 仍按 20 轮做压缩记忆。
 
 当前评分口径：
 
-- `score_regime = trend_capture_v3`
+- `score_regime = trend_capture_v4`
 - `quality_score = 0.70 * eval_trend_capture_score + 0.30 * eval_return_score`
-- `promotion_score = 0.70 * full_period_trend_capture_score + 0.30 * full_period_return_score`
+- `promotion_score = 0.70 * validation_trend_capture_score + 0.30 * validation_return_score`
 - `trend_capture_score` 不看“平滑度”，而是看大趋势的 `到来 / 陪跑 / 掉头`
 - 切段用唯一 `4h` 市场路径，不重复加权重叠窗口里的同一时间点
 - 当前切段已经放宽到更细的 `4h` 趋势段，约 `5%` 级别的单边也纳入核心机会；按当前全段数据大约会识别出 `61` 段
-- `promotion_score` 和 Discord 主收益行现在都直接来自真实整段连续回测，不再用拼接路径充当主口径
+- `promotion_score` 现在只看 `validation` 连续结果；全段连续收益和全段趋势分保留为展示与诊断口径
+- `validation` 连续路径会再按时间顺序切成 `3` 个分块；晋级时除了看 `promotion_score`，还会看分块均值、波动、最差块和负分块数量
 
 当前窗口配置默认是：
 
@@ -62,7 +63,7 @@
 - `heartbeat` 会写出当前阶段和窗口进度，便于判断卡在 `smoke`、`full_eval` 还是修复。
 - 模型生成和 repair 阶段现在也会持续刷新 `heartbeat`，状态里能直接看到 `model_generate / model_repair`、等待秒数和超时上限。
 - `codex exec` 默认单次超时已从 `900s` 收紧到 `600s`；超时后会回收整组 provider 子进程，避免留下孤儿进程一直占着 CPU / 内存。
-- `2026-04-17` 已按当前 `trend_capture_v3` 评分口径重新初始化 best state，避免旧分数挡住本该通过的候选。
+- `2026-04-17` 已按当前 `trend_capture_v4` 评分口径重新初始化 best state，避免旧分数挡住本该通过的候选。
 - 提前淘汰从旧的 Sortino 逻辑改成了部分窗口趋势捕获快照：趋势段够多且趋势捕获分、命中率都很差时，会提前结束该轮。
 - 评估阶段现在会额外计算过拟合风险：若结果过度依赖单一正向趋势段、同向连续段，或有效命中覆盖率过低且明显多空偏科，会直接被 gate 掉。
 - compact 历史现在会带上 `score_regime`，喂给 prompt 时只使用当前评分口径下的压缩历史；旧版未标记口径的 compact 轮次会被跳过，避免长期污染。
@@ -99,15 +100,20 @@
 
 研究器运行时会把最新最优状态写到 `state/research_macd_aggressive_v2_best.json`。
 
-截至 `2026-04-17 10:18:24`（Asia/Shanghai），按当前 `trend_capture_v3` 评分口径重新评估，当前最优快照为：
+截至 `2026-04-17 11:39:31`（Asia/Shanghai），按当前 `trend_capture_v4` 评分口径重新评估，当前最优快照为：
 
 - `quality_score = 0.75`
-- `promotion_score = 0.88`
+- `promotion_score = 0.40`
 - `full_period_return_pct = 230.09%`
 - `eval_trend_capture_score = 0.71`
 - `validation_trend_capture_score = 0.18`
 - `combined_trend_capture_score = 0.53`
 - `combined_return_score = 1.72`
+- `promotion_gap = 0.35`
+- `validation_block_score_mean = 0.23`
+- `validation_block_score_std = 0.27`
+- `validation_block_score_min = -0.15`
+- `validation_block_fail_count = 1`
 - `eval_avg_return = 2.28%`
 - `validation_avg_return = 88.98%`
 - `worst_drawdown = 34.17%`
@@ -209,9 +215,24 @@ Discord 里的主表目前会显示这些字段。下面尽量用直白的话解
   就是 `capture_drop`。
   它表示评估和验证之间的趋势捕获差多少，绝对值越大，一般越不稳。
 
+- `主晋级分落差`
+  就是 `promotion_gap`。
+  它表示 `quality_score` 和 `promotion_score` 差多少。
+  如果这个数很大，通常就是前面 `eval` 很强，但后面 `validation` 跟不上。
+
 - `评分(主/晋)`
   第一个是 `quality_score`，主要看 `eval` 阶段表现。
-  第二个是 `promotion_score`，看全段连续回测表现，也是决定能不能刷新最优的核心分数。
+  第二个是 `promotion_score`，只看 `validation` 连续回测表现，也是决定能不能刷新最优的核心分数。
+
+- `验证分块均值/std`
+  这是把整段 `validation` 连续路径按时间顺序切成 `3` 块后，每块各算一个晋级分。
+  前一个是这 `3` 块的平均值，后一个是它们之间的波动。
+  波动越大，说明这套策略在验证期内部也不够稳。
+
+- `验证最差块/负块数`
+  前一个是 `validation` 三个分块里最差的那块分数。
+  后一个是分数小于 `0` 的分块数量。
+  如果最差块太差，或者负块太多，就算整段验证总分还行，也不会轻易刷新最优。
 
 - `全段趋势/收益分`
   第一个是 `combined_trend_capture_score`，意思是这套策略在全段连续口径下对大趋势抓得好不好。

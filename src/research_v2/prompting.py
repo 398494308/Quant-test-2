@@ -119,18 +119,23 @@ def build_strategy_research_prompt(
 - eval 趋势捕获分 >= 0.10
 - validation 趋势捕获分 >= 0.05
 - eval 与 validation 的趋势捕获落差 <= 0.60
+- eval 与 validation 的综合分落差 <= 0.35
+- validation 连续路径会再按时间顺序切成 3 个分块：分块 std <= 0.30、最差分块 >= -0.20、负分块最多 1 个
 - 全段连续多头捕获分 >= -0.10
 - 全段连续空头捕获分 >= -0.10
 - 手续费拖累 <= 8%
 - 严重过拟合风险会直接淘汰；如果结果主要依赖少数同类行情、单一同向链或明显多空偏科，即使分数高也不能通过
 
 评分方式：
-- 主评分口径是 `trend_capture_v3`
+- 主评分口径是 `trend_capture_v4`
 - 先在唯一时间轴上识别 BTC 的大趋势段，再把每段拆成“到来 / 陪跑 / 掉头”三部分
 - `trend_capture_score` 衡量：是否及时跟上、是否陪跑主趋势、是否在掉头时跑掉或反手
 - `return_score` 衡量：连续路径最后把资金放大了多少
 - `quality_score` = `0.70 * eval_trend_capture_score + 0.30 * eval_return_score`
-- `promotion_score` = `0.70 * full_period_trend_capture_score + 0.30 * full_period_return_score`
+- `promotion_score` = `0.70 * validation_trend_capture_score + 0.30 * validation_return_score`
+- `promotion_score` 是唯一晋级主分；全段连续收益和全段趋势分只做诊断，不直接决定能否刷新最优
+- validation 会再切成 3 个连续时间分块，晋级时还要看分块均值、分块波动、最差分块和负分块数量
+- 候选的 `promotion_score` 必须比当前最优至少高 `0.02`，才会刷新 best
 - 爆仓和回撤现在是诊断项，不是主评分，也不是单独惩罚项
 - 你看不到 validation 的逐项细节，但 gate 会告诉你是否通过
 

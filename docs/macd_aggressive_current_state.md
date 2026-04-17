@@ -28,6 +28,10 @@
 - `eval` 趋势捕获分 `>= 0.10`
 - `validation` 趋势捕获分 `>= 0.05`
 - `eval - validation` 趋势捕获落差 `<= 0.60`
+- `quality_score - promotion_score` 综合分落差 `<= 0.35`
+- `validation` 连续路径按时间顺序切 `3` 块后：分块 `std <= 0.30`
+- `validation` 最差分块 `>= -0.20`
+- `validation` 负分块数量 `<= 1`
 - 全段连续多头捕获分 `>= 0.00`
 - 全段连续空头捕获分 `>= 0.00`
 - 平均手续费拖累 `<= 8%`
@@ -39,7 +43,7 @@
 
 - 当前策略源码按最新评分口径重新评估
 
-`2026-04-17 10:18:24`（Asia/Shanghai）已按当前 `trend_capture_v3` 评分口径重算并写回 best state。
+`2026-04-17 11:39:31`（Asia/Shanghai）已按当前 `trend_capture_v4` 评分口径重算并写回 best state。
 
 截至 `2026-04-17`，当前最佳基底：
 
@@ -58,7 +62,12 @@
 - `combined_trend_capture_score = 0.53`
 - `combined_return_score = 1.72`
 - `quality_score = 0.75`
-- `promotion_score = 0.88`
+- `promotion_score = 0.40`
+- `promotion_gap = 0.35`
+- `validation_block_score_mean = 0.23`
+- `validation_block_score_std = 0.27`
+- `validation_block_score_min = -0.15`
+- `validation_block_fail_count = 1`
 - `eval_major_segment_count = 33`
 - `validation_major_segment_count = 21`
 - `major_segment_count = 61`
@@ -78,9 +87,10 @@
 
 本次主线增强点已经落地：
 
-- 主评分已经从 `Sortino` 切到 `trend_capture_v3`，核心目标改成抓大趋势，不再优化成“更平滑”。
+- 主评分已经从 `Sortino` 切到 `trend_capture_v4`，核心目标改成抓大趋势，不再优化成“更平滑”。
 - 切段口径已经放宽到更细的 `4h` 趋势段，约 `5%` 级别单边也算核心机会；当前全段会识别出约 `61` 段。
-- `promotion_score` 现在直接使用真实全段连续回测结果，不再用拼接路径充当主晋级分。
+- `promotion_score` 现在改成只看 `validation` 连续结果；全段连续收益和全段趋势分只保留为诊断项。
+- `validation` 连续路径会再按时间顺序切成 `3` 个分块，晋级会额外检查分块均值、波动、最差块和负分块数量。
 - Discord 主表的收益字段已统一为 `全段连续 / 评估连续 / 验证连续` 同类口径。
 - 默认 funding 数据源切到 Binance funding，并强制检查 `price / funding` venue 一致和窗口覆盖完整。
 - prompt 开头会先强调这是 `15m` 执行、`1h + 4h` 确认的 BTC 激进趋势策略，要求模型优先理解策略目标而不是盲目微调参数。
@@ -131,6 +141,8 @@
 
 - 在更细的 `61` 段口径下，当前策略并没有“段数不够”的问题，问题是很多机会没抓到
 - 双向趋势捕获已经转正，当前 gate 可以通过，但 `validation` 趋势捕获分仍明显弱于 `eval`
+- `promotion_gap = 0.35`，已经贴近当前上限，说明这个 best 仍然存在明显的“前强后弱”特征
+- `validation` 三分块里已有 `1` 个负分块，说明验证期内部还不算平滑稳定
 - 当前 best 的过拟合风险分是 `20`，属于“观察”而不是“高/严重”，说明还没有明显依赖单一行情，但后续仍应继续盯多样性
 
 后续研究重点应该继续放在：

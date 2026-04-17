@@ -87,6 +87,16 @@ class OverfitRiskReport:
     hard_reasons: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class ValidationBlockReport:
+    block_scores: tuple[float, ...]
+    mean_score: float
+    std_score: float
+    min_score: float
+    fail_count: int
+    used_block_count: int
+
+
 HIT_SCORE_THRESHOLD = 0.25
 OVERFIT_WARN_SCORE = 20.0
 OVERFIT_HIGH_SCORE = 40.0
@@ -116,6 +126,7 @@ TREND_SEGMENT_MOVE_FLOOR = 0.05
 TREND_REVERSAL_MOVE_MULTIPLIER = 2.0
 TREND_REVERSAL_MOVE_FLOOR = 0.025
 TREND_MIN_SEGMENT_BARS = 3
+MIN_VALIDATION_BLOCK_POINTS = 60
 
 
 # ==================== 基础统计 ====================
@@ -817,6 +828,66 @@ def _trend_report_from_result(result: dict[str, Any] | None) -> TrendScoreReport
     return _trend_score_report(points)
 
 
+def _validation_block_report(
+    result: dict[str, Any] | None,
+    *,
+    block_count: int,
+    fallback_score: float,
+) -> ValidationBlockReport:
+    points = _normalize_trend_points(_result_trend_capture_points(result or {}))
+    if block_count <= 1 or len(points) < MIN_VALIDATION_BLOCK_POINTS:
+        return ValidationBlockReport(
+            block_scores=(),
+            mean_score=fallback_score,
+            std_score=0.0,
+            min_score=fallback_score,
+            fail_count=1 if fallback_score < 0.0 else 0,
+            used_block_count=0,
+        )
+
+    actual_block_count = min(block_count, len(points))
+    if actual_block_count <= 1:
+        return ValidationBlockReport(
+            block_scores=(),
+            mean_score=fallback_score,
+            std_score=0.0,
+            min_score=fallback_score,
+            fail_count=1 if fallback_score < 0.0 else 0,
+            used_block_count=0,
+        )
+
+    base_size, remainder = divmod(len(points), actual_block_count)
+    block_scores: list[float] = []
+    start_idx = 0
+    for block_index in range(actual_block_count):
+        extra = 1 if block_index < remainder else 0
+        end_idx = start_idx + base_size + extra
+        block_points = points[start_idx:end_idx]
+        if block_points:
+            block_report = _trend_score_report(block_points)
+            block_scores.append(0.70 * block_report.trend_score + 0.30 * block_report.return_score)
+        start_idx = end_idx
+
+    if not block_scores:
+        return ValidationBlockReport(
+            block_scores=(),
+            mean_score=fallback_score,
+            std_score=0.0,
+            min_score=fallback_score,
+            fail_count=1 if fallback_score < 0.0 else 0,
+            used_block_count=0,
+        )
+
+    return ValidationBlockReport(
+        block_scores=tuple(block_scores),
+        mean_score=_mean(block_scores),
+        std_score=_std(block_scores),
+        min_score=min(block_scores),
+        fail_count=sum(1 for score in block_scores if score < 0.0),
+        used_block_count=len(block_scores),
+    )
+
+
 def partial_eval_gate_snapshot(result: dict[str, Any] | None) -> dict[str, float]:
     points = _normalize_trend_points(_result_trend_capture_points(result or {}))
     report = _trend_score_report(points)
@@ -871,8 +942,14 @@ def summarize_evaluation(
     full_period_trend_report = _trend_report_from_result(full_period_result)
 
     quality_score = 0.70 * eval_trend_report.trend_score + 0.30 * eval_trend_report.return_score
-    promotion_score = 0.70 * full_period_trend_report.trend_score + 0.30 * full_period_trend_report.return_score
+    promotion_score = 0.70 * validation_trend_report.trend_score + 0.30 * validation_trend_report.return_score
+    validation_block_report = _validation_block_report(
+        validation_source,
+        block_count=gates.validation_block_count,
+        fallback_score=promotion_score,
+    )
     capture_drop = eval_trend_report.trend_score - validation_trend_report.trend_score
+    promotion_gap = quality_score - promotion_score
     overfit_report = _overfit_risk_report(full_period_trend_report, capture_drop)
 
     gate_reasons: list[str] = []
@@ -890,12 +967,30 @@ def summarize_evaluation(
         gate_reasons.append(f"验证趋势捕获分偏低({validation_trend_report.trend_score:.2f})")
     if capture_drop > gates.max_capture_drop:
         gate_reasons.append(f"评估/验证捕获落差过大({capture_drop:.2f})")
+    if promotion_gap > gates.max_promotion_gap:
+        gate_reasons.append(f"评估/验证综合分落差过大({promotion_gap:.2f})")
     if full_period_trend_report.bull_score < gates.min_bull_capture:
         gate_reasons.append(f"多头捕获偏低({full_period_trend_report.bull_score:.2f})")
     if full_period_trend_report.bear_score < gates.min_bear_capture:
         gate_reasons.append(f"空头捕获偏低({full_period_trend_report.bear_score:.2f})")
     if avg_fee_drag > gates.max_fee_drag_pct:
         gate_reasons.append(f"手续费拖累过高({avg_fee_drag:.2f}%)")
+    if validation_block_report.used_block_count >= 2:
+        if validation_block_report.std_score > gates.max_validation_block_std:
+            gate_reasons.append(
+                "验证分块波动过大"
+                f"({validation_block_report.std_score:.2f})"
+            )
+        if validation_block_report.min_score < gates.min_validation_block_floor:
+            gate_reasons.append(
+                "验证最差分块过弱"
+                f"({validation_block_report.min_score:.2f})"
+            )
+        if validation_block_report.fail_count > gates.max_validation_block_failures:
+            gate_reasons.append(
+                "验证负分块过多"
+                f"({validation_block_report.fail_count})"
+            )
     if overfit_report.hard_fail:
         gate_reasons.append("严重过拟合风险(" + "；".join(overfit_report.hard_reasons) + ")")
     elif overfit_report.risk_score >= OVERFIT_GATE_SCORE:
@@ -916,6 +1011,17 @@ def summarize_evaluation(
         f"全段连续多头 / 空头捕获: {full_period_trend_report.bull_score:.2f} / {full_period_trend_report.bear_score:.2f}",
         f"评估趋势段 / 命中率: {eval_trend_report.segment_count} / {eval_trend_report.hit_rate:.0%}",
         f"验证趋势段 / 命中率: {validation_trend_report.segment_count} / {validation_trend_report.hit_rate:.0%}",
+        (
+            "验证分块晋级分(均值/std/最差/负分块): "
+            f"{validation_block_report.mean_score:.2f} / "
+            f"{validation_block_report.std_score:.2f} / "
+            f"{validation_block_report.min_score:.2f} / "
+            f"{validation_block_report.fail_count}"
+            + (
+                f" (分块数={validation_block_report.used_block_count})"
+                if validation_block_report.used_block_count > 0 else " (未启用)"
+            )
+        ),
         (
             "过拟合风险: "
             f"{overfit_report.risk_level}({overfit_report.risk_score:.0f})，"
@@ -948,8 +1054,23 @@ def summarize_evaluation(
         f"当前策略是 BTC 激进趋势策略：15m 执行，1h/4h 确认，目标是抓大行情的到来、陪跑主趋势、在掉头时退出或反手。",
         f"当前基底主评分={quality_score:.2f}，综合晋级分={promotion_score:.2f}，gate={gate_reason}",
         f"评估趋势捕获分={eval_trend_report.trend_score:.2f}，收益分={eval_trend_report.return_score:.2f}，趋势段={eval_trend_report.segment_count}，命中率={eval_trend_report.hit_rate:.0%}",
+        (
+            f"验证晋级分={promotion_score:.2f}，"
+            f"验证分块均值/std/最差/负分块="
+            f"{validation_block_report.mean_score:.2f}/"
+            f"{validation_block_report.std_score:.2f}/"
+            f"{validation_block_report.min_score:.2f}/"
+            f"{validation_block_report.fail_count}"
+            + (
+                f"，分块数={validation_block_report.used_block_count}"
+                if validation_block_report.used_block_count > 0 else "，分块稳健性未启用"
+            )
+        ),
         f"全段连续到来/陪跑/掉头={full_period_trend_report.arrival_score:.2f}/{full_period_trend_report.escort_score:.2f}/{full_period_trend_report.turn_score:.2f}",
-        f"全段连续多头/空头捕获={full_period_trend_report.bull_score:.2f}/{full_period_trend_report.bear_score:.2f}，评估/验证捕获落差={capture_drop:.2f}",
+        (
+            f"全段连续多头/空头捕获={full_period_trend_report.bull_score:.2f}/{full_period_trend_report.bear_score:.2f}，"
+            f"评估/验证捕获落差={capture_drop:.2f}，综合分落差={promotion_gap:.2f}"
+        ),
         (
             f"过拟合风险={overfit_report.risk_level}({overfit_report.risk_score:.0f})，"
             f"单段正向贡献={overfit_report.top1_positive_share:.0%}，"
@@ -1019,6 +1140,12 @@ def summarize_evaluation(
         "combined_path_return_pct": full_period_trend_report.path_return_pct,
         "full_period_return_pct": full_period_return,
         "capture_drop": capture_drop,
+        "promotion_gap": promotion_gap,
+        "validation_block_score_mean": validation_block_report.mean_score,
+        "validation_block_score_std": validation_block_report.std_score,
+        "validation_block_score_min": validation_block_report.min_score,
+        "validation_block_fail_count": float(validation_block_report.fail_count),
+        "validation_block_count_used": float(validation_block_report.used_block_count),
         "overfit_risk_score": overfit_report.risk_score,
         "overfit_top1_positive_share": overfit_report.top1_positive_share,
         "overfit_chain_positive_share": overfit_report.max_chain_positive_share,

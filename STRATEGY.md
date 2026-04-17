@@ -100,7 +100,7 @@
 - 文件：`scripts/research_macd_aggressive_v2.py`
 - 允许模型直接改写策略源码
 - 但会经过源码校验、参数边界校验和研究历史去重
-- 评分核心是 `trend_capture_v3 + gate`
+- 评分核心是 `trend_capture_v4 + gate`
 
 当前主评分口径：
 
@@ -110,7 +110,10 @@
 - `trend_capture_score` 看的是：能否及时跟上、能否陪跑主趋势、能否在掉头时跑掉或反手
 - `return_score` 看的是整条路径最终把资金放大了多少
 - `quality_score = 0.70 * eval_trend_capture_score + 0.30 * eval_return_score`
-- `promotion_score = 0.70 * full_period_trend_capture_score + 0.30 * full_period_return_score`
+- `promotion_score = 0.70 * validation_trend_capture_score + 0.30 * validation_return_score`
+- `promotion_score` 只负责晋级，要求至少比当前 best 高 `0.02`
+- `validation` 连续路径会再按时间顺序切成 `3` 个分块；分块波动过大、最差块过弱或负分块太多时，即使总分过线也不会刷新 best
+- 全段连续收益和全段趋势分保留为诊断项，不再直接决定 best
 - 爆仓和回撤保留为诊断项，但不再是主评分，也不再单独惩罚
 
 当前研究器的研究记忆与修复链路：

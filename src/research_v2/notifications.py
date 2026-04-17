@@ -241,7 +241,8 @@ def build_discord_summary_message(
 ) -> str:
     metrics = report.metrics
     full_period_return_pct = float(metrics.get("full_period_return_pct", metrics.get("combined_path_return_pct", 0.0)))
-    stitched_path_return_pct = float(metrics.get("combined_path_return_pct", 0.0))
+    eval_path_return_pct = float(metrics.get("eval_path_return_pct", metrics.get("eval_avg_return", 0.0)))
+    validation_path_return_pct = float(metrics.get("validation_path_return_pct", metrics.get("validation_avg_return", 0.0)))
     overfit_score = float(metrics.get("overfit_risk_score", 0.0))
     overfit_hard_fail = float(metrics.get("overfit_hard_fail", 0.0)) > 0.5
     overfit_level = "严重" if overfit_hard_fail else overfit_risk_level_from_score(overfit_score)
@@ -251,13 +252,13 @@ def build_discord_summary_message(
     rows = [
         ("窗口", window_text),
         ("全段连续收益", f"{full_period_return_pct:.2f}%"),
-        ("评估窗口均值收益", f"{metrics['eval_avg_return']:.2f}%"),
+        ("评估连续收益", f"{eval_path_return_pct:.2f}%"),
         (
-            "验证整段收益",
-            f"{metrics['validation_avg_return']:.2f}%"
+            "验证连续收益",
+            f"{validation_path_return_pct:.2f}%"
             if validation_window_count > 0 else "-",
         ),
-        ("拼接路径收益", f"{stitched_path_return_pct:.2f}%"),
+        ("评估窗口均值收益", f"{metrics['eval_avg_return']:.2f}%"),
         (
             "评/验趋势分",
             f"{metrics['eval_trend_capture_score']:.2f}"
@@ -278,11 +279,28 @@ def build_discord_summary_message(
             f"{metrics['capture_drop']:.2f}"
             if validation_window_count > 0 else "-",
         ),
+        (
+            "主晋级分落差",
+            f"{metrics.get('promotion_gap', 0.0):.2f}"
+            if validation_window_count > 0 else "-",
+        ),
         ("评分(主/晋)", f"{metrics['quality_score']:.2f} / {metrics['promotion_score']:.2f}"),
-        ("趋势/收益分", f"{metrics['combined_trend_capture_score']:.2f} / {metrics['combined_return_score']:.2f}"),
-        ("到来/陪跑/掉头", f"{metrics['arrival_capture_score']:.2f} / {metrics['escort_capture_score']:.2f} / {metrics['turn_adaptation_score']:.2f}"),
-        ("多/空捕获", f"{metrics['bull_capture_score']:.2f} / {metrics['bear_capture_score']:.2f}"),
-        ("综合命中率/趋势段", f"{metrics['segment_hit_rate']:.0%} / {int(metrics['major_segment_count'])}"),
+        (
+            "验证分块均值/std",
+            f"{metrics.get('validation_block_score_mean', 0.0):.2f} / "
+            f"{metrics.get('validation_block_score_std', 0.0):.2f}"
+            if int(metrics.get("validation_block_count_used", 0)) > 0 else "-",
+        ),
+        (
+            "验证最差块/负块数",
+            f"{metrics.get('validation_block_score_min', 0.0):.2f} / "
+            f"{int(metrics.get('validation_block_fail_count', 0.0))}"
+            if int(metrics.get("validation_block_count_used", 0)) > 0 else "-",
+        ),
+        ("全段趋势/收益分", f"{metrics['combined_trend_capture_score']:.2f} / {metrics['combined_return_score']:.2f}"),
+        ("全段到来/陪跑/掉头", f"{metrics['arrival_capture_score']:.2f} / {metrics['escort_capture_score']:.2f} / {metrics['turn_adaptation_score']:.2f}"),
+        ("全段多/空捕获", f"{metrics['bull_capture_score']:.2f} / {metrics['bear_capture_score']:.2f}"),
+        ("全段命中率/趋势段", f"{metrics['segment_hit_rate']:.0%} / {int(metrics['major_segment_count'])}"),
         ("过拟合风险", f"{overfit_level} / {overfit_score:.0f}"),
         (
             "集中度/覆盖率",
