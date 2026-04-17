@@ -21,15 +21,15 @@
 
 ## 当前 Gate
 
-- `eval` 大趋势段数 `>= 8`
-- `validation` 大趋势段数 `>= 3`
-- `eval` 趋势段命中率 `>= 35%`
-- `validation` 趋势段命中率 `>= 25%`
+- `eval` 大趋势段数 `>= 18`
+- `validation` 大趋势段数 `>= 8`
+- `eval` 趋势段命中率 `>= 40%`
+- `validation` 趋势段命中率 `>= 35%`
 - `eval` 趋势捕获分 `>= 0.10`
-- `validation` 趋势捕获分 `>= 0.00`
-- `eval - validation` 趋势捕获落差 `<= 0.45`
-- 综合多头捕获分 `>= -0.10`
-- 综合空头捕获分 `>= -0.10`
+- `validation` 趋势捕获分 `>= 0.05`
+- `eval - validation` 趋势捕获落差 `<= 0.60`
+- 全段连续多头捕获分 `>= 0.00`
+- 全段连续空头捕获分 `>= 0.00`
 - 平均手续费拖累 `<= 8%`
 - 严重过拟合风险直接淘汰
 
@@ -39,36 +39,37 @@
 
 - 当前策略源码按最新评分口径重新评估
 
-`2026-04-15 22:37:12`（Asia/Shanghai）已按当前 `trend_capture_v1` 评分口径重算并写回 best state。
+`2026-04-17 10:18:24`（Asia/Shanghai）已按当前 `trend_capture_v3` 评分口径重算并写回 best state。
 
-截至 `2026-04-15`，当前最佳基底：
+截至 `2026-04-17`，当前最佳基底：
 
-- `eval_avg_return = 0.24%`
-- `eval_median_return = -1.16%`
-- `eval_p25_return = -9.75%`
-- `validation_avg_return = 89.37%`
-- `worst_drawdown = 34.93%`
-- `avg_fee_drag = 3.67%`
-- `total_trades = 475`
-- `eval_trades = 336`
-- `validation_trades = 139`
-- `eval_trend_capture_score = 0.63`
-- `validation_trend_capture_score = 0.28`
-- `combined_trend_capture_score = 0.46`
-- `combined_return_score = 1.38`
-- `quality_score = 0.58`
-- `promotion_score = 0.74`
-- `eval_major_segment_count = 11`
-- `validation_major_segment_count = 10`
-- `major_segment_count = 22`
-- `segment_hit_rate = 54.55%`
-- `bull_capture_score = 0.33`
-- `bear_capture_score = 0.67`
+- `eval_avg_return = 2.28%`
+- `eval_median_return = 0.50%`
+- `eval_p25_return = -9.00%`
+- `validation_avg_return = 88.98%`
+- `full_period_return_pct = 230.09%`
+- `worst_drawdown = 34.17%`
+- `avg_fee_drag = 3.33%`
+- `total_trades = 432`
+- `eval_trades = 313`
+- `validation_trades = 119`
+- `eval_trend_capture_score = 0.71`
+- `validation_trend_capture_score = 0.18`
+- `combined_trend_capture_score = 0.53`
+- `combined_return_score = 1.72`
+- `quality_score = 0.75`
+- `promotion_score = 0.88`
+- `eval_major_segment_count = 33`
+- `validation_major_segment_count = 21`
+- `major_segment_count = 61`
+- `segment_hit_rate = 45.90%`
+- `bull_capture_score = 0.37`
+- `bear_capture_score = 0.72`
 - `overfit_risk_score = 20`
-- `overfit_top1_positive_share = 14.40%`
-- `overfit_chain_positive_share = 14.40%`
-- `overfit_coverage_ratio = 100%`
-- `overfit_bull_bear_gap = 0.34`
+- `overfit_top1_positive_share = 8.32%`
+- `overfit_chain_positive_share = 11.04%`
+- `overfit_coverage_ratio = 83.33%`
+- `overfit_bull_bear_gap = 0.36`
 - `eval_unique_trend_points = 3655`
 - `eval_overlap_trend_points = 1246`
 - `gate = 通过`
@@ -77,7 +78,11 @@
 
 本次主线增强点已经落地：
 
-- 主评分已经从 `Sortino` 切到 `trend_capture_v1`，核心目标改成抓大趋势，不再优化成“更平滑”。
+- 主评分已经从 `Sortino` 切到 `trend_capture_v3`，核心目标改成抓大趋势，不再优化成“更平滑”。
+- 切段口径已经放宽到更细的 `4h` 趋势段，约 `5%` 级别单边也算核心机会；当前全段会识别出约 `61` 段。
+- `promotion_score` 现在直接使用真实全段连续回测结果，不再用拼接路径充当主晋级分。
+- Discord 主表的收益字段已统一为 `全段连续 / 评估连续 / 验证连续` 同类口径。
+- 默认 funding 数据源切到 Binance funding，并强制检查 `price / funding` venue 一致和窗口覆盖完整。
 - prompt 开头会先强调这是 `15m` 执行、`1h + 4h` 确认的 BTC 激进趋势策略，要求模型优先理解策略目标而不是盲目微调参数。
 - 切段使用唯一 `4h` 时间轴，并在回测结果中直接输出市场路径与策略权益路径，避免为了评分重复加载市场数据。
 - prompt 第一屏现在先给模型看“方向风险表”，按方向簇聚合近期失败、零增益、运行报错和最佳 `promotion_delta`。
@@ -97,9 +102,9 @@
 当前本地显式运行参数：
 
 - `MACD_V2_EARLY_REJECT_WINDOWS=10`
-- `MACD_V2_EARLY_REJECT_MIN_SEGMENTS=6`
+- `MACD_V2_EARLY_REJECT_MIN_SEGMENTS=8`
 - `MACD_V2_EARLY_REJECT_TREND_SCORE=-0.18`
-- `MACD_V2_EARLY_REJECT_HIT_RATE=0.05`
+- `MACD_V2_EARLY_REJECT_HIT_RATE=0.08`
 - `MACD_V2_SMOKE_WINDOW_COUNT=3`
 - `MACD_V2_MAX_REPAIR_ATTEMPTS=2`
 
@@ -124,8 +129,8 @@
 
 当前基底在新口径下的主要问题已经更直白地暴露出来：
 
-- 评估期大趋势段数量是够的，但真正“命中”的比例仍然很低
-- 双向趋势捕获已经明显转正，当前 gate 可以通过，但 `eval` 和 `validation` 仍有不小落差
+- 在更细的 `61` 段口径下，当前策略并没有“段数不够”的问题，问题是很多机会没抓到
+- 双向趋势捕获已经转正，当前 gate 可以通过，但 `validation` 趋势捕获分仍明显弱于 `eval`
 - 当前 best 的过拟合风险分是 `20`，属于“观察”而不是“高/严重”，说明还没有明显依赖单一行情，但后续仍应继续盯多样性
 
 后续研究重点应该继续放在：

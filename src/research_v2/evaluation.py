@@ -109,6 +109,13 @@ DURATION_SHORT_MAX_BARS = 96
 DURATION_MEDIUM_MAX_BARS = 288
 VOLATILITY_LOW_MAX_ATR_RATIO = 0.010
 VOLATILITY_MEDIUM_MAX_ATR_RATIO = 0.016
+TREND_INIT_MOVE_MULTIPLIER = 3.0
+TREND_INIT_MOVE_FLOOR = 0.04
+TREND_SEGMENT_MOVE_MULTIPLIER = 4.0
+TREND_SEGMENT_MOVE_FLOOR = 0.05
+TREND_REVERSAL_MOVE_MULTIPLIER = 2.0
+TREND_REVERSAL_MOVE_FLOOR = 0.025
+TREND_MIN_SEGMENT_BARS = 3
 
 
 # ==================== 基础统计 ====================
@@ -226,6 +233,11 @@ def _result_trend_capture_points(result: dict[str, Any]) -> list[dict[str, Any]]
             normalized_timestamp = int(timestamp)
         except (TypeError, ValueError):
             continue
+        strategy_return = point.get("strategy_return")
+        if strategy_return in (None, ""):
+            normalized_return = None
+        else:
+            normalized_return = float(strategy_return)
         points.append(
             {
                 "timestamp": normalized_timestamp,
@@ -233,10 +245,28 @@ def _result_trend_capture_points(result: dict[str, Any]) -> list[dict[str, Any]]
                 "market_close": float(point.get("market_close", 0.0)),
                 "atr_ratio": float(point.get("atr_ratio", 0.0)),
                 "strategy_equity": float(point.get("strategy_equity", 0.0)),
-                "strategy_return": point.get("strategy_return"),
+                "strategy_return": normalized_return,
             }
         )
     return points
+
+
+def _normalize_trend_points(points: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ordered_points = sorted(points, key=lambda item: int(item["timestamp"]))
+    normalized_points: list[dict[str, Any]] = []
+    for idx, point in enumerate(ordered_points):
+        strategy_return = point.get("strategy_return")
+        if strategy_return is None:
+            if idx == 0:
+                strategy_return = 0.0
+            else:
+                prev_equity = float(ordered_points[idx - 1].get("strategy_equity", 0.0))
+                current_equity = float(point.get("strategy_equity", 0.0))
+                strategy_return = _simple_return(prev_equity, current_equity)
+        normalized = dict(point)
+        normalized["strategy_return"] = float(strategy_return)
+        normalized_points.append(normalized)
+    return normalized_points
 
 
 def _collect_trend_path(results: list[dict[str, Any]], group: str | None) -> PointSeriesPath:
@@ -252,20 +282,7 @@ def _collect_trend_path(results: list[dict[str, Any]], group: str | None) -> Poi
 
     ordered_keys = sorted(assigned_points)
     overlap_points = sum(1 for count in seen_counts.values() if count > 1)
-    ordered_points = [assigned_points[key] for key in ordered_keys]
-    normalized_points: list[dict[str, Any]] = []
-    for idx, point in enumerate(ordered_points):
-        strategy_return = point.get("strategy_return")
-        if strategy_return is None:
-            if idx == 0:
-                strategy_return = 0.0
-            else:
-                prev_equity = float(ordered_points[idx - 1].get("strategy_equity", 0.0))
-                current_equity = float(point.get("strategy_equity", 0.0))
-                strategy_return = _simple_return(prev_equity, current_equity)
-        normalized = dict(point)
-        normalized["strategy_return"] = float(strategy_return)
-        normalized_points.append(normalized)
+    normalized_points = _normalize_trend_points([assigned_points[key] for key in ordered_keys])
 
     return PointSeriesPath(
         points=normalized_points,
@@ -356,12 +373,20 @@ def _detect_major_trend_segments(points: list[dict[str, Any]]) -> list[TrendSegm
 
         up_move = _move_pct(closes[initial_low_idx], closes[initial_high_idx]) if initial_high_idx > initial_low_idx else 0.0
         down_move = _move_pct(closes[initial_high_idx], closes[initial_low_idx]) if initial_low_idx > initial_high_idx else 0.0
-        if up_move >= _trend_threshold(4.0, 0.06, max(atrs[initial_low_idx], atrs[initial_high_idx])):
+        if up_move >= _trend_threshold(
+            TREND_INIT_MOVE_MULTIPLIER,
+            TREND_INIT_MOVE_FLOOR,
+            max(atrs[initial_low_idx], atrs[initial_high_idx]),
+        ):
             pivot_idx = initial_low_idx
             extreme_idx = initial_high_idx
             direction = 1
             break
-        if down_move >= _trend_threshold(4.0, 0.06, max(atrs[initial_low_idx], atrs[initial_high_idx])):
+        if down_move >= _trend_threshold(
+            TREND_INIT_MOVE_MULTIPLIER,
+            TREND_INIT_MOVE_FLOOR,
+            max(atrs[initial_low_idx], atrs[initial_high_idx]),
+        ):
             pivot_idx = initial_high_idx
             extreme_idx = initial_low_idx
             direction = -1
@@ -379,14 +404,22 @@ def _detect_major_trend_segments(points: list[dict[str, Any]]) -> list[TrendSegm
             pullback = _move_pct(closes[extreme_idx], price)
             move_pct = _move_pct(closes[pivot_idx], closes[extreme_idx])
             atr_ratio = max(atrs[pivot_idx], atrs[extreme_idx])
-            min_segment = _trend_threshold(6.0, 0.08, atr_ratio)
-            min_reversal = _trend_threshold(3.0, 0.04, max(atrs[extreme_idx], atrs[idx]))
+            min_segment = _trend_threshold(TREND_SEGMENT_MOVE_MULTIPLIER, TREND_SEGMENT_MOVE_FLOOR, atr_ratio)
+            min_reversal = _trend_threshold(
+                TREND_REVERSAL_MOVE_MULTIPLIER,
+                TREND_REVERSAL_MOVE_FLOOR,
+                max(atrs[extreme_idx], atrs[idx]),
+            )
             if move_pct < min_segment:
                 if price <= closes[pivot_idx]:
                     direction = -1
                     extreme_idx = idx
                 continue
-            if pullback >= min_reversal and move_pct >= min_segment and extreme_idx - pivot_idx >= 4:
+            if (
+                pullback >= min_reversal
+                and move_pct >= min_segment
+                and extreme_idx - pivot_idx >= TREND_MIN_SEGMENT_BARS
+            ):
                 weight = _log_weight(closes[pivot_idx], closes[extreme_idx])
                 if weight > 1e-9:
                     segments.append(
@@ -408,14 +441,22 @@ def _detect_major_trend_segments(points: list[dict[str, Any]]) -> list[TrendSegm
             rebound = _move_pct(closes[extreme_idx], price)
             move_pct = _move_pct(closes[pivot_idx], closes[extreme_idx])
             atr_ratio = max(atrs[pivot_idx], atrs[extreme_idx])
-            min_segment = _trend_threshold(6.0, 0.08, atr_ratio)
-            min_reversal = _trend_threshold(3.0, 0.04, max(atrs[extreme_idx], atrs[idx]))
+            min_segment = _trend_threshold(TREND_SEGMENT_MOVE_MULTIPLIER, TREND_SEGMENT_MOVE_FLOOR, atr_ratio)
+            min_reversal = _trend_threshold(
+                TREND_REVERSAL_MOVE_MULTIPLIER,
+                TREND_REVERSAL_MOVE_FLOOR,
+                max(atrs[extreme_idx], atrs[idx]),
+            )
             if move_pct < min_segment:
                 if price >= closes[pivot_idx]:
                     direction = 1
                     extreme_idx = idx
                 continue
-            if rebound >= min_reversal and move_pct >= min_segment and extreme_idx - pivot_idx >= 4:
+            if (
+                rebound >= min_reversal
+                and move_pct >= min_segment
+                and extreme_idx - pivot_idx >= TREND_MIN_SEGMENT_BARS
+            ):
                 weight = _log_weight(closes[pivot_idx], closes[extreme_idx])
                 if weight > 1e-9:
                     segments.append(
@@ -432,8 +473,12 @@ def _detect_major_trend_segments(points: list[dict[str, Any]]) -> list[TrendSegm
                 direction = 1
 
     final_move = _move_pct(closes[pivot_idx], closes[extreme_idx])
-    final_threshold = _trend_threshold(6.0, 0.08, max(atrs[pivot_idx], atrs[extreme_idx]))
-    if extreme_idx - pivot_idx >= 4 and final_move >= final_threshold:
+    final_threshold = _trend_threshold(
+        TREND_SEGMENT_MOVE_MULTIPLIER,
+        TREND_SEGMENT_MOVE_FLOOR,
+        max(atrs[pivot_idx], atrs[extreme_idx]),
+    )
+    if extreme_idx - pivot_idx >= TREND_MIN_SEGMENT_BARS and final_move >= final_threshold:
         weight = _log_weight(closes[pivot_idx], closes[extreme_idx])
         if weight > 1e-9:
             segments.append(
@@ -765,15 +810,22 @@ def _overfit_risk_report(trend_report: TrendScoreReport, capture_drop: float) ->
     )
 
 
-def partial_eval_gate_snapshot(results: list[dict[str, Any]]) -> dict[str, float]:
-    eval_path = _collect_trend_path(results, "eval")
-    report = _trend_score_report(eval_path.points)
+def _trend_report_from_result(result: dict[str, Any] | None) -> TrendScoreReport:
+    if not result:
+        return _trend_score_report([])
+    points = _normalize_trend_points(_result_trend_capture_points(result))
+    return _trend_score_report(points)
+
+
+def partial_eval_gate_snapshot(result: dict[str, Any] | None) -> dict[str, float]:
+    points = _normalize_trend_points(_result_trend_capture_points(result or {}))
+    report = _trend_score_report(points)
     return {
         "segment_count": float(report.segment_count),
         "trend_score": report.trend_score,
         "hit_rate": report.hit_rate,
         "path_return_pct": report.path_return_pct,
-        "unique_points": float(eval_path.unique_points),
+        "unique_points": float(len(points)),
     }
 
 
@@ -783,6 +835,8 @@ def partial_eval_gate_snapshot(results: list[dict[str, Any]]) -> dict[str, float
 def summarize_evaluation(
     results: list[dict[str, Any]],
     gates: GateConfig,
+    eval_continuous_result: dict[str, Any] | None = None,
+    validation_continuous_result: dict[str, Any] | None = None,
     full_period_result: dict[str, Any] | None = None,
     **_kwargs: Any,
 ) -> EvaluationReport:
@@ -808,16 +862,18 @@ def summarize_evaluation(
 
     eval_path = _collect_trend_path(results, "eval")
     validation_path = _collect_trend_path(results, "validation")
-    combined_path = _collect_trend_path(results, None)
 
-    eval_trend_report = _trend_score_report(eval_path.points)
-    validation_trend_report = _trend_score_report(validation_path.points)
-    combined_trend_report = _trend_score_report(combined_path.points)
+    eval_trend_report = _trend_report_from_result(eval_continuous_result)
+    validation_source = validation_continuous_result
+    if validation_source is None and len(validation_results) == 1:
+        validation_source = validation_results[0]["result"]
+    validation_trend_report = _trend_report_from_result(validation_source)
+    full_period_trend_report = _trend_report_from_result(full_period_result)
 
     quality_score = 0.70 * eval_trend_report.trend_score + 0.30 * eval_trend_report.return_score
-    promotion_score = 0.70 * combined_trend_report.trend_score + 0.30 * combined_trend_report.return_score
+    promotion_score = 0.70 * full_period_trend_report.trend_score + 0.30 * full_period_trend_report.return_score
     capture_drop = eval_trend_report.trend_score - validation_trend_report.trend_score
-    overfit_report = _overfit_risk_report(combined_trend_report, capture_drop)
+    overfit_report = _overfit_risk_report(full_period_trend_report, capture_drop)
 
     gate_reasons: list[str] = []
     if eval_trend_report.segment_count < gates.min_eval_segments:
@@ -834,10 +890,10 @@ def summarize_evaluation(
         gate_reasons.append(f"验证趋势捕获分偏低({validation_trend_report.trend_score:.2f})")
     if capture_drop > gates.max_capture_drop:
         gate_reasons.append(f"评估/验证捕获落差过大({capture_drop:.2f})")
-    if combined_trend_report.bull_score < gates.min_bull_capture:
-        gate_reasons.append(f"多头捕获偏低({combined_trend_report.bull_score:.2f})")
-    if combined_trend_report.bear_score < gates.min_bear_capture:
-        gate_reasons.append(f"空头捕获偏低({combined_trend_report.bear_score:.2f})")
+    if full_period_trend_report.bull_score < gates.min_bull_capture:
+        gate_reasons.append(f"多头捕获偏低({full_period_trend_report.bull_score:.2f})")
+    if full_period_trend_report.bear_score < gates.min_bear_capture:
+        gate_reasons.append(f"空头捕获偏低({full_period_trend_report.bear_score:.2f})")
     if avg_fee_drag > gates.max_fee_drag_pct:
         gate_reasons.append(f"手续费拖累过高({avg_fee_drag:.2f}%)")
     if overfit_report.hard_fail:
@@ -855,9 +911,9 @@ def summarize_evaluation(
         "研究评估摘要",
         f"评估趋势捕获分 / 绝对收益分: {eval_trend_report.trend_score:.2f} / {eval_trend_report.return_score:.2f}",
         f"验证趋势捕获分 / 绝对收益分: {validation_trend_report.trend_score:.2f} / {validation_trend_report.return_score:.2f}",
-        f"综合趋势捕获分 / 综合收益分: {combined_trend_report.trend_score:.2f} / {combined_trend_report.return_score:.2f}",
-        f"到来 / 陪跑 / 掉头: {combined_trend_report.arrival_score:.2f} / {combined_trend_report.escort_score:.2f} / {combined_trend_report.turn_score:.2f}",
-        f"多头 / 空头捕获: {combined_trend_report.bull_score:.2f} / {combined_trend_report.bear_score:.2f}",
+        f"全段连续趋势捕获分 / 绝对收益分: {full_period_trend_report.trend_score:.2f} / {full_period_trend_report.return_score:.2f}",
+        f"全段连续到来 / 陪跑 / 掉头: {full_period_trend_report.arrival_score:.2f} / {full_period_trend_report.escort_score:.2f} / {full_period_trend_report.turn_score:.2f}",
+        f"全段连续多头 / 空头捕获: {full_period_trend_report.bull_score:.2f} / {full_period_trend_report.bear_score:.2f}",
         f"评估趋势段 / 命中率: {eval_trend_report.segment_count} / {eval_trend_report.hit_rate:.0%}",
         f"验证趋势段 / 命中率: {validation_trend_report.segment_count} / {validation_trend_report.hit_rate:.0%}",
         (
@@ -869,10 +925,10 @@ def summarize_evaluation(
             f"多空落差={overfit_report.bull_bear_gap:.2f}"
         ),
         (
-            "评估路径收益 / 全段连续收益 / 拼接路径收益: "
+            "评估连续路径收益 / 验证连续路径收益 / 全段连续收益: "
             f"{eval_trend_report.path_return_pct:.2f}% / "
-            f"{full_period_return:.2f}% / "
-            f"{combined_trend_report.path_return_pct:.2f}%"
+            f"{validation_trend_report.path_return_pct:.2f}% / "
+            f"{full_period_return:.2f}%"
         ),
         f"评估平均收益 / 验证收益: {eval_avg_return:.2f}% / {validation_avg_return:.2f}%",
         f"评估中位收益 / P25 / 最差: {eval_median_return:.2f}% / {eval_p25_return:.2f}% / {eval_worst_return:.2f}%",
@@ -892,8 +948,8 @@ def summarize_evaluation(
         f"当前策略是 BTC 激进趋势策略：15m 执行，1h/4h 确认，目标是抓大行情的到来、陪跑主趋势、在掉头时退出或反手。",
         f"当前基底主评分={quality_score:.2f}，综合晋级分={promotion_score:.2f}，gate={gate_reason}",
         f"评估趋势捕获分={eval_trend_report.trend_score:.2f}，收益分={eval_trend_report.return_score:.2f}，趋势段={eval_trend_report.segment_count}，命中率={eval_trend_report.hit_rate:.0%}",
-        f"综合到来/陪跑/掉头={combined_trend_report.arrival_score:.2f}/{combined_trend_report.escort_score:.2f}/{combined_trend_report.turn_score:.2f}",
-        f"综合多头/空头捕获={combined_trend_report.bull_score:.2f}/{combined_trend_report.bear_score:.2f}，评估/验证捕获落差={capture_drop:.2f}",
+        f"全段连续到来/陪跑/掉头={full_period_trend_report.arrival_score:.2f}/{full_period_trend_report.escort_score:.2f}/{full_period_trend_report.turn_score:.2f}",
+        f"全段连续多头/空头捕获={full_period_trend_report.bull_score:.2f}/{full_period_trend_report.bear_score:.2f}，评估/验证捕获落差={capture_drop:.2f}",
         (
             f"过拟合风险={overfit_report.risk_level}({overfit_report.risk_score:.0f})，"
             f"单段正向贡献={overfit_report.top1_positive_share:.0%}，"
@@ -902,9 +958,9 @@ def summarize_evaluation(
             f"多空落差={overfit_report.bull_bear_gap:.2f}"
         ),
         (
-            f"评估路径收益={eval_trend_report.path_return_pct:.2f}%，"
+            f"评估连续路径收益={eval_trend_report.path_return_pct:.2f}%，"
+            f"验证连续路径收益={validation_trend_report.path_return_pct:.2f}%，"
             f"全段连续收益={full_period_return:.2f}%，"
-            f"拼接路径收益={combined_trend_report.path_return_pct:.2f}%，"
             f"最大回撤={worst_drawdown:.2f}%"
         ),
         f"评估4h唯一路径点={eval_path.unique_points}，重叠点={eval_path.overlap_points}，被覆盖点={eval_path.dropped_points}",
@@ -934,29 +990,33 @@ def summarize_evaluation(
         "validation_overlap_trend_points_dropped": float(validation_path.dropped_points),
         "eval_trend_capture_score": eval_trend_report.trend_score,
         "validation_trend_capture_score": validation_trend_report.trend_score,
-        "combined_trend_capture_score": combined_trend_report.trend_score,
+        "combined_trend_capture_score": full_period_trend_report.trend_score,
+        "full_period_trend_capture_score": full_period_trend_report.trend_score,
         "eval_return_score": eval_trend_report.return_score,
         "validation_return_score": validation_trend_report.return_score,
-        "combined_return_score": combined_trend_report.return_score,
+        "combined_return_score": full_period_trend_report.return_score,
+        "full_period_return_score": full_period_trend_report.return_score,
         "eval_arrival_capture_score": eval_trend_report.arrival_score,
         "eval_escort_capture_score": eval_trend_report.escort_score,
         "eval_turn_adaptation_score": eval_trend_report.turn_score,
-        "arrival_capture_score": combined_trend_report.arrival_score,
-        "escort_capture_score": combined_trend_report.escort_score,
-        "turn_adaptation_score": combined_trend_report.turn_score,
+        "arrival_capture_score": full_period_trend_report.arrival_score,
+        "escort_capture_score": full_period_trend_report.escort_score,
+        "turn_adaptation_score": full_period_trend_report.turn_score,
         "eval_bull_capture_score": eval_trend_report.bull_score,
         "eval_bear_capture_score": eval_trend_report.bear_score,
-        "bull_capture_score": combined_trend_report.bull_score,
-        "bear_capture_score": combined_trend_report.bear_score,
+        "bull_capture_score": full_period_trend_report.bull_score,
+        "bear_capture_score": full_period_trend_report.bear_score,
         "eval_segment_hit_rate": eval_trend_report.hit_rate,
         "validation_segment_hit_rate": validation_trend_report.hit_rate,
-        "segment_hit_rate": combined_trend_report.hit_rate,
+        "segment_hit_rate": full_period_trend_report.hit_rate,
+        "full_period_segment_hit_rate": full_period_trend_report.hit_rate,
         "eval_major_segment_count": float(eval_trend_report.segment_count),
         "validation_major_segment_count": float(validation_trend_report.segment_count),
-        "major_segment_count": float(combined_trend_report.segment_count),
+        "major_segment_count": float(full_period_trend_report.segment_count),
+        "full_period_major_segment_count": float(full_period_trend_report.segment_count),
         "eval_path_return_pct": eval_trend_report.path_return_pct,
         "validation_path_return_pct": validation_trend_report.path_return_pct,
-        "combined_path_return_pct": combined_trend_report.path_return_pct,
+        "combined_path_return_pct": full_period_trend_report.path_return_pct,
         "full_period_return_pct": full_period_return,
         "capture_drop": capture_drop,
         "overfit_risk_score": overfit_report.risk_score,

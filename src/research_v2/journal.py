@@ -15,7 +15,8 @@ from research_v2.evaluation import OVERFIT_WARN_SCORE, overfit_reference_action,
 
 
 COMPACT_INTERVAL = 20
-NEGATIVE_OUTCOMES = {"rejected", "early_rejected", "runtime_failed"}
+NEGATIVE_OUTCOMES = {"rejected", "early_rejected", "runtime_failed", "duplicate_skipped"}
+NO_OP_STOP_STAGES = {"duplicate_source", "duplicate_history", "empty_diff"}
 
 CLUSTER_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("ownership_cluster", ("ownership", "acceptance", "handoff", "transfer", "reset_reclaim")),
@@ -176,6 +177,7 @@ def _compact_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
 
     accepted = [e for e in entries if _outcome_bucket(str(e.get("outcome", ""))) == "accepted"]
     rejected = [e for e in entries if _outcome_bucket(str(e.get("outcome", ""))) == "rejected"]
+    duplicate_skipped_count = sum(1 for e in entries if e.get("outcome") == "duplicate_skipped")
     early_rejected_count = sum(1 for e in entries if e.get("outcome") == "early_rejected")
     runtime_failed_count = sum(1 for e in entries if e.get("outcome") == "runtime_failed")
 
@@ -272,6 +274,7 @@ def _compact_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
         "score_regime": _entry_score_regime(entries[-1]),
         "accepted_count": len(accepted),
         "rejected_count": len(rejected),
+        "duplicate_skipped_count": duplicate_skipped_count,
         "early_rejected_count": early_rejected_count,
         "runtime_failed_count": runtime_failed_count,
         "accept_rate": len(accepted) / len(entries) if entries else 0.0,
@@ -640,7 +643,7 @@ def _span(values: list[float]) -> float:
 def _low_change_tail(entries: list[dict[str, Any]], streak: int = LOW_CHANGE_STREAK) -> list[dict[str, Any]]:
     eligible = [
         entry for entry in entries
-        if str(entry.get("outcome", "")) in {"accepted", "rejected"}
+        if _outcome_bucket(str(entry.get("outcome", ""))) in {"accepted", "rejected"}
     ]
     if len(eligible) < streak:
         return []
@@ -668,7 +671,51 @@ def _low_change_tail(entries: list[dict[str, Any]], streak: int = LOW_CHANGE_STR
     return tail
 
 
+def _noop_tail(entries: list[dict[str, Any]], streak: int = LOW_CHANGE_STREAK) -> list[dict[str, Any]]:
+    if len(entries) < streak:
+        return []
+    tail = entries[-streak:]
+    if all(str(entry.get("outcome", "")) == "duplicate_skipped" for entry in tail):
+        return tail
+    if all(str(entry.get("stop_stage", "")) in NO_OP_STOP_STAGES for entry in tail):
+        return tail
+    return []
+
+
 def _exploration_trigger_lines(entries: list[dict[str, Any]], limit: int) -> list[str]:
+    noop_tail = _noop_tail(entries)
+    if noop_tail:
+        clusters: list[str] = []
+        tags: list[str] = []
+        regions: list[str] = []
+        reasons: list[str] = []
+        for entry in noop_tail:
+            cluster = cluster_key_for_entry(entry)
+            if cluster and cluster not in clusters:
+                clusters.append(cluster)
+            for tag in entry.get("change_tags", []):
+                tag_text = str(tag).strip()
+                if tag_text and tag_text not in tags:
+                    tags.append(tag_text)
+            for region in entry.get("edited_regions", []):
+                region_text = str(region).strip()
+                if region_text and region_text not in regions:
+                    regions.append(region_text)
+            reason_text = str(entry.get("gate_reason", "")).strip()
+            if reason_text and reason_text not in reasons:
+                reasons.append(reason_text)
+
+        return [
+            "探索触发（必须执行）:",
+            f"最近 {LOW_CHANGE_STREAK} 轮都没有产生有效代码改动，已按重复探索记入历史。",
+            f"- 重复原因：{'；'.join(reasons[:limit]) or '-'}",
+            f"- 近期近邻方向簇：{', '.join(clusters[:limit]) or '-'}",
+            f"- 近期近邻标签：{', '.join(tags[:limit]) or '-'}",
+            f"- 近期高频编辑区域：{', '.join(regions[:limit]) or '-'}",
+            "- 下一轮必须先产生有效 diff，不允许再次直接回传原文件或近乎等价的空改动。",
+            "- 若继续沿用相近方向，必须切换核心因子解释或 edited region family，并明确说明会改变哪类交易路径。",
+        ]
+
     tail = _low_change_tail(entries)
     if not tail:
         return []
@@ -738,6 +785,7 @@ def _display_outcome(raw_outcome: str) -> str:
     return {
         "accepted": "保留",
         "rejected": "未保留",
+        "duplicate_skipped": "重复跳过",
         "early_rejected": "提前淘汰",
         "runtime_failed": "运行失败",
     }.get(raw_outcome, raw_outcome or "-")
@@ -749,6 +797,12 @@ def _display_stage(entry: dict[str, Any]) -> str:
         return "提前淘汰"
     if stage == "runtime_error":
         return "运行失败"
+    if stage == "duplicate_source":
+        return "重复源码"
+    if stage == "duplicate_history":
+        return "历史重复"
+    if stage == "empty_diff":
+        return "无有效diff"
     if stage == "full_eval":
         return "完整评估"
     if str(entry.get("outcome", "")) in {"accepted", "rejected"}:
@@ -868,7 +922,7 @@ def _empty_prompt_tables() -> list[str]:
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         "| - | - | - | 低 | 0 | - | - | - | - | - | 暂无需要降权的高风险轮次 |",
         "",
-        "最近未压缩轮次共 0 条：保留 0，未保留 0，提前淘汰 0，运行失败 0。",
+        "最近未压缩轮次共 0 条：保留 0，未保留 0，重复跳过 0，提前淘汰 0，运行失败 0。",
         "最近未压缩轮次表:",
         "| 轮次 | 候选 | 结果 | 阶段 | promotion | quality | trend | return | hit | seg | bull | bear | gate | tags | regions | 摘要 |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
@@ -876,7 +930,17 @@ def _empty_prompt_tables() -> list[str]:
     ]
 
 
-def build_journal_prompt_summary(entries: list[dict[str, Any]], limit: int = 6, journal_path: Path | None = None) -> str:
+def build_journal_prompt_summary(
+    entries: list[dict[str, Any]],
+    limit: int = 6,
+    journal_path: Path | None = None,
+    current_score_regime: str = "",
+) -> str:
+    if current_score_regime:
+        entries = [
+            entry for entry in entries
+            if str(entry.get("score_regime", "")).strip() == current_score_regime
+        ]
     parts: list[str] = []
     if not entries:
         parts.extend(_empty_prompt_tables())
@@ -908,11 +972,13 @@ def build_journal_prompt_summary(entries: list[dict[str, Any]], limit: int = 6, 
 
         accepted_count = sum(1 for entry in display_entries if entry.get("outcome") == "accepted")
         rejected_count = sum(1 for entry in display_entries if entry.get("outcome") == "rejected")
+        duplicate_skipped_count = sum(1 for entry in display_entries if entry.get("outcome") == "duplicate_skipped")
         early_rejected_count = sum(1 for entry in display_entries if entry.get("outcome") == "early_rejected")
         runtime_failed_count = sum(1 for entry in display_entries if entry.get("outcome") == "runtime_failed")
         parts.append(
             f"最近未压缩轮次共 {len(display_entries)} 条："
             f"保留 {accepted_count}，未保留 {rejected_count}，"
+            f"重复跳过 {duplicate_skipped_count}，"
             f"提前淘汰 {early_rejected_count}，运行失败 {runtime_failed_count}。"
         )
         failure_tag_lines = _recent_failure_tag_lines(display_entries, limit=min(8, limit))

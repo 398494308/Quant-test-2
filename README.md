@@ -23,15 +23,17 @@
 7. 先对候选跑少量 `smoke` 窗口；若运行报错，会在同一轮把错误回传给模型修复，而不是直接进入下一轮。
 8. `smoke` 通过后再跑整套 `eval + validation` 窗口回测。
 9. 只有 `gate` 通过、未触发严重过拟合淘汰且 `promotion_score` 提升，才晋级为新的最优。
-10. 把每轮结果写进 journal，包含 `accepted / rejected / early_rejected / runtime_failed`，并按 20 轮做压缩记忆。
+10. 把每轮结果写进 journal，包含 `accepted / rejected / duplicate_skipped / early_rejected / runtime_failed`；即使候选和当前最优完全相同，或没有有效 diff，也会记入历史并参与探索计数；journal 仍按 20 轮做压缩记忆。
 
 当前评分口径：
 
-- `score_regime = trend_capture_v1`
+- `score_regime = trend_capture_v3`
 - `quality_score = 0.70 * eval_trend_capture_score + 0.30 * eval_return_score`
-- `promotion_score = 0.70 * combined_trend_capture_score + 0.30 * combined_return_score`
+- `promotion_score = 0.70 * full_period_trend_capture_score + 0.30 * full_period_return_score`
 - `trend_capture_score` 不看“平滑度”，而是看大趋势的 `到来 / 陪跑 / 掉头`
 - 切段用唯一 `4h` 市场路径，不重复加权重叠窗口里的同一时间点
+- 当前切段已经放宽到更细的 `4h` 趋势段，约 `5%` 级别的单边也纳入核心机会；按当前全段数据大约会识别出 `61` 段
+- `promotion_score` 和 Discord 主收益行现在都直接来自真实整段连续回测，不再用拼接路径充当主口径
 
 当前窗口配置默认是：
 
@@ -53,15 +55,19 @@
 - 每轮先跑 `smoke` 窗口，运行报错会在同一轮进入 repair loop，最多按配置尝试修复，再决定是否记为 `runtime_failed`。
 - 候选生成现在改成“临时 workspace 原地编辑”模式：prompt 不再内嵌完整策略源码，模型也不再回传完整 `strategy_code`，只回传候选元信息。
 - 主进程会直接读取临时 workspace 里的 `src/strategy_macd_aggressive.py`，并校验非 editable 区域完全未变，防止模型偷偷改动边界外内容。
+- `same-source / recent-hash / empty-diff` 这类空转轮次现在也会写进 journal，并出现在方向风险表、最近轮次表和探索触发里，不再静默跳过。
+- 这台机器上的 `codex exec` 在 `workspace-write` 沙箱下会触发 `bwrap: loopback: Failed RTM_NEWADDR`，所以研究器子进程现在显式使用非交互 `approval=never`，并改走 `danger-full-access`，否则模型连本地文件都读写不了。
 - 这次切换后，研究 prompt 体积从之前约 `105KB` 降到约 `15KB`，主要节省来自不再传输整份策略源码。
 - `smoke` 抽样现在默认会覆盖 `validation`；在 `smoke_window_count=3` 时，默认是“早期 eval + validation + 中段 eval”，不再只测 `eval`。
 - `heartbeat` 会写出当前阶段和窗口进度，便于判断卡在 `smoke`、`full_eval` 还是修复。
 - 模型生成和 repair 阶段现在也会持续刷新 `heartbeat`，状态里能直接看到 `model_generate / model_repair`、等待秒数和超时上限。
 - `codex exec` 默认单次超时已从 `900s` 收紧到 `600s`；超时后会回收整组 provider 子进程，避免留下孤儿进程一直占着 CPU / 内存。
-- `2026-04-15` 已按当前 `trend_capture_v1` 评分口径重新初始化 best state，避免旧分数挡住本该通过的候选。
+- `2026-04-17` 已按当前 `trend_capture_v3` 评分口径重新初始化 best state，避免旧分数挡住本该通过的候选。
 - 提前淘汰从旧的 Sortino 逻辑改成了部分窗口趋势捕获快照：趋势段够多且趋势捕获分、命中率都很差时，会提前结束该轮。
 - 评估阶段现在会额外计算过拟合风险：若结果过度依赖单一正向趋势段、同向连续段，或有效命中覆盖率过低且明显多空偏科，会直接被 gate 掉。
 - compact 历史现在会带上 `score_regime`，喂给 prompt 时只使用当前评分口径下的压缩历史；旧版未标记口径的 compact 轮次会被跳过，避免长期污染。
+- 回测器现在会强制校验 `price / funding` 的 venue 是否一致，并检查 funding 在请求窗口内是否完整覆盖，避免静默错跑。
+- 默认 funding 数据源已经切到 Binance 永续 funding，和当前 Binance 价格数据口径保持一致。
 
 ## 当前策略轮廓
 
@@ -93,26 +99,27 @@
 
 研究器运行时会把最新最优状态写到 `state/research_macd_aggressive_v2_best.json`。
 
-截至 `2026-04-15 22:37:12`（Asia/Shanghai），按当前 `trend_capture_v1` 评分口径重新评估，当前最优快照为：
+截至 `2026-04-17 10:18:24`（Asia/Shanghai），按当前 `trend_capture_v3` 评分口径重新评估，当前最优快照为：
 
-- `quality_score = 0.58`
-- `promotion_score = 0.74`
-- `eval_trend_capture_score = 0.63`
-- `validation_trend_capture_score = 0.28`
-- `combined_trend_capture_score = 0.46`
-- `combined_return_score = 1.38`
-- `eval_avg_return = 0.24%`
-- `validation_avg_return = 89.37%`
-- `worst_drawdown = 34.93%`
-- `total_trades = 475`
-- `eval_major_segment_count = 11`
-- `validation_major_segment_count = 10`
-- `segment_hit_rate = 54.55%`
-- `bull_capture_score = 0.33`
-- `bear_capture_score = 0.67`
+- `quality_score = 0.75`
+- `promotion_score = 0.88`
+- `full_period_return_pct = 230.09%`
+- `eval_trend_capture_score = 0.71`
+- `validation_trend_capture_score = 0.18`
+- `combined_trend_capture_score = 0.53`
+- `combined_return_score = 1.72`
+- `eval_avg_return = 2.28%`
+- `validation_avg_return = 88.98%`
+- `worst_drawdown = 34.17%`
+- `total_trades = 432`
+- `eval_major_segment_count = 33`
+- `validation_major_segment_count = 21`
+- `segment_hit_rate = 45.90%`
+- `bull_capture_score = 0.37`
+- `bear_capture_score = 0.72`
 - `overfit_risk_score = 20`
-- `overfit_top1_positive_share = 14.40%`
-- `overfit_coverage_ratio = 100%`
+- `overfit_top1_positive_share = 8.32%`
+- `overfit_coverage_ratio = 83.33%`
 - `gate = 通过`
 
 ## 目录结构
@@ -176,18 +183,15 @@ Discord 里的主表目前会显示这些字段。下面尽量用直白的话解
   这是把当前策略从研究起点一直连续跑到研究终点，只跑 1 次之后得到的总收益。
   它最接近“这套策略整段历史一路跑下来最后赚了多少”。
 
+- `评估连续收益`
+  这是把全部 `eval` 时间段首尾连起来，真正连续跑 1 次之后得到的收益。
+
+- `验证连续收益`
+  这是把 `validation` 整段真正连续跑 1 次之后得到的收益。
+
 - `评估窗口均值收益`
   这是所有 `eval` 窗口收益的平均值。
-  它主要用来看训练期窗口整体表现，不再直接拿去和 `validation` 并排对比。
-
-- `验证整段收益`
-  这是单个 `validation` 大窗口的整段收益。
-  因为它本来就不是和 `eval` 窗口平均一个口径，所以现在单独列出来。
-
-- `拼接路径收益`
-  这不是“把整个时间段首尾连起来单次连续回测”出来的收益。
-  它是把所有窗口里的趋势路径点按时间去重后，拼成一条合并主路径，再按这条主路径做复利后得到的结果。
-  它更适合拿来辅助看趋势捕获路径，不适合作为“整段最终赚了多少”的主口径。
+  它主要用来看训练期窗口整体表现，是辅助诊断，不再和连续收益混成同一口径。
 
 - `评/验趋势分`
   这是 `eval_trend_capture_score / validation_trend_capture_score`。
@@ -207,25 +211,25 @@ Discord 里的主表目前会显示这些字段。下面尽量用直白的话解
 
 - `评分(主/晋)`
   第一个是 `quality_score`，主要看 `eval` 阶段表现。
-  第二个是 `promotion_score`，看整条合并后的大路径表现，也是决定能不能刷新最优的核心分数。
+  第二个是 `promotion_score`，看全段连续回测表现，也是决定能不能刷新最优的核心分数。
 
-- `趋势/收益分`
-  第一个是 `combined_trend_capture_score`，意思是这套策略对大趋势抓得好不好。
-  第二个是 `combined_return_score`，意思是最终把钱放大了多少。
+- `全段趋势/收益分`
+  第一个是 `combined_trend_capture_score`，意思是这套策略在全段连续口径下对大趋势抓得好不好。
+  第二个是 `combined_return_score`，意思是它在全段连续口径下把资金放大了多少。
 
-- `到来/陪跑/掉头`
+- `全段到来/陪跑/掉头`
   一共 3 个数：
   第一个看大行情刚开始时，能不能及时上车。
   第二个看上车后，能不能尽量跟住主趋势。
   第三个看趋势转向时，能不能及时跑掉或者反手。
 
-- `多/空捕获`
+- `全段多/空捕获`
   前一个是多头趋势抓得怎么样，后一个是空头趋势抓得怎么样。
   如果一个很高一个很低，说明策略可能偏科，只会单边。
 
-- `综合命中率/趋势段`
-  前一个是 `segment_hit_rate`，意思是在全部大趋势段里，有多少比例算是“抓到了”。
-  后一个是 `major_segment_count`，意思是合并后总共识别出了多少个大趋势段。
+- `全段命中率/趋势段`
+  前一个是 `segment_hit_rate`，意思是在全段连续口径识别出来的大趋势段里，有多少比例算是“抓到了”。
+  后一个是 `major_segment_count`，意思是全段连续口径下总共识别出了多少个大趋势段。
 
 - `过拟合风险`
   前一个是风险等级，比如 `低 / 观察 / 高 / 严重`。

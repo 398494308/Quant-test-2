@@ -100,16 +100,17 @@
 - 文件：`scripts/research_macd_aggressive_v2.py`
 - 允许模型直接改写策略源码
 - 但会经过源码校验、参数边界校验和研究历史去重
-- 评分核心是 `trend_capture_v1 + gate`
+- 评分核心是 `trend_capture_v3 + gate`
 
 当前主评分口径：
 
 - 先在唯一 `4h` 市场路径上识别 BTC 的大趋势段
+- 当前切段已经放宽到更细的 `4h` 趋势段，约 `5%` 级别单边也算核心机会；按当前全段数据大约会识别出 `61` 段
 - 每段拆成 `到来 / 陪跑 / 掉头`
 - `trend_capture_score` 看的是：能否及时跟上、能否陪跑主趋势、能否在掉头时跑掉或反手
 - `return_score` 看的是整条路径最终把资金放大了多少
 - `quality_score = 0.70 * eval_trend_capture_score + 0.30 * eval_return_score`
-- `promotion_score = 0.70 * combined_trend_capture_score + 0.30 * combined_return_score`
+- `promotion_score = 0.70 * full_period_trend_capture_score + 0.30 * full_period_return_score`
 - 爆仓和回撤保留为诊断项，但不再是主评分，也不再单独惩罚
 
 当前研究器的研究记忆与修复链路：

@@ -15,7 +15,14 @@ import backtest_macd_aggressive as backtest
 from codex_exec_client import StrategyClientConfig, StrategyGenerationTransientError, generate_json_object
 from scripts.research_macd_aggressive_v2 import select_smoke_windows
 from research_v2.config import GateConfig
-from research_v2.evaluation import EvaluationReport, _collect_daily_path, _collect_trend_path, _trend_score_report, summarize_evaluation
+from research_v2.evaluation import (
+    EvaluationReport,
+    _collect_daily_path,
+    _collect_trend_path,
+    _trend_score_report,
+    partial_eval_gate_snapshot,
+    summarize_evaluation,
+)
 from research_v2.charting import charts_available, render_performance_chart
 from research_v2.journal import (
     _format_compact_for_prompt,
@@ -254,31 +261,48 @@ class EvaluationFixesTest(unittest.TestCase):
             max_fee_drag_pct=100.0,
         )
 
+        expected_eval_points = _collect_trend_path(results, "eval").points
+        expected_validation_points = _collect_trend_path(results, "validation").points
+        full_period_result = {
+            "return": 12.34,
+            "max_drawdown": 7.8,
+            "trend_capture_points": expected_eval_points + expected_validation_points,
+        }
         report = summarize_evaluation(
             results,
             gates,
-            full_period_result={"return": 12.34, "max_drawdown": 7.8},
+            eval_continuous_result={
+                "return": 6.78,
+                "max_drawdown": 4.5,
+                "trend_capture_points": expected_eval_points,
+            },
+            validation_continuous_result={
+                "return": 2.34,
+                "max_drawdown": 3.2,
+                "trend_capture_points": expected_validation_points,
+            },
+            full_period_result=full_period_result,
         )
-        expected_eval_points = _collect_trend_path(results, "eval").points
-        expected_all_points = _collect_trend_path(results, None).points
         expected_eval_report = _trend_score_report(expected_eval_points)
-        expected_all_report = _trend_score_report(expected_all_points)
+        expected_full_period_report = _trend_score_report(full_period_result["trend_capture_points"])
 
         self.assertAlmostEqual(report.metrics["eval_trend_capture_score"], expected_eval_report.trend_score)
-        self.assertAlmostEqual(report.metrics["combined_trend_capture_score"], expected_all_report.trend_score)
+        self.assertAlmostEqual(report.metrics["combined_trend_capture_score"], expected_full_period_report.trend_score)
+        self.assertAlmostEqual(report.metrics["full_period_trend_capture_score"], expected_full_period_report.trend_score)
         self.assertAlmostEqual(
             report.metrics["quality_score"],
             0.70 * expected_eval_report.trend_score + 0.30 * expected_eval_report.return_score,
         )
         self.assertAlmostEqual(
             report.metrics["promotion_score"],
-            0.70 * expected_all_report.trend_score + 0.30 * expected_all_report.return_score,
+            0.70 * expected_full_period_report.trend_score + 0.30 * expected_full_period_report.return_score,
         )
         self.assertEqual(report.metrics["eval_unique_trend_points"], 15.0)
         self.assertEqual(report.metrics["eval_overlap_trend_points"], 2.0)
         self.assertEqual(report.metrics["eval_overlap_trend_points_dropped"], 2.0)
         self.assertEqual(report.metrics["validation_overlap_trend_points"], 0.0)
         self.assertEqual(report.metrics["full_period_return_pct"], 12.34)
+        self.assertAlmostEqual(report.metrics["combined_path_return_pct"], expected_full_period_report.path_return_pct)
         self.assertTrue(report.gate_passed)
 
     def test_summarize_evaluation_rejects_severe_overfit_concentration(self):
@@ -353,13 +377,44 @@ class EvaluationFixesTest(unittest.TestCase):
             max_fee_drag_pct=100.0,
         )
 
-        report = summarize_evaluation(results, gates)
+        report = summarize_evaluation(
+            results,
+            gates,
+            eval_continuous_result={
+                "return": 180.0,
+                "max_drawdown": 10.0,
+                "trend_capture_points": eval_points,
+            },
+            validation_continuous_result={
+                "return": 0.3,
+                "max_drawdown": 2.0,
+                "trend_capture_points": validation_points,
+            },
+            full_period_result={
+                "return": 180.3,
+                "max_drawdown": 10.0,
+                "trend_capture_points": eval_points + validation_points,
+            },
+        )
 
         self.assertFalse(report.gate_passed)
         self.assertIn("过拟合风险", report.gate_reason)
         self.assertGreater(report.metrics["overfit_risk_score"], 0.0)
         self.assertGreater(report.metrics["overfit_top1_positive_share"], 0.60)
         self.assertEqual(report.metrics["overfit_hard_fail"], 1.0)
+
+    def test_partial_eval_gate_snapshot_normalizes_missing_strategy_return(self):
+        gate_snapshot = partial_eval_gate_snapshot(
+            {
+                "trend_capture_points": [
+                    {"timestamp": 1, "label": "a", "market_close": 100.0, "atr_ratio": 0.01, "strategy_equity": 100000.0},
+                    {"timestamp": 2, "label": "b", "market_close": 110.0, "atr_ratio": 0.01, "strategy_equity": 110000.0},
+                ]
+            }
+        )
+
+        self.assertEqual(gate_snapshot["unique_points"], 2.0)
+        self.assertGreaterEqual(gate_snapshot["path_return_pct"], 0.0)
 
 
 class StrategyValidationFixesTest(unittest.TestCase):
@@ -663,6 +718,56 @@ class JournalPromptFixesTest(unittest.TestCase):
         self.assertIn("impulse_persistence", summary)
         self.assertIn("continuation_energy_decay", summary)
 
+    def test_journal_summary_emits_exploration_trigger_after_three_duplicate_skips(self):
+        entries = []
+        for idx in range(3):
+            entries.append(
+                {
+                    "iteration": idx + 1,
+                    "candidate_id": f"duplicate_{idx}",
+                    "outcome": "duplicate_skipped",
+                    "stop_stage": "duplicate_source",
+                    "promotion_delta": None,
+                    "gate_reason": "候选源码与当前最优完全相同",
+                    "change_tags": ["ownership_takeover", "arrival_entry"],
+                    "edited_regions": ["strategy"],
+                    "closest_failed_cluster": "ownership_cluster",
+                    "hypothesis": "模型重复回传了原文件。",
+                    "score_regime": "trend_capture_v1",
+                }
+            )
+
+        summary = build_journal_prompt_summary(entries, limit=8)
+
+        self.assertIn("重复跳过 3", summary)
+        self.assertIn("探索触发（必须执行）", summary)
+        self.assertIn("没有产生有效代码改动", summary)
+        self.assertIn("ownership_cluster", summary)
+
+    def test_journal_summary_prefers_current_score_regime_when_provided(self):
+        entries = [
+            {
+                "iteration": 1,
+                "candidate_id": "old_regime",
+                "outcome": "accepted",
+                "stop_stage": "full_eval",
+                "promotion_score": 0.80,
+                "quality_score": 0.60,
+                "promotion_delta": 0.05,
+                "gate_reason": "通过",
+                "change_tags": ["long_breakout"],
+                "edited_regions": ["strategy"],
+                "hypothesis": "旧评分口径历史。",
+                "score_regime": "trend_capture_v2",
+            }
+        ]
+
+        summary = build_journal_prompt_summary(entries, limit=8, current_score_regime="trend_capture_v3")
+
+        self.assertIn("方向风险表", summary)
+        self.assertIn("等待新历史", summary)
+        self.assertNotIn("old_regime", summary)
+
     def test_journal_summary_keeps_empty_table_after_reset(self):
         summary = build_journal_prompt_summary([], limit=8)
 
@@ -716,6 +821,7 @@ class CodexExecClientTest(unittest.TestCase):
             codex_bin="codex",
             model="gpt-5.4",
             reasoning_effort="medium",
+            approval_policy="never",
             sandbox="read-only",
             timeout_seconds=90,
             use_ephemeral=True,
@@ -744,6 +850,51 @@ class CodexExecClientTest(unittest.TestCase):
         self.assertIn("heartbeat", [event["event"] for event in events])
         self.assertEqual(events[-1]["event"], "completed")
 
+    def test_generate_json_object_passes_noninteractive_approval_policy(self):
+        class FakePopen:
+            def __init__(self, *args, **kwargs):
+                self.pid = 43210
+                self.returncode = 0
+
+            def communicate(self, input=None, timeout=None):
+                return (json.dumps({"ok": True}), "")
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        config = StrategyClientConfig(
+            codex_bin="codex",
+            model="gpt-5.4",
+            reasoning_effort="medium",
+            approval_policy="never",
+            sandbox="danger-full-access",
+            timeout_seconds=90,
+            use_ephemeral=True,
+        )
+
+        with mock.patch("codex_exec_client.shutil.which", return_value="/usr/local/bin/codex"):
+            with mock.patch("codex_exec_client.subprocess.Popen", return_value=FakePopen()) as popen:
+                generate_json_object(
+                    prompt="test",
+                    system_prompt="system",
+                    config=config,
+                    text_format={
+                        "type": "json_schema",
+                        "schema": {
+                            "type": "object",
+                            "properties": {"ok": {"type": "boolean"}},
+                            "required": ["ok"],
+                            "additionalProperties": False,
+                        },
+                    },
+                )
+
+        command = popen.call_args.args[0]
+        self.assertEqual(command[:4], ["codex", "-a", "never", "exec"])
+
     def test_generate_json_object_kills_process_group_after_timeout(self):
         class FakePopen:
             def __init__(self, *args, **kwargs):
@@ -770,6 +921,7 @@ class CodexExecClientTest(unittest.TestCase):
             codex_bin="codex",
             model="gpt-5.4",
             reasoning_effort="medium",
+            approval_policy="never",
             sandbox="read-only",
             timeout_seconds=30,
             use_ephemeral=True,
@@ -822,7 +974,9 @@ class DiscordSummaryFormattingTest(unittest.TestCase):
                 "segment_hit_rate": 0.50,
                 "major_segment_count": 22.0,
                 "full_period_return_pct": 123.4,
+                "eval_path_return_pct": 12.3,
                 "eval_avg_return": 1.23,
+                "validation_path_return_pct": 34.5,
                 "validation_avg_return": 45.67,
                 "combined_path_return_pct": 88.9,
                 "overfit_risk_score": 20.0,
@@ -852,15 +1006,18 @@ class DiscordSummaryFormattingTest(unittest.TestCase):
         self.assertIn("评/验命中率", message)
         self.assertIn("评/验趋势段", message)
         self.assertIn("全段连续收益", message)
+        self.assertIn("评估连续收益", message)
+        self.assertIn("验证连续收益", message)
         self.assertIn("评估窗口均值收益", message)
-        self.assertIn("验证整段收益", message)
-        self.assertIn("拼接路径收益", message)
+        self.assertIn("全段趋势/收益分", message)
+        self.assertNotIn("验证整段收益", message)
+        self.assertNotIn("拼接路径收益", message)
         self.assertNotIn("综合路径收益", message)
         self.assertNotIn("| 收益 | 1.23% / 45.67% |", message)
         self.assertLess(message.index("全段连续收益"), message.index("评/验趋势分"))
+        self.assertLess(message.index("评估连续收益"), message.index("评/验趋势分"))
+        self.assertLess(message.index("验证连续收益"), message.index("评/验趋势分"))
         self.assertLess(message.index("评估窗口均值收益"), message.index("评/验趋势分"))
-        self.assertLess(message.index("验证整段收益"), message.index("评/验趋势分"))
-        self.assertLess(message.index("拼接路径收益"), message.index("评/验趋势分"))
 
 
 class ChartRenderingTest(unittest.TestCase):

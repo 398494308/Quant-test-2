@@ -74,7 +74,7 @@ WINDOWS = build_research_windows(RUNTIME.windows)
 DISCORD_CONFIG = load_discord_config()
 EVAL_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "eval")
 VALIDATION_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "validation")
-SCORE_REGIME = "trend_capture_v1"
+SCORE_REGIME = "trend_capture_v3"
 MODEL_WORKSPACE_STRATEGY_PATH = Path("src/strategy_macd_aggressive.py")
 
 best_source = ""
@@ -168,7 +168,7 @@ def reload_strategy_module() -> None:
 
 
 def _model_client_config():
-    return replace(load_strategy_client_config(), sandbox="workspace-write")
+    return replace(load_strategy_client_config(), approval_policy="never", sandbox="danger-full-access")
 
 
 @contextlib.contextmanager
@@ -251,6 +251,13 @@ def _full_period_bounds(windows: list[Any]) -> tuple[str, str]:
     return start_date, end_date
 
 
+def _eval_bounds(windows: list[Any]) -> tuple[str, str]:
+    eval_windows = [window for window in windows if window.group == "eval"]
+    if not eval_windows:
+        raise ValueError("missing eval windows")
+    return eval_windows[0].start_date, eval_windows[-1].end_date
+
+
 def _validation_window() -> Any:
     for window in WINDOWS:
         if window.group == "validation":
@@ -271,6 +278,7 @@ def _run_base_backtests(
     check_at = RUNTIME.early_reject_after_windows
     active_windows = windows or WINDOWS
     runtime_context = prepared_context or _prepare_backtest_context()
+    eval_start_date: str | None = None
 
     for index, window in enumerate(active_windows, start=1):
         write_heartbeat(
@@ -296,8 +304,21 @@ def _run_base_backtests(
 
         if allow_early_reject and window.group == "eval":
             eval_count += 1
+            if eval_start_date is None:
+                eval_start_date = window.start_date
             if eval_count >= check_at and check_at > 0:
-                snapshot = partial_eval_gate_snapshot(results)
+                snapshot_result = backtest_module.backtest_macd_aggressive(
+                    strategy_func=strategy_module.strategy,
+                    intraday_file=backtest_module.DEFAULT_INTRADAY_FILE,
+                    hourly_file=backtest_module.DEFAULT_HOURLY_FILE,
+                    start_date=eval_start_date or window.start_date,
+                    end_date=window.end_date,
+                    strategy_params=strategy_module.PARAMS,
+                    exit_params=backtest_module.EXIT_PARAMS,
+                    include_diagnostics=True,
+                    prepared_context=runtime_context,
+                )
+                snapshot = partial_eval_gate_snapshot(snapshot_result)
                 if (
                     snapshot["segment_count"] >= float(RUNTIME.early_reject_min_segments)
                     and snapshot["trend_score"] < RUNTIME.early_reject_trend_score_threshold
@@ -313,7 +334,7 @@ def _run_base_backtests(
 def _run_full_period_backtest(
     prepared_context: dict[str, Any],
     *,
-    include_diagnostics: bool = False,
+    include_diagnostics: bool = True,
     heartbeat_phase: str = "full_period_eval",
 ) -> dict[str, Any]:
     start_date, end_date = _full_period_bounds(WINDOWS)
@@ -331,6 +352,62 @@ def _run_full_period_backtest(
         hourly_file=backtest_module.DEFAULT_HOURLY_FILE,
         start_date=start_date,
         end_date=end_date,
+        strategy_params=strategy_module.PARAMS,
+        exit_params=backtest_module.EXIT_PARAMS,
+        include_diagnostics=include_diagnostics,
+        prepared_context=prepared_context,
+    )
+
+
+def _run_eval_continuous_backtest(
+    prepared_context: dict[str, Any],
+    *,
+    include_diagnostics: bool = True,
+    heartbeat_phase: str = "eval_continuous",
+) -> dict[str, Any]:
+    start_date, end_date = _eval_bounds(WINDOWS)
+    write_heartbeat(
+        "iteration_running",
+        message=f"iteration {iteration_counter} {heartbeat_phase}",
+        phase=heartbeat_phase,
+        current_window="评估连续",
+        window_index=len(WINDOWS) + 1,
+        window_count=len(WINDOWS) + 2,
+    )
+    return backtest_module.backtest_macd_aggressive(
+        strategy_func=strategy_module.strategy,
+        intraday_file=backtest_module.DEFAULT_INTRADAY_FILE,
+        hourly_file=backtest_module.DEFAULT_HOURLY_FILE,
+        start_date=start_date,
+        end_date=end_date,
+        strategy_params=strategy_module.PARAMS,
+        exit_params=backtest_module.EXIT_PARAMS,
+        include_diagnostics=include_diagnostics,
+        prepared_context=prepared_context,
+    )
+
+
+def _run_validation_continuous_backtest(
+    prepared_context: dict[str, Any],
+    *,
+    include_diagnostics: bool = True,
+    heartbeat_phase: str = "validation_continuous",
+) -> dict[str, Any]:
+    validation_window = _validation_window()
+    write_heartbeat(
+        "iteration_running",
+        message=f"iteration {iteration_counter} {heartbeat_phase}",
+        phase=heartbeat_phase,
+        current_window="验证连续",
+        window_index=len(WINDOWS) + 1,
+        window_count=len(WINDOWS) + 2,
+    )
+    return backtest_module.backtest_macd_aggressive(
+        strategy_func=strategy_module.strategy,
+        intraday_file=backtest_module.DEFAULT_INTRADAY_FILE,
+        hourly_file=backtest_module.DEFAULT_HOURLY_FILE,
+        start_date=validation_window.start_date,
+        end_date=validation_window.end_date,
         strategy_params=strategy_module.PARAMS,
         exit_params=backtest_module.EXIT_PARAMS,
         include_diagnostics=include_diagnostics,
@@ -428,10 +505,14 @@ def evaluate_current_strategy(allow_early_reject: bool = False) -> EvaluationRep
         allow_early_reject=allow_early_reject,
         prepared_context=prepared_context,
     )
+    eval_continuous_result = _run_eval_continuous_backtest(prepared_context)
+    validation_continuous_result = _run_validation_continuous_backtest(prepared_context)
     full_period_result = _run_full_period_backtest(prepared_context)
     return summarize_evaluation(
         base_results,
         RUNTIME.gates,
+        eval_continuous_result=eval_continuous_result,
+        validation_continuous_result=validation_continuous_result,
         full_period_result=full_period_result,
     )
 
@@ -511,7 +592,12 @@ def _build_model_candidate(
 
     prompt = build_strategy_research_prompt(
         evaluation_summary=report.prompt_summary_text,
-        journal_summary=build_journal_prompt_summary(journal_entries, limit=RUNTIME.max_recent_journal_entries, journal_path=RUNTIME.paths.journal_file),
+        journal_summary=build_journal_prompt_summary(
+            journal_entries,
+            limit=RUNTIME.max_recent_journal_entries,
+            journal_path=RUNTIME.paths.journal_file,
+            current_score_regime=SCORE_REGIME,
+        ),
         previous_best_score=report.metrics["promotion_score"],
     )
     with _temporary_cwd(workspace_root):
@@ -752,6 +838,32 @@ def _build_journal_entry(
     }
 
 
+def _record_duplicate_skip(
+    *,
+    iteration_id: int,
+    candidate: StrategyCandidate,
+    base_source: str,
+    stop_stage: str,
+    gate_reason: str,
+    note: str,
+) -> None:
+    append_journal_entry(
+        RUNTIME.paths.journal_file,
+        _build_journal_entry(
+            iteration_id=iteration_id,
+            candidate=candidate,
+            base_source=base_source,
+            candidate_report=None,
+            outcome="duplicate_skipped",
+            stop_stage=stop_stage,
+            gate_reason=gate_reason,
+            note=note,
+        ),
+    )
+    if maybe_compact(RUNTIME.paths.journal_file):
+        log_info("研究日志已压缩")
+
+
 def _activate_candidate(candidate: StrategyCandidate) -> None:
     write_strategy_source(RUNTIME.paths.strategy_backup_file, candidate.strategy_code)
     write_strategy_source(RUNTIME.paths.strategy_file, candidate.strategy_code)
@@ -850,16 +962,40 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
         journal_entries = load_journal_entries(RUNTIME.paths.journal_file)
 
         if candidate_hash == source_hash(best_source):
+            _record_duplicate_skip(
+                iteration_id=iteration_id,
+                candidate=candidate,
+                base_source=best_source,
+                stop_stage="duplicate_source",
+                gate_reason="候选源码与当前最优完全相同",
+                note="模型未产生有效代码改动；本轮按重复探索记入研究历史。",
+            )
             log_info(f"第 {iteration_id} 轮跳过: 候选源码与当前最优完全相同")
             write_heartbeat("iteration_skipped", message=f"iteration {iteration_id} duplicate source")
             return "duplicate_skipped"
         if has_recent_code_hash(journal_entries, candidate_hash):
+            _record_duplicate_skip(
+                iteration_id=iteration_id,
+                candidate=candidate,
+                base_source=best_source,
+                stop_stage="duplicate_history",
+                gate_reason="候选源码命中最近研究历史",
+                note="模型重复产出了最近已出现过的候选源码；本轮按重复探索记入研究历史。",
+            )
             log_info(f"第 {iteration_id} 轮跳过: 候选源码命中最近研究历史")
             write_heartbeat("iteration_skipped", message=f"iteration {iteration_id} duplicate journal hash")
             return "duplicate_skipped"
 
         diff_summary = build_diff_summary(best_source, candidate.strategy_code, limit=12)
         if not diff_summary:
+            _record_duplicate_skip(
+                iteration_id=iteration_id,
+                candidate=candidate,
+                base_source=best_source,
+                stop_stage="empty_diff",
+                gate_reason="候选没有产生有效 diff",
+                note="候选虽然通过了解析，但没有形成可验证的有效改动；本轮按重复探索记入研究历史。",
+            )
             log_info(f"第 {iteration_id} 轮跳过: 候选没有产生有效 diff")
             write_heartbeat("iteration_skipped", message=f"iteration {iteration_id} empty diff")
             return "duplicate_skipped"

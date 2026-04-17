@@ -93,6 +93,7 @@ def build_strategy_research_prompt(
 - `15m` 执行，`1h + 4h` 做趋势确认。
 - 目标是尽快抓到 BTC 的大上涨或大下跌，尽量陪跑主趋势，并在掉头时退出或反手。
 - 允许较大波动、较大回撤，甚至允许个别阶段爆仓；不要为了“看起来更平滑”而牺牲大趋势捕获能力。
+- 当前评分口径已经放宽到更细的 `4h` 趋势段，约 `5%` 级别的单边行情也算应当抓住的有效机会；不要只盯超大波段。
 
 你的目标不是机械拨参数，而是围绕一个清晰假设，修改 `src/strategy_macd_aggressive.py`，提升这套策略对大趋势的捕获能力。
 
@@ -111,25 +112,25 @@ def build_strategy_research_prompt(
 - 除 `src/strategy_macd_aggressive.py` 外，不要创建、修改或删除其他文件
 
 门禁规则（触碰即淘汰）：
-- eval 大趋势段数 >= 8
-- validation 大趋势段数 >= 3
-- eval 趋势段命中率 >= 35%
-- validation 趋势段命中率 >= 25%
+- eval 大趋势段数 >= 18
+- validation 大趋势段数 >= 8
+- eval 趋势段命中率 >= 40%
+- validation 趋势段命中率 >= 35%
 - eval 趋势捕获分 >= 0.10
-- validation 趋势捕获分 >= 0.00
-- eval 与 validation 的趋势捕获落差 <= 0.45
-- 综合多头捕获分 >= -0.10
-- 综合空头捕获分 >= -0.10
+- validation 趋势捕获分 >= 0.05
+- eval 与 validation 的趋势捕获落差 <= 0.60
+- 全段连续多头捕获分 >= -0.10
+- 全段连续空头捕获分 >= -0.10
 - 手续费拖累 <= 8%
 - 严重过拟合风险会直接淘汰；如果结果主要依赖少数同类行情、单一同向链或明显多空偏科，即使分数高也不能通过
 
 评分方式：
-- 主评分口径是 `trend_capture_v1`
+- 主评分口径是 `trend_capture_v3`
 - 先在唯一时间轴上识别 BTC 的大趋势段，再把每段拆成“到来 / 陪跑 / 掉头”三部分
 - `trend_capture_score` 衡量：是否及时跟上、是否陪跑主趋势、是否在掉头时跑掉或反手
-- `return_score` 衡量：整段路径最后把资金放大了多少
+- `return_score` 衡量：连续路径最后把资金放大了多少
 - `quality_score` = `0.70 * eval_trend_capture_score + 0.30 * eval_return_score`
-- `promotion_score` = `0.70 * combined_trend_capture_score + 0.30 * combined_return_score`
+- `promotion_score` = `0.70 * full_period_trend_capture_score + 0.30 * full_period_return_score`
 - 爆仓和回撤现在是诊断项，不是主评分，也不是单独惩罚项
 - 你看不到 validation 的逐项细节，但 gate 会告诉你是否通过
 
