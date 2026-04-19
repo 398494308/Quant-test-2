@@ -75,8 +75,28 @@ def _prepare_bt_state(
     ema_anchor: int | None = None,
 ) -> tuple[DataFrame, list[dict]]:
     frame = _with_timestamp(dataframe).sort_values("timestamp").reset_index(drop=True)
+    if "trade_count" not in frame.columns:
+        frame["trade_count"] = 0.0
+    if "taker_buy_volume" not in frame.columns:
+        frame["taker_buy_volume"] = pd.to_numeric(frame["volume"], errors="coerce").fillna(0.0) * 0.5
+    if "taker_sell_volume" not in frame.columns:
+        volume_series = pd.to_numeric(frame["volume"], errors="coerce").fillna(0.0)
+        taker_buy_series = pd.to_numeric(frame["taker_buy_volume"], errors="coerce").fillna(0.0)
+        frame["taker_sell_volume"] = (volume_series - taker_buy_series).clip(lower=0.0)
     bt_rows = (
-        frame[["timestamp", "open", "high", "low", "close", "volume"]]
+        frame[
+            [
+                "timestamp",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "trade_count",
+                "taker_buy_volume",
+                "taker_sell_volume",
+            ]
+        ]
         .assign(timestamp=lambda item: item["timestamp"].astype("int64"))
         .to_dict("records")
     )
@@ -107,6 +127,13 @@ def _apply_trend_columns(dataframe: DataFrame, ema_fast: int, ema_slow: int, ema
 
 def _apply_intraday_indicators(dataframe: DataFrame) -> DataFrame:
     frame, state = _prepare_bt_state(dataframe, P["intraday_ema_fast"], P["intraday_ema_slow"])
+    frame["trade_count"] = [item["trade_count"] for item in state]
+    frame["trade_count_ratio"] = [item["trade_count_ratio"] for item in state]
+    frame["taker_buy_volume"] = [item["taker_buy_volume"] for item in state]
+    frame["taker_sell_volume"] = [item["taker_sell_volume"] for item in state]
+    frame["taker_buy_ratio"] = [item["taker_buy_ratio"] for item in state]
+    frame["taker_sell_ratio"] = [item["taker_sell_ratio"] for item in state]
+    frame["flow_imbalance"] = [item["flow_imbalance"] for item in state]
     frame["ema_fast"] = [item["ema_fast"] for item in state]
     frame["ema_slow"] = [item["ema_slow"] for item in state]
     frame["trend_spread_pct"] = [item["trend_spread_pct"] for item in state]
@@ -140,6 +167,11 @@ def _apply_hourly_indicators(dataframe: DataFrame) -> DataFrame:
     frame["ema_fast"] = [item["ema_fast"] for item in state]
     frame["ema_slow"] = [item["ema_slow"] for item in state]
     frame["ema_anchor"] = [item["ema_anchor"] for item in state]
+    frame["trade_count"] = [item["trade_count"] for item in state]
+    frame["trade_count_ratio"] = [item["trade_count_ratio"] for item in state]
+    frame["taker_buy_ratio"] = [item["taker_buy_ratio"] for item in state]
+    frame["taker_sell_ratio"] = [item["taker_sell_ratio"] for item in state]
+    frame["flow_imbalance"] = [item["flow_imbalance"] for item in state]
     frame["trend_spread_pct"] = [item["trend_spread_pct"] for item in state]
     frame["ema_slow_slope_pct"] = [item["ema_slow_slope_pct"] for item in state]
     frame["adx"] = [item["adx"] for item in state]
@@ -154,6 +186,11 @@ def _apply_fourh_indicators(dataframe: DataFrame) -> DataFrame:
     frame, state = _prepare_bt_state(dataframe, P["fourh_ema_fast"], P["fourh_ema_slow"])
     frame["ema_fast"] = [item["ema_fast"] for item in state]
     frame["ema_slow"] = [item["ema_slow"] for item in state]
+    frame["trade_count"] = [item["trade_count"] for item in state]
+    frame["trade_count_ratio"] = [item["trade_count_ratio"] for item in state]
+    frame["taker_buy_ratio"] = [item["taker_buy_ratio"] for item in state]
+    frame["taker_sell_ratio"] = [item["taker_sell_ratio"] for item in state]
+    frame["flow_imbalance"] = [item["flow_imbalance"] for item in state]
     frame["trend_spread_pct"] = [item["trend_spread_pct"] for item in state]
     frame["ema_slow_slope_pct"] = [item["ema_slow_slope_pct"] for item in state]
     frame["adx"] = [item["adx"] for item in state]
@@ -197,7 +234,32 @@ def apply_entry_logic(dataframe: DataFrame) -> DataFrame:
     frame["enter_long"] = 0
     frame["enter_short"] = 0
     frame["enter_tag"] = None
-    ohlcv = frame[["open", "high", "low", "close", "volume"]].to_dict("records")
+    for column, default in (
+        ("trade_count", 0.0),
+        ("taker_buy_volume", None),
+        ("taker_sell_volume", None),
+    ):
+        if column not in frame.columns:
+            if column == "taker_buy_volume":
+                frame[column] = pd.to_numeric(frame["volume"], errors="coerce").fillna(0.0) * 0.5
+            elif column == "taker_sell_volume":
+                volume_series = pd.to_numeric(frame["volume"], errors="coerce").fillna(0.0)
+                taker_buy_series = pd.to_numeric(frame.get("taker_buy_volume"), errors="coerce").fillna(0.0)
+                frame[column] = (volume_series - taker_buy_series).clip(lower=0.0)
+            else:
+                frame[column] = default
+    ohlcv = frame[
+        [
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "trade_count",
+            "taker_buy_volume",
+            "taker_sell_volume",
+        ]
+    ].to_dict("records")
     signals: list[str | None] = []
     for idx in range(len(frame)):
         row = frame.iloc[idx]
@@ -215,10 +277,41 @@ def apply_entry_logic(dataframe: DataFrame) -> DataFrame:
     return frame
 
 
-def build_signal_frame(df_15m: DataFrame, df_1h: DataFrame, df_4h: DataFrame) -> DataFrame:
+def _aggregate_dataframe(dataframe: DataFrame, bars_per_bucket: int) -> DataFrame:
+    frame = _with_timestamp(dataframe).sort_values("timestamp").reset_index(drop=True)
+    if "trade_count" not in frame.columns:
+        frame["trade_count"] = 0.0
+    if "taker_buy_volume" not in frame.columns:
+        frame["taker_buy_volume"] = pd.to_numeric(frame["volume"], errors="coerce").fillna(0.0) * 0.5
+    if "taker_sell_volume" not in frame.columns:
+        volume_series = pd.to_numeric(frame["volume"], errors="coerce").fillna(0.0)
+        taker_buy_series = pd.to_numeric(frame["taker_buy_volume"], errors="coerce").fillna(0.0)
+        frame["taker_sell_volume"] = (volume_series - taker_buy_series).clip(lower=0.0)
+    rows = (
+        frame[
+            [
+                "timestamp",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "trade_count",
+                "taker_buy_volume",
+                "taker_sell_volume",
+            ]
+        ]
+        .assign(timestamp=lambda item: item["timestamp"].astype("int64"))
+        .to_dict("records")
+    )
+    aggregated = backtest_module._aggregate_bars(rows, bars_per_bucket)
+    return pd.DataFrame(aggregated)
+
+
+def build_signal_frame(df_15m: DataFrame, df_1h: DataFrame | None = None, df_4h: DataFrame | None = None) -> DataFrame:
     df_15m = df_15m.copy()
-    df_1h = df_1h.copy()
-    df_4h = df_4h.copy()
+    df_1h = _aggregate_dataframe(df_15m, 4)
+    df_4h = _aggregate_dataframe(df_15m, 16)
     for dataset in (df_15m, df_1h, df_4h):
         dataset["timestamp"] = pd.to_numeric(dataset["timestamp"], errors="coerce").astype("Int64")
 
@@ -236,6 +329,10 @@ def build_signal_frame(df_15m: DataFrame, df_1h: DataFrame, df_4h: DataFrame) ->
             "ema_fast",
             "ema_slow",
             "ema_anchor",
+            "trade_count_ratio",
+            "taker_buy_ratio",
+            "taker_sell_ratio",
+            "flow_imbalance",
             "macd_line",
             "macd_signal",
             "histogram",
@@ -251,7 +348,19 @@ def build_signal_frame(df_15m: DataFrame, df_1h: DataFrame, df_4h: DataFrame) ->
         merged,
         fourh,
         "4h",
-        ["timestamp", "close", "ema_fast", "ema_slow", "adx", "trend_spread_pct", "ema_slow_slope_pct"],
+        [
+            "timestamp",
+            "close",
+            "ema_fast",
+            "ema_slow",
+            "trade_count_ratio",
+            "taker_buy_ratio",
+            "taker_sell_ratio",
+            "flow_imbalance",
+            "adx",
+            "trend_spread_pct",
+            "ema_slow_slope_pct",
+        ],
         base_timeframe="15m",
         informative_timeframe="4h",
     )
@@ -296,6 +405,10 @@ def _row_to_market_state(row: pd.Series, prev_row: pd.Series | None = None) -> d
             "macd_signal_1h",
             "histogram_1h",
             "adx_1h",
+            "trade_count_ratio_1h",
+            "taker_buy_ratio_1h",
+            "taker_sell_ratio_1h",
+            "flow_imbalance_1h",
             "trend_spread_pct_1h",
             "ema_slow_slope_pct_1h",
             "chop_1h",
@@ -310,6 +423,10 @@ def _row_to_market_state(row: pd.Series, prev_row: pd.Series | None = None) -> d
             "macd_line": _safe_float(row.get("macd_line_1h")),
             "signal_line": _safe_float(row.get("macd_signal_1h")),
             "adx": _safe_float(row.get("adx_1h")),
+            "trade_count_ratio": _safe_float(row.get("trade_count_ratio_1h"), 1.0),
+            "taker_buy_ratio": _safe_float(row.get("taker_buy_ratio_1h"), 0.5),
+            "taker_sell_ratio": _safe_float(row.get("taker_sell_ratio_1h"), 0.5),
+            "flow_imbalance": _safe_float(row.get("flow_imbalance_1h")),
             "trend_spread_pct": _safe_float(row.get("trend_spread_pct_1h")),
             "ema_slow_slope_pct": _safe_float(row.get("ema_slow_slope_pct_1h")),
             "chop": _safe_float(row.get("chop_1h")),
@@ -327,6 +444,10 @@ def _row_to_market_state(row: pd.Series, prev_row: pd.Series | None = None) -> d
             "macd_signal_1h",
             "histogram_1h",
             "adx_1h",
+            "trade_count_ratio_1h",
+            "taker_buy_ratio_1h",
+            "taker_sell_ratio_1h",
+            "flow_imbalance_1h",
             "trend_spread_pct_1h",
             "ema_slow_slope_pct_1h",
             "chop_1h",
@@ -341,6 +462,10 @@ def _row_to_market_state(row: pd.Series, prev_row: pd.Series | None = None) -> d
             "macd_line": _safe_float(prev.get("macd_line_1h")),
             "signal_line": _safe_float(prev.get("macd_signal_1h")),
             "adx": _safe_float(prev.get("adx_1h")),
+            "trade_count_ratio": _safe_float(prev.get("trade_count_ratio_1h"), 1.0),
+            "taker_buy_ratio": _safe_float(prev.get("taker_buy_ratio_1h"), 0.5),
+            "taker_sell_ratio": _safe_float(prev.get("taker_sell_ratio_1h"), 0.5),
+            "flow_imbalance": _safe_float(prev.get("flow_imbalance_1h")),
             "trend_spread_pct": _safe_float(prev.get("trend_spread_pct_1h")),
             "ema_slow_slope_pct": _safe_float(prev.get("ema_slow_slope_pct_1h")),
             "chop": _safe_float(prev.get("chop_1h")),
@@ -353,6 +478,10 @@ def _row_to_market_state(row: pd.Series, prev_row: pd.Series | None = None) -> d
             "close_4h",
             "ema_fast_4h",
             "ema_slow_4h",
+            "trade_count_ratio_4h",
+            "taker_buy_ratio_4h",
+            "taker_sell_ratio_4h",
+            "flow_imbalance_4h",
             "adx_4h",
             "trend_spread_pct_4h",
             "ema_slow_slope_pct_4h",
@@ -362,6 +491,10 @@ def _row_to_market_state(row: pd.Series, prev_row: pd.Series | None = None) -> d
             "close": _safe_float(row.get("close_4h")),
             "ema_fast": _safe_float(row.get("ema_fast_4h")),
             "ema_slow": _safe_float(row.get("ema_slow_4h")),
+            "trade_count_ratio": _safe_float(row.get("trade_count_ratio_4h"), 1.0),
+            "taker_buy_ratio": _safe_float(row.get("taker_buy_ratio_4h"), 0.5),
+            "taker_sell_ratio": _safe_float(row.get("taker_sell_ratio_4h"), 0.5),
+            "flow_imbalance": _safe_float(row.get("flow_imbalance_4h")),
             "adx": _safe_float(row.get("adx_4h")),
             "trend_spread_pct": _safe_float(row.get("trend_spread_pct_4h")),
             "ema_slow_slope_pct": _safe_float(row.get("ema_slow_slope_pct_4h")),
@@ -378,6 +511,13 @@ def _row_to_market_state(row: pd.Series, prev_row: pd.Series | None = None) -> d
         "adx": _safe_float(row.get("adx")),
         "atr": _safe_float(row.get("atr")),
         "atr_ratio": _safe_float(row.get("atr_ratio")),
+        "trade_count": _safe_float(row.get("trade_count")),
+        "trade_count_ratio": _safe_float(row.get("trade_count_ratio"), 1.0),
+        "taker_buy_volume": _safe_float(row.get("taker_buy_volume")),
+        "taker_sell_volume": _safe_float(row.get("taker_sell_volume")),
+        "taker_buy_ratio": _safe_float(row.get("taker_buy_ratio"), 0.5),
+        "taker_sell_ratio": _safe_float(row.get("taker_sell_ratio"), 0.5),
+        "flow_imbalance": _safe_float(row.get("flow_imbalance")),
         "rsi": _safe_float(row.get("rsi")),
         "chop": _safe_float(row.get("chop")),
         "macd_line": _safe_float(row.get("macd_line")),

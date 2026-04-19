@@ -16,14 +16,15 @@
 
 1. 读取当前最优策略。
 2. 创建临时 workspace，把当前最优策略复制到里面。
-3. 把“当前诊断 + 方向风险表 + 过拟合风险表 + 最近轮次摘要 + 压缩历史弱参考”喂给模型。
+3. 把“当前诊断 + 方向风险表 + 方向冷却表 + 过拟合风险表 + 最近轮次摘要 + 压缩历史弱参考”喂给模型。
 4. 模型只允许改 `src/strategy_macd_aggressive.py` 的可编辑区域，并在 workspace 里原地改文件。
 5. 主进程校验候选只修改了允许区域。
-6. 先跑少量 `smoke` 窗口；如果运行报错，会在同一轮进入 repair loop，而不是直接开始下一轮。
-7. `smoke` 通过后，再跑整套 `development walk-forward + validation`。
-8. 只有 `gate` 通过，且 `promotion_score` 至少比当前最优高 `0.02`，才刷新 best。
-9. 刷新 best 之后，才会额外跑一次隐藏 `test`；它只做验收，不参与 best 选择，也不会喂给模型。
-10. 每轮结果都会写进 journal，包含 `accepted / rejected / duplicate_skipped / early_rejected / runtime_failed`。
+6. 先做评估前硬约束检查；如果候选仍然是同簇低变化近邻，或命中锁簇，会在同一轮直接强制重生，而不是白跑评估。
+7. 通过前置检查后，先跑少量 `smoke` 窗口；如果运行报错，会在同一轮进入 repair loop，而不是直接开始下一轮。
+8. `smoke` 通过后，再跑整套 `development walk-forward + validation`。
+9. 只有 `gate` 通过，且 `promotion_score` 至少比当前最优高 `0.02`，才刷新 best。
+10. 刷新 best 之后，才会额外跑一次隐藏 `test`；它只做验收，不参与 best 选择，也不会喂给模型。
+11. 每轮结果都会写进 journal，包含 `accepted / rejected / duplicate_skipped / exploration_blocked / early_rejected / runtime_failed`。
 
 ## 当前评分口径
 
@@ -128,11 +129,17 @@
 
 当前策略仍然是：
 
-- `15m` 执行
-- `1h + 4h` 做趋势确认
-- 横盘环境尽量少做
+- `15m` 是唯一事实源
+- `1h + 4h` 只是由 `15m` 聚合出来的趋势确认层
+- 横盘环境尽量少做；突破不只看总成交量，也会看主动买卖量和成交活跃度
 - 开仓后带 ATR 初始止损、保本、TP1、移动止损、趋势失效退出、时间退出
 - 允许有限次加仓
+
+数据下载脚本现在会先下载 `15m`，再由它派生 `1h` 和 `4h`。如果本地还是旧版 CSV，需要重新执行：
+
+```bash
+python3 scripts/download_aggressive_data.py
+```
 
 回测器当前已包含：
 
@@ -144,6 +151,12 @@
 - TP1 分批结算
 
 交易统计口径已经是“整笔仓位”，不会再把 `TP1` 当成独立 trade。
+
+研究器现在还带了新的防局部最优保护：
+
+- 如果候选只是落在同一方向簇里的低变化近邻，系统会在评估前直接拦截
+- 被拦截后不会立刻浪费下一轮，而是会在同一轮里强制重生候选
+- 如果同一方向簇反复触发该问题，会进入短期冷却锁，默认是 `3 -> 6 -> 10` 轮递增
 
 ## Discord 播报说明
 

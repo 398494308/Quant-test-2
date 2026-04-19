@@ -11,9 +11,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_INTRADAY_FILE = REPO_ROOT / "data/price/BTCUSDT_futures_15m_20230101_20260401.csv"
 DEFAULT_HOURLY_FILE = REPO_ROOT / "data/price/BTCUSDT_futures_1h_20230101_20260401.csv"
+DEFAULT_FOURH_FILE = REPO_ROOT / "data/price/BTCUSDT_futures_4h_20230101_20260401.csv"
 DEFAULT_EXECUTION_FILE = REPO_ROOT / "data/price/BTCUSDT_futures_1m_20230101_20260401.csv"
 DEFAULT_SENTIMENT_FILE = REPO_ROOT / "data/index/crypto_fear_greed_daily_20230101_20260401.csv"
-DEFAULT_FUNDING_FILE = REPO_ROOT / "data/funding/OKX_BTC_USDT_SWAP_funding_20230101_20260401.csv"
+DEFAULT_FUNDING_FILE = REPO_ROOT / "data/funding/BTCUSDT_futures_funding_20230101_20260401.csv"
 
 
 # EXIT_PARAMS_START
@@ -93,12 +94,32 @@ def _position_side(position):
     return _signal_side(position.get("entry_signal", "long_breakout"))
 
 
+def _infer_data_venue(filename):
+    name = Path(str(filename)).name.lower()
+    if "okx" in name:
+        return "okx"
+    if "binance" in name or "btcusdt_futures" in name:
+        return "binance"
+    return "unknown"
+
+
 @lru_cache(maxsize=12)
 def load_ohlcv_data(filename):
     data = []
     with open(filename, "r") as handle:
         reader = csv.DictReader(handle)
         for row in reader:
+            if "trade_count" not in row or "taker_buy_volume" not in row:
+                raise ValueError(
+                    f"{filename} missing flow columns; rerun scripts/download_aggressive_data.py to regenerate 15m/1m data"
+                )
+            volume = float(row["volume"])
+            taker_buy_volume = float(row["taker_buy_volume"])
+            taker_sell_volume = row.get("taker_sell_volume")
+            if taker_sell_volume in (None, ""):
+                taker_sell_volume_value = max(volume - taker_buy_volume, 0.0)
+            else:
+                taker_sell_volume_value = float(taker_sell_volume)
             data.append(
                 {
                     "timestamp": int(row["timestamp"]),
@@ -106,7 +127,10 @@ def load_ohlcv_data(filename):
                     "high": float(row["high"]),
                     "low": float(row["low"]),
                     "close": float(row["close"]),
-                    "volume": float(row["volume"]),
+                    "volume": volume,
+                    "trade_count": float(row["trade_count"]),
+                    "taker_buy_volume": taker_buy_volume,
+                    "taker_sell_volume": taker_sell_volume_value,
                 }
             )
     return data
@@ -304,12 +328,27 @@ def _choppiness_series(data, length=14):
     return output
 
 
+def _rolling_mean_series(values, length):
+    window = max(1, int(length))
+    output = []
+    running = 0.0
+    for idx, value in enumerate(values):
+        running += value
+        if idx >= window:
+            running -= values[idx - window]
+        output.append(running / min(idx + 1, window))
+    return output
+
+
 def _aggregate_bars(data, bars_per_bucket):
     buckets = []
     current = []
     for row in data:
         current.append(row)
         if len(current) == bars_per_bucket:
+            volume = sum(item["volume"] for item in current)
+            taker_buy_volume = sum(item.get("taker_buy_volume", 0.0) for item in current)
+            taker_sell_volume = sum(item.get("taker_sell_volume", 0.0) for item in current)
             buckets.append(
                 {
                     "timestamp": current[0]["timestamp"],
@@ -317,15 +356,34 @@ def _aggregate_bars(data, bars_per_bucket):
                     "high": max(item["high"] for item in current),
                     "low": min(item["low"] for item in current),
                     "close": current[-1]["close"],
-                    "volume": sum(item["volume"] for item in current),
+                    "volume": volume,
+                    "trade_count": sum(item.get("trade_count", 0.0) for item in current),
+                    "taker_buy_volume": taker_buy_volume,
+                    "taker_sell_volume": taker_sell_volume,
                 }
             )
             current = []
     return buckets
 
 
-def _prepare_state(data, ema_fast_len, ema_slow_len, macd_fast, macd_slow, macd_signal, ema_anchor_len=None):
+def _prepare_state(
+    data,
+    ema_fast_len,
+    ema_slow_len,
+    macd_fast,
+    macd_slow,
+    macd_signal,
+    ema_anchor_len=None,
+    flow_lookback=9,
+):
     closes = [row["close"] for row in data]
+    volumes = [row["volume"] for row in data]
+    trade_counts = [max(row.get("trade_count", 0.0), 0.0) for row in data]
+    taker_buy_volumes = [max(row.get("taker_buy_volume", 0.0), 0.0) for row in data]
+    taker_sell_volumes = [
+        max(row.get("taker_sell_volume", max(row["volume"] - row.get("taker_buy_volume", 0.0), 0.0)), 0.0)
+        for row in data
+    ]
     ema_fast, ema_slow, macd_line, signal_line, histogram = _macd_series(
         closes,
         macd_fast,
@@ -339,14 +397,28 @@ def _prepare_state(data, ema_fast_len, ema_slow_len, macd_fast, macd_slow, macd_
     adx = _adx_series(data, 14)
     rsi = _rsi_series(closes, 14)
     chop = _choppiness_series(data, 14)
+    avg_trade_counts = _rolling_mean_series(trade_counts, flow_lookback)
     output = []
     for idx, row in enumerate(data):
         prev_slow = trend_slow[idx - 1] if idx > 0 else trend_slow[idx]
         trend_base = max(abs(trend_slow[idx]), row["close"] * 1e-9)
+        volume_base = max(volumes[idx], 1e-9)
+        taker_buy_volume = taker_buy_volumes[idx]
+        taker_sell_volume = taker_sell_volumes[idx]
+        trade_count = trade_counts[idx]
         output.append(
             {
                 "timestamp": row["timestamp"],
                 "close": row["close"],
+                "volume": row["volume"],
+                "trade_count": trade_count,
+                "avg_trade_count": avg_trade_counts[idx],
+                "trade_count_ratio": trade_count / max(avg_trade_counts[idx], 1e-9),
+                "taker_buy_volume": taker_buy_volume,
+                "taker_sell_volume": taker_sell_volume,
+                "taker_buy_ratio": taker_buy_volume / volume_base,
+                "taker_sell_ratio": taker_sell_volume / volume_base,
+                "flow_imbalance": (taker_buy_volume - taker_sell_volume) / volume_base,
                 "ema_fast": trend_fast[idx],
                 "ema_slow": trend_slow[idx],
                 "ema_anchor": trend_anchor[idx],
@@ -485,6 +557,55 @@ def _close_cash_release(position_size, gross_pnl_amount, exit_fee=0.0, funding_p
     return position_size + gross_pnl_amount + funding_pnl - exit_fee
 
 
+def _settle_full_position(position, price, reason, leverage, exit_p):
+    exit_notional = _position_notional(position, price, leverage)
+    exit_fee = _trading_fee_amount(exit_notional, exit_p)
+    allocated_entry_fee = position.get("entry_fee_paid", 0.0)
+    allocated_funding = position.get("funding_pnl", 0.0)
+    trade, gross_pnl_amount = _close_trade(
+        position,
+        price,
+        reason,
+        leverage,
+        allocated_entry_fee=allocated_entry_fee,
+        exit_fee=exit_fee,
+        funding_pnl=allocated_funding,
+    )
+    cash_release = _close_cash_release(
+        position["size"],
+        gross_pnl_amount,
+        exit_fee=exit_fee,
+        funding_pnl=allocated_funding,
+    )
+    return trade, gross_pnl_amount, cash_release, exit_fee
+
+
+def _settle_partial_position(position, close_size, price, reason, leverage, exit_p):
+    close_fraction = close_size / max(position["size"], 1e-9)
+    allocated_entry_fee = position.get("entry_fee_paid", 0.0) * close_fraction
+    allocated_funding = position.get("funding_pnl", 0.0) * close_fraction
+    partial_position = dict(position)
+    partial_position["size"] = close_size
+    exit_notional = _position_notional(partial_position, price, leverage)
+    exit_fee = _trading_fee_amount(exit_notional, exit_p)
+    trade, gross_pnl_amount = _close_trade(
+        partial_position,
+        price,
+        reason,
+        leverage,
+        allocated_entry_fee=allocated_entry_fee,
+        exit_fee=exit_fee,
+        funding_pnl=allocated_funding,
+    )
+    cash_release = _close_cash_release(
+        close_size,
+        gross_pnl_amount,
+        exit_fee=exit_fee,
+        funding_pnl=allocated_funding,
+    )
+    return trade, gross_pnl_amount, cash_release, exit_fee, allocated_entry_fee, allocated_funding
+
+
 def _apply_trade_leg_rollup(position, trade):
     position["realized_pnl_amount"] = position.get("realized_pnl_amount", 0.0) + trade["pnl_amount"]
     position["realized_gross_pnl_amount"] = (
@@ -540,6 +661,86 @@ def _refresh_stop_after_resize(position, market_state, exit_p, leverage):
         position["stop_price"] = min(position["stop_price"], refreshed_stop)
     else:
         position["stop_price"] = max(position["stop_price"], refreshed_stop)
+
+
+def _update_protective_stops(position, exit_p, leverage):
+    side = _position_side(position)
+    break_even_activation_pct = float(_exit_value(exit_p, position, "break_even_activation_pct"))
+    if position["peak_pnl_pct"] >= break_even_activation_pct:
+        if side == "short":
+            breakeven_price = position["entry_price"] * (1.0 - float(exit_p["break_even_buffer_pct"]) / 100.0)
+            position["stop_price"] = min(position["stop_price"], breakeven_price)
+        else:
+            breakeven_price = position["entry_price"] * (1.0 + float(exit_p["break_even_buffer_pct"]) / 100.0)
+            position["stop_price"] = max(position["stop_price"], breakeven_price)
+
+    trailing_activation_pct = float(_exit_value(exit_p, position, "trailing_activation_pct"))
+    trailing_giveback_pct = float(_exit_value(exit_p, position, "trailing_giveback_pct"))
+    if position["peak_pnl_pct"] < trailing_activation_pct:
+        return
+    trailing_gap_raw = trailing_giveback_pct / leverage / 100.0
+    if side == "short":
+        trailing_price = position["favorable_price"] * (1.0 + trailing_gap_raw)
+        position["stop_price"] = min(position["stop_price"], trailing_price)
+    else:
+        trailing_price = position["favorable_price"] * (1.0 - trailing_gap_raw)
+        position["stop_price"] = max(position["stop_price"], trailing_price)
+
+
+def _subbars_for_window_bar(bar, execution_rows, execution_timestamps, bar_interval_ms):
+    if execution_rows and execution_timestamps and bar_interval_ms > 0:
+        start_idx, end_idx = _timestamp_window_indices_inclusive(
+            execution_timestamps,
+            bar["timestamp"],
+            bar["timestamp"] + max(bar_interval_ms, 1) - 1,
+        )
+        subbars = execution_rows[start_idx:end_idx]
+        if subbars:
+            return subbars
+    return [bar]
+
+
+def _subbar_close_ts(subbar, default_interval_ms, bar_close_ts):
+    interval_ms = default_interval_ms if default_interval_ms > 0 else bar_close_ts - subbar["timestamp"]
+    if interval_ms <= 0:
+        return bar_close_ts
+    return min(bar_close_ts, subbar["timestamp"] + interval_ms)
+
+
+def _funding_interval_ms(funding_timestamps):
+    if len(funding_timestamps) < 2:
+        return 8 * 60 * 60 * 1000
+    deltas = [
+        funding_timestamps[idx] - funding_timestamps[idx - 1]
+        for idx in range(1, len(funding_timestamps))
+        if funding_timestamps[idx] > funding_timestamps[idx - 1]
+    ]
+    return min(deltas) if deltas else 8 * 60 * 60 * 1000
+
+
+def _validate_funding_window_coverage(funding_timestamps, start_ts, end_ts):
+    if not funding_timestamps:
+        raise ValueError("funding enabled but funding data is empty")
+    interval_ms = _funding_interval_ms(funding_timestamps)
+    if funding_timestamps[0] > start_ts + interval_ms:
+        raise ValueError("funding data starts too late for requested window")
+    if funding_timestamps[-1] < end_ts - interval_ms:
+        raise ValueError("funding data ends too early for requested window")
+    max_gap = interval_ms + interval_ms // 2
+    for idx in range(1, len(funding_timestamps)):
+        if funding_timestamps[idx] - funding_timestamps[idx - 1] > max_gap:
+            raise ValueError("funding data has gaps inside requested window")
+
+
+def _intrabar_tp1_first(position, subbar, leverage, exit_p):
+    if position.get("tp1_done"):
+        return False
+    side = _position_side(position)
+    tp1_pnl_pct = float(_exit_value(exit_p, position, "tp1_pnl_pct"))
+    tp1_trigger = _tp_trigger_price(position["entry_price"], tp1_pnl_pct, leverage, side)
+    if side == "short":
+        return subbar["low"] <= tp1_trigger
+    return subbar["high"] >= tp1_trigger
 
 
 def _market_risk_profile(market_state, exit_p):
@@ -809,13 +1010,12 @@ def prepare_backtest_context(
         exit_p.update(exit_params)
 
     intraday_file = str(intraday_file or DEFAULT_INTRADAY_FILE)
-    hourly_file = str(hourly_file or DEFAULT_HOURLY_FILE)
     sentiment_file = str(sentiment_file or DEFAULT_SENTIMENT_FILE)
     execution_file = str(execution_file or DEFAULT_EXECUTION_FILE)
     funding_file = str(funding_file or DEFAULT_FUNDING_FILE)
 
     intraday_all = load_ohlcv_data(intraday_file)
-    hourly_all = load_ohlcv_data(hourly_file)
+    hourly_all = _aggregate_bars(intraday_all, 4)
     if not intraday_all or not hourly_all:
         raise ValueError("missing source data")
 
@@ -828,18 +1028,35 @@ def prepare_backtest_context(
 
     intraday_interval_ms = _infer_interval_ms(intraday_all, 15)
     hourly_interval_ms = _infer_interval_ms(hourly_all, 60)
+    execution_interval_ms = 60_000
 
     execution_all = []
     execution_timestamps = []
     if Path(execution_file).exists() and int(exit_p.get("execution_use_1m", 1)) > 0:
         execution_all = load_ohlcv_data(execution_file)
         execution_timestamps = [row["timestamp"] for row in execution_all]
+        execution_interval_ms = _infer_interval_ms(execution_all, 1)
 
     funding_all = []
     funding_timestamps = []
     if Path(funding_file).exists() and int(exit_p.get("funding_fee_enabled", 1)) > 0:
         funding_all = load_funding_data(funding_file)
         funding_timestamps = [row["timestamp"] for row in funding_all]
+
+    price_venues = {
+        _infer_data_venue(intraday_file),
+    }
+    if execution_all:
+        price_venues.add(_infer_data_venue(execution_file))
+    price_venues.discard("unknown")
+    if len(price_venues) > 1:
+        raise ValueError(f"mixed price venues are not allowed: {sorted(price_venues)}")
+    price_venue = next(iter(price_venues), "unknown")
+    funding_venue = _infer_data_venue(funding_file)
+    if funding_all and price_venue != "unknown" and funding_venue != "unknown" and price_venue != funding_venue:
+        raise ValueError(
+            f"funding venue mismatch: price venue={price_venue}, funding venue={funding_venue}"
+        )
 
     hourly_state = _prepare_state(
         hourly_all,
@@ -849,8 +1066,9 @@ def prepare_backtest_context(
         strategy_params["macd_slow"],
         strategy_params["macd_signal"],
         strategy_params.get("hourly_ema_anchor"),
+        flow_lookback=strategy_params.get("flow_lookback", strategy_params.get("volume_lookback", 9)),
     )
-    four_hour_bars = _aggregate_bars(hourly_all, 4)
+    four_hour_bars = _aggregate_bars(intraday_all, 16)
     four_hour_state = _prepare_state(
         four_hour_bars,
         strategy_params["fourh_ema_fast"],
@@ -858,6 +1076,7 @@ def prepare_backtest_context(
         strategy_params["macd_fast"],
         strategy_params["macd_slow"],
         strategy_params["macd_signal"],
+        flow_lookback=strategy_params.get("flow_lookback", strategy_params.get("volume_lookback", 9)),
     )
     intraday_state = _prepare_state(
         intraday_all,
@@ -866,6 +1085,7 @@ def prepare_backtest_context(
         strategy_params["macd_fast"],
         strategy_params["macd_slow"],
         strategy_params["macd_signal"],
+        flow_lookback=strategy_params.get("flow_lookback", strategy_params.get("volume_lookback", 9)),
     )
 
     four_hour_interval_ms = _infer_interval_ms(four_hour_bars, 240) if four_hour_bars else 240 * 60_000
@@ -879,6 +1099,7 @@ def prepare_backtest_context(
         "hourly_timestamps": hourly_timestamps,
         "intraday_interval_ms": intraday_interval_ms,
         "hourly_interval_ms": hourly_interval_ms,
+        "execution_interval_ms": execution_interval_ms,
         "intraday_state": intraday_state,
         "hourly_state": hourly_state,
         "hourly_close_timestamps": hourly_close_timestamps,
@@ -891,6 +1112,8 @@ def prepare_backtest_context(
         "execution_timestamps": execution_timestamps,
         "funding_all": funding_all,
         "funding_timestamps": funding_timestamps,
+        "price_venue": price_venue,
+        "funding_venue": funding_venue,
     }
 
 
@@ -927,6 +1150,7 @@ def backtest_macd_aggressive(
     hourly_all = prepared_context["hourly_all"]
     intraday_timestamps = prepared_context["intraday_timestamps"]
     intraday_interval_ms = prepared_context["intraday_interval_ms"]
+    execution_interval_ms = prepared_context["execution_interval_ms"]
     hourly_state = prepared_context["hourly_state"]
     four_hour_state = prepared_context["four_hour_state"]
     intraday_state = prepared_context["intraday_state"]
@@ -961,6 +1185,17 @@ def backtest_macd_aggressive(
     funding_all = prepared_context["funding_all"]
     if funding_all:
         full_funding_timestamps = prepared_context["funding_timestamps"]
+        funding_interval_ms = _funding_interval_ms(full_funding_timestamps)
+        validation_start_idx, validation_end_idx = _timestamp_window_indices_inclusive(
+            full_funding_timestamps,
+            start_ts - funding_interval_ms,
+            end_ts + funding_interval_ms,
+        )
+        _validate_funding_window_coverage(
+            full_funding_timestamps[validation_start_idx:validation_end_idx],
+            start_ts,
+            end_ts,
+        )
         funding_start_idx, funding_end_idx = _timestamp_window_indices_inclusive(
             full_funding_timestamps,
             start_ts,
@@ -1042,6 +1277,13 @@ def backtest_macd_aggressive(
             "prev_hourly": prev_hourly_context,
             "four_hour": four_hour_context,
             "sentiment": sentiment_context,
+            "trade_count": intraday_context["trade_count"],
+            "trade_count_ratio": intraday_context["trade_count_ratio"],
+            "taker_buy_volume": intraday_context["taker_buy_volume"],
+            "taker_sell_volume": intraday_context["taker_sell_volume"],
+            "taker_buy_ratio": intraday_context["taker_buy_ratio"],
+            "taker_sell_ratio": intraday_context["taker_sell_ratio"],
+            "flow_imbalance": intraday_context["flow_imbalance"],
             "ema_fast": intraday_context["ema_fast"],
             "ema_slow": intraday_context["ema_slow"],
             "prev_ema_fast": prev_intraday_context["ema_fast"],
@@ -1066,89 +1308,132 @@ def backtest_macd_aggressive(
         )
         risk_profile = _market_risk_profile(market_state, exit_p)
 
-        if funding_rows and positions:
-            while funding_idx < len(funding_rows) and funding_timestamps[funding_idx] <= bar_close_ts:
-                funding_row = funding_rows[funding_idx]
-                if funding_row["timestamp"] > prev_bar_close_ts:
-                    settlement_price = _price_before_timestamp(
-                        funding_row["timestamp"],
-                        execution_timestamps,
-                        execution_rows,
-                        bar["close"],
-                    )
-                    for position in positions:
-                        funding_pnl = _apply_funding(
-                            position,
-                            funding_row["funding_rate"],
-                            settlement_price,
-                            leverage,
+        for position in positions:
+            position["hold_bars"] += 1
+
+        subbars = _subbars_for_window_bar(bar, execution_rows, execution_timestamps, intraday_interval_ms)
+        intrabar_prev_ts = prev_bar_close_ts
+        for subbar in subbars:
+            subbar_close_ts = _subbar_close_ts(
+                subbar,
+                execution_interval_ms if execution_rows else bar_close_ts - bar["timestamp"],
+                bar_close_ts,
+            )
+            if funding_rows and positions:
+                while funding_idx < len(funding_rows) and funding_timestamps[funding_idx] <= subbar_close_ts:
+                    funding_row = funding_rows[funding_idx]
+                    if funding_row["timestamp"] > intrabar_prev_ts:
+                        settlement_price = _price_before_timestamp(
+                            funding_row["timestamp"],
+                            execution_timestamps,
+                            execution_rows,
+                            subbar["close"],
                         )
-                        total_funding_pnl += funding_pnl
-                    funding_event_count += 1
-                funding_idx += 1
+                        for position in positions:
+                            funding_pnl = _apply_funding(
+                                position,
+                                funding_row["funding_rate"],
+                                settlement_price,
+                                leverage,
+                            )
+                            total_funding_pnl += funding_pnl
+                        funding_event_count += 1
+                    funding_idx += 1
+
+            intrabar_remaining = []
+            for position in positions:
+                side = _position_side(position)
+                if side == "short":
+                    best_pnl_pct = _position_pnl_pct(position, subbar["low"], leverage)
+                    worst_pnl_pct = _position_pnl_pct(position, subbar["high"], leverage)
+                    position["favorable_price"] = min(position["favorable_price"], subbar["low"])
+                else:
+                    best_pnl_pct = _position_pnl_pct(position, subbar["high"], leverage)
+                    worst_pnl_pct = _position_pnl_pct(position, subbar["low"], leverage)
+                    position["favorable_price"] = max(position["favorable_price"], subbar["high"])
+                position["peak_pnl_pct"] = max(position["peak_pnl_pct"], best_pnl_pct)
+
+                if worst_pnl_pct <= -100.0:
+                    capital += position.get("funding_pnl", 0.0)
+                    liquidation_trade = {
+                        "pnl_pct": -100.0,
+                        "pnl_amount": -position["size"] - position.get("entry_fee_paid", 0.0) + position.get("funding_pnl", 0.0),
+                        "gross_pnl_amount": -position["size"],
+                        "fee_amount": position.get("entry_fee_paid", 0.0),
+                        "funding_amount": position.get("funding_pnl", 0.0),
+                        "hold_bars": position["hold_bars"],
+                        "reason": "爆仓",
+                        "entry_signal": position["entry_signal"],
+                        "size": position["size"],
+                        "pyramids_done": position.get("pyramids_done", 0),
+                        "trade_id": position.get("trade_id"),
+                    }
+                    record_settlement_leg(liquidation_trade)
+                    _apply_trade_leg_rollup(position, liquidation_trade)
+                    record_trade(_build_closed_trade(position))
+                    continue
+
+                stop_hit = subbar["high"] >= position["stop_price"] if side == "short" else subbar["low"] <= position["stop_price"]
+                if stop_hit:
+                    stop_fill = _fill_with_slippage(position["stop_price"], side, False, slippage_pct)
+                    trade, _gross_pnl_amount, cash_release, exit_fee = _settle_full_position(
+                        position,
+                        stop_fill,
+                        "止损",
+                        leverage,
+                        exit_p,
+                    )
+                    capital += cash_release
+                    total_trading_fees += exit_fee
+                    record_settlement_leg(trade)
+                    _apply_trade_leg_rollup(position, trade)
+                    record_trade(_build_closed_trade(position))
+                    continue
+
+                if _intrabar_tp1_first(position, subbar, leverage, exit_p):
+                    tp1_pnl_pct = float(_exit_value(exit_p, position, "tp1_pnl_pct"))
+                    tp1_close_fraction = float(_exit_value(exit_p, position, "tp1_close_fraction"))
+                    close_size = position["size"] * tp1_close_fraction
+                    if close_size > 1e-9:
+                        tp1_trigger = _tp_trigger_price(position["entry_price"], tp1_pnl_pct, leverage, side)
+                        tp1_fill = _fill_with_slippage(tp1_trigger, side, False, slippage_pct)
+                        (
+                            trade,
+                            _gross_pnl_amount,
+                            cash_release,
+                            exit_fee,
+                            allocated_entry_fee,
+                            allocated_funding,
+                        ) = _settle_partial_position(
+                            position,
+                            close_size,
+                            tp1_fill,
+                            "第一止盈",
+                            leverage,
+                            exit_p,
+                        )
+                        capital += cash_release
+                        total_trading_fees += exit_fee
+                        record_settlement_leg(trade)
+                        _apply_trade_leg_rollup(position, trade)
+                        position["size"] -= close_size
+                        position["entry_fee_paid"] = position.get("entry_fee_paid", 0.0) - allocated_entry_fee
+                        position["funding_pnl"] = position.get("funding_pnl", 0.0) - allocated_funding
+                        position["tp1_done"] = True
+                        if position["size"] <= 1e-9:
+                            record_trade(_build_closed_trade(position))
+                            continue
+
+                _update_protective_stops(position, exit_p, leverage)
+                intrabar_remaining.append(position)
+
+            positions = intrabar_remaining
+            intrabar_prev_ts = subbar_close_ts
 
         remaining = []
         for position in positions:
             side = _position_side(position)
-            position["hold_bars"] += 1
             close_pnl_pct = _position_pnl_pct(position, bar["close"], leverage)
-            if side == "short":
-                best_pnl_pct = _position_pnl_pct(position, bar["low"], leverage)
-                worst_pnl_pct = _position_pnl_pct(position, bar["high"], leverage)
-                position["favorable_price"] = min(position["favorable_price"], bar["low"])
-            else:
-                best_pnl_pct = _position_pnl_pct(position, bar["high"], leverage)
-                worst_pnl_pct = _position_pnl_pct(position, bar["low"], leverage)
-                position["favorable_price"] = max(position["favorable_price"], bar["high"])
-            position["peak_pnl_pct"] = max(position["peak_pnl_pct"], best_pnl_pct)
-
-            if worst_pnl_pct <= -100.0:
-                capital += position.get("funding_pnl", 0.0)
-                liquidation_trade = {
-                    "pnl_pct": -100.0,
-                    "pnl_amount": -position["size"] - position.get("entry_fee_paid", 0.0) + position.get("funding_pnl", 0.0),
-                    "gross_pnl_amount": -position["size"],
-                    "fee_amount": position.get("entry_fee_paid", 0.0),
-                    "funding_amount": position.get("funding_pnl", 0.0),
-                    "hold_bars": position["hold_bars"],
-                    "reason": "爆仓",
-                    "entry_signal": position["entry_signal"],
-                    "size": position["size"],
-                    "pyramids_done": position.get("pyramids_done", 0),
-                    "trade_id": position.get("trade_id"),
-                }
-                record_settlement_leg(liquidation_trade)
-                _apply_trade_leg_rollup(position, liquidation_trade)
-                record_trade(_build_closed_trade(position))
-                continue
-
-            stop_hit = bar["high"] >= position["stop_price"] if side == "short" else bar["low"] <= position["stop_price"]
-            if stop_hit:
-                stop_fill = _fill_with_slippage(position["stop_price"], side, False, slippage_pct)
-                exit_notional = _position_notional(position, stop_fill, leverage)
-                exit_fee = _trading_fee_amount(exit_notional, exit_p)
-                allocated_entry_fee = position.get("entry_fee_paid", 0.0)
-                allocated_funding = position.get("funding_pnl", 0.0)
-                trade, gross_pnl_amount = _close_trade(
-                    position,
-                    stop_fill,
-                    "止损",
-                    leverage,
-                    allocated_entry_fee=allocated_entry_fee,
-                    exit_fee=exit_fee,
-                    funding_pnl=allocated_funding,
-                )
-                capital += _close_cash_release(
-                    position["size"],
-                    gross_pnl_amount,
-                    exit_fee=exit_fee,
-                    funding_pnl=allocated_funding,
-                )
-                total_trading_fees += exit_fee
-                record_settlement_leg(trade)
-                _apply_trade_leg_rollup(position, trade)
-                record_trade(_build_closed_trade(position))
-                continue
 
             if _should_pyramid(position, market_state, close_pnl_pct, exit_p, allow_pyramid=risk_profile["allow_pyramid"]):
                 pyramid_fill = _fill_with_slippage(market_fill_price, side, True, slippage_pct)
@@ -1169,89 +1454,19 @@ def backtest_macd_aggressive(
                     pyramid_add_count += 1
                     _refresh_stop_after_resize(position, market_state, exit_p, leverage)
 
-            tp1_pnl_pct = float(_exit_value(exit_p, position, "tp1_pnl_pct"))
-            tp1_close_fraction = float(_exit_value(exit_p, position, "tp1_close_fraction"))
-            if (not position["tp1_done"]) and best_pnl_pct >= tp1_pnl_pct:
-                tp1_trigger = _tp_trigger_price(position["entry_price"], tp1_pnl_pct, leverage, side)
-                tp1_fill = _fill_with_slippage(tp1_trigger, side, False, slippage_pct)
-                close_size = position["size"] * tp1_close_fraction
-                remaining_size = position["size"] - close_size
-                close_fraction = close_size / max(position["size"], 1e-9)
-                allocated_entry_fee = position.get("entry_fee_paid", 0.0) * close_fraction
-                allocated_funding = position.get("funding_pnl", 0.0) * close_fraction
-                partial_position = dict(position)
-                partial_position["size"] = close_size
-                exit_notional = _position_notional(partial_position, tp1_fill, leverage)
-                exit_fee = _trading_fee_amount(exit_notional, exit_p)
-                trade, gross_pnl_amount = _close_trade(
-                    partial_position,
-                    tp1_fill,
-                    "第一止盈",
-                    leverage,
-                    allocated_entry_fee=allocated_entry_fee,
-                    exit_fee=exit_fee,
-                    funding_pnl=allocated_funding,
-                )
-                capital += _close_cash_release(
-                    close_size,
-                    gross_pnl_amount,
-                    exit_fee=exit_fee,
-                    funding_pnl=allocated_funding,
-                )
-                total_trading_fees += exit_fee
-                record_settlement_leg(trade)
-                _apply_trade_leg_rollup(position, trade)
-                position["size"] = remaining_size
-                position["entry_fee_paid"] = position.get("entry_fee_paid", 0.0) - allocated_entry_fee
-                position["funding_pnl"] = position.get("funding_pnl", 0.0) - allocated_funding
-                position["tp1_done"] = True
-                if position["size"] <= 1e-9:
-                    record_trade(_build_closed_trade(position))
-                    continue
-
-            break_even_activation_pct = float(_exit_value(exit_p, position, "break_even_activation_pct"))
-            if position["peak_pnl_pct"] >= break_even_activation_pct:
-                if side == "short":
-                    breakeven_price = position["entry_price"] * (1.0 - float(exit_p["break_even_buffer_pct"]) / 100.0)
-                    position["stop_price"] = min(position["stop_price"], breakeven_price)
-                else:
-                    breakeven_price = position["entry_price"] * (1.0 + float(exit_p["break_even_buffer_pct"]) / 100.0)
-                    position["stop_price"] = max(position["stop_price"], breakeven_price)
-
             trailing_activation_pct = float(_exit_value(exit_p, position, "trailing_activation_pct"))
-            trailing_giveback_pct = float(_exit_value(exit_p, position, "trailing_giveback_pct"))
-            if position["peak_pnl_pct"] >= trailing_activation_pct:
-                trailing_gap_raw = trailing_giveback_pct / leverage / 100.0
-                if side == "short":
-                    trailing_price = position["favorable_price"] * (1.0 + trailing_gap_raw)
-                    position["stop_price"] = min(position["stop_price"], trailing_price)
-                else:
-                    trailing_price = position["favorable_price"] * (1.0 - trailing_gap_raw)
-                    position["stop_price"] = max(position["stop_price"], trailing_price)
-
             if int(exit_p["regime_exit_enabled"]) > 0 and hourly_context is not None:
                 regime_broken = _confirmed_regime_break(position, exit_p, bar, prev_bar, market_state)
                 if regime_broken and close_pnl_pct < trailing_activation_pct:
                     regime_fill = _fill_with_slippage(market_fill_price, side, False, slippage_pct)
-                    exit_notional = _position_notional(position, regime_fill, leverage)
-                    exit_fee = _trading_fee_amount(exit_notional, exit_p)
-                    allocated_entry_fee = position.get("entry_fee_paid", 0.0)
-                    allocated_funding = position.get("funding_pnl", 0.0)
-                    trade, gross_pnl_amount = _close_trade(
+                    trade, _gross_pnl_amount, cash_release, exit_fee = _settle_full_position(
                         position,
                         regime_fill,
                         "趋势失效",
                         leverage,
-                        allocated_entry_fee=allocated_entry_fee,
-                        exit_fee=exit_fee,
-                        funding_pnl=allocated_funding,
+                        exit_p,
                     )
-                    capital += _close_cash_release(
-                        position["size"],
-                        gross_pnl_amount,
-                        exit_fee=exit_fee,
-                        funding_pnl=allocated_funding,
-                    )
+                    capital += cash_release
                     total_trading_fees += exit_fee
                     record_settlement_leg(trade)
                     _apply_trade_leg_rollup(position, trade)
@@ -1261,25 +1476,14 @@ def backtest_macd_aggressive(
             hold_limit = _resolve_hold_limit(position, exit_p, market_state, close_pnl_pct)
             if position["hold_bars"] >= hold_limit:
                 time_fill = _fill_with_slippage(market_fill_price, side, False, slippage_pct)
-                exit_notional = _position_notional(position, time_fill, leverage)
-                exit_fee = _trading_fee_amount(exit_notional, exit_p)
-                allocated_entry_fee = position.get("entry_fee_paid", 0.0)
-                allocated_funding = position.get("funding_pnl", 0.0)
-                trade, gross_pnl_amount = _close_trade(
+                trade, _gross_pnl_amount, cash_release, exit_fee = _settle_full_position(
                     position,
                     time_fill,
                     "时间退出",
                     leverage,
-                    allocated_entry_fee=allocated_entry_fee,
-                    exit_fee=exit_fee,
-                    funding_pnl=allocated_funding,
+                    exit_p,
                 )
-                capital += _close_cash_release(
-                    position["size"],
-                    gross_pnl_amount,
-                    exit_fee=exit_fee,
-                    funding_pnl=allocated_funding,
-                )
+                capital += cash_release
                 total_trading_fees += exit_fee
                 record_settlement_leg(trade)
                 _apply_trade_leg_rollup(position, trade)
@@ -1295,25 +1499,14 @@ def backtest_macd_aggressive(
             for position in positions:
                 rev_side = _position_side(position)
                 rev_fill = _fill_with_slippage(market_fill_price, rev_side, False, slippage_pct)
-                exit_notional = _position_notional(position, rev_fill, leverage)
-                exit_fee = _trading_fee_amount(exit_notional, exit_p)
-                allocated_entry_fee = position.get("entry_fee_paid", 0.0)
-                allocated_funding = position.get("funding_pnl", 0.0)
-                trade, gross_pnl_amount = _close_trade(
+                trade, _gross_pnl_amount, cash_release, exit_fee = _settle_full_position(
                     position,
                     rev_fill,
                     "反向信号",
                     leverage,
-                    allocated_entry_fee=allocated_entry_fee,
-                    exit_fee=exit_fee,
-                    funding_pnl=allocated_funding,
+                    exit_p,
                 )
-                capital += _close_cash_release(
-                    position["size"],
-                    gross_pnl_amount,
-                    exit_fee=exit_fee,
-                    funding_pnl=allocated_funding,
-                )
+                capital += cash_release
                 total_trading_fees += exit_fee
                 record_settlement_leg(trade)
                 _apply_trade_leg_rollup(position, trade)
@@ -1399,25 +1592,14 @@ def backtest_macd_aggressive(
     for position in positions:
         end_side = _position_side(position)
         end_fill = _fill_with_slippage(last_close, end_side, False, slippage_pct)
-        exit_notional = _position_notional(position, end_fill, leverage)
-        exit_fee = _trading_fee_amount(exit_notional, exit_p)
-        allocated_entry_fee = position.get("entry_fee_paid", 0.0)
-        allocated_funding = position.get("funding_pnl", 0.0)
-        trade, gross_pnl_amount = _close_trade(
+        trade, _gross_pnl_amount, cash_release, exit_fee = _settle_full_position(
             position,
             end_fill,
             "数据结束",
             leverage,
-            allocated_entry_fee=allocated_entry_fee,
-            exit_fee=exit_fee,
-            funding_pnl=allocated_funding,
+            exit_p,
         )
-        capital += _close_cash_release(
-            position["size"],
-            gross_pnl_amount,
-            exit_fee=exit_fee,
-            funding_pnl=allocated_funding,
-        )
+        capital += cash_release
         total_trading_fees += exit_fee
         record_settlement_leg(trade)
         _apply_trade_leg_rollup(position, trade)

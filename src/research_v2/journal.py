@@ -41,6 +41,26 @@ LEGACY_REFERENCE_CLUSTER_LIMIT = 2
 CLUSTER_OVERHEAT_LOOKBACK = 10
 CLUSTER_OVERHEAT_MIN_ROUNDS = 6
 CLUSTER_OVERHEAT_SHARE = 0.60
+DEFAULT_CLUSTER_LOCK_STEPS = (3, 6, 10)
+TAG_NOVELTY_MAX_OVERLAP = 0.34
+LONG_TARGET_KEYWORDS = (
+    "long",
+    "bull",
+    "breakout",
+    "uptrend",
+    "多头",
+    "上涨",
+    "上车",
+)
+SHORT_TARGET_KEYWORDS = (
+    "short",
+    "bear",
+    "breakdown",
+    "downtrend",
+    "空头",
+    "下跌",
+    "做空",
+)
 
 
 # ==================== 基础读写 ====================
@@ -116,6 +136,19 @@ def _truncate(text: Any, limit: int) -> str:
     return cleaned[: max(0, limit - 3)] + "..."
 
 
+def _entry_decision_reason(entry: dict[str, Any]) -> str:
+    decision_reason = str(entry.get("decision_reason", "")).strip()
+    if decision_reason:
+        return decision_reason
+    gate_reason = str(entry.get("gate_reason", "")).strip()
+    if gate_reason and gate_reason != "通过":
+        return gate_reason
+    note = str(entry.get("note", "")).strip()
+    if str(entry.get("outcome", "")) == "rejected" and note:
+        return note
+    return gate_reason or "-"
+
+
 def cluster_for_tags(tags: list[str] | tuple[str, ...]) -> str:
     normalized = [str(tag).strip().lower() for tag in tags if str(tag).strip()]
     for cluster_name, keywords in CLUSTER_KEYWORDS:
@@ -178,6 +211,107 @@ def _risk_label(*, attempts: int, failures: int, zero_delta: int, runtime_errors
     return "OPEN"
 
 
+def region_families_for_regions(regions: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    normalized = []
+    for region in regions:
+        name = str(region).strip()
+        if name and name not in normalized:
+            normalized.append(name)
+    return tuple(normalized)
+
+
+def target_family_from_text(
+    change_tags: list[str] | tuple[str, ...],
+    hypothesis: Any,
+    expected_effects: list[str] | tuple[str, ...],
+) -> str:
+    corpus = " ".join(
+        [
+            *[str(tag).strip().lower() for tag in change_tags if str(tag).strip()],
+            str(hypothesis or "").strip().lower(),
+            *[str(effect).strip().lower() for effect in expected_effects if str(effect).strip()],
+        ]
+    )
+    long_hits = sum(1 for keyword in LONG_TARGET_KEYWORDS if keyword in corpus)
+    short_hits = sum(1 for keyword in SHORT_TARGET_KEYWORDS if keyword in corpus)
+    if long_hits > 0 and short_hits == 0:
+        return "long"
+    if short_hits > 0 and long_hits == 0:
+        return "short"
+    if long_hits > 0 and short_hits > 0:
+        return "mixed"
+    return "unknown"
+
+
+def exploration_signature_for_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    stored_regions = entry.get("region_families", [])
+    if stored_regions:
+        region_families = tuple(str(item).strip() for item in stored_regions if str(item).strip())
+    else:
+        region_families = region_families_for_regions(entry.get("edited_regions", []))
+
+    stored_target = str(entry.get("target_family", "")).strip()
+    if stored_target:
+        target_family = stored_target
+    else:
+        target_family = target_family_from_text(
+            entry.get("change_tags", []),
+            entry.get("hypothesis", ""),
+            entry.get("expected_effects", []),
+        )
+
+    stored_factors = entry.get("core_factor_names", [])
+    if stored_factors:
+        core_factor_names = {
+            str(item).strip()
+            for item in stored_factors
+            if str(item).strip()
+        }
+    else:
+        core_factor_names = {
+            str(factor.get("name", "")).strip()
+            for factor in entry.get("core_factors", [])
+            if isinstance(factor, dict) and str(factor.get("name", "")).strip()
+        }
+
+    return {
+        "cluster_key": cluster_key_for_entry(entry),
+        "tags": {
+            str(tag).strip()
+            for tag in entry.get("change_tags", [])
+            if str(tag).strip()
+        },
+        "region_families": set(region_families),
+        "target_family": target_family,
+        "core_factor_names": core_factor_names,
+    }
+
+
+def exploration_signature_for_candidate(candidate: Any) -> dict[str, Any]:
+    return {
+        "cluster_key": cluster_key_for_components(
+            getattr(candidate, "closest_failed_cluster", ""),
+            getattr(candidate, "change_tags", ()),
+        ),
+        "tags": {
+            str(tag).strip()
+            for tag in getattr(candidate, "change_tags", ())
+            if str(tag).strip()
+        },
+        "region_families": set(region_families_for_regions(getattr(candidate, "edited_regions", ()))),
+        "target_family": target_family_from_text(
+            getattr(candidate, "change_tags", ()),
+            getattr(candidate, "hypothesis", ""),
+            getattr(candidate, "expected_effects", ()),
+        ),
+        "core_factor_names": {
+            str(getattr(factor, "name", "")).strip()
+            for factor in getattr(candidate, "core_factors", ())
+            if str(getattr(factor, "name", "")).strip()
+        },
+    }
+
+
 def _compact_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
     """把一批 journal 条目压缩成结构化的经验摘要。"""
     if not entries:
@@ -186,6 +320,7 @@ def _compact_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
     accepted = [e for e in entries if _outcome_bucket(str(e.get("outcome", ""))) == "accepted"]
     rejected = [e for e in entries if _outcome_bucket(str(e.get("outcome", ""))) == "rejected"]
     duplicate_skipped_count = sum(1 for e in entries if e.get("outcome") == "duplicate_skipped")
+    exploration_blocked_count = sum(1 for e in entries if e.get("outcome") == "exploration_blocked")
     early_rejected_count = sum(1 for e in entries if e.get("outcome") == "early_rejected")
     runtime_failed_count = sum(1 for e in entries if e.get("outcome") == "runtime_failed")
 
@@ -215,7 +350,7 @@ def _compact_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
     # 常见失败原因
     gate_reasons: dict[str, int] = defaultdict(int)
     for entry in rejected:
-        reason = entry.get("gate_reason", "")
+        reason = _entry_decision_reason(entry)
         for segment in reason.split("；"):
             segment = segment.strip()
             if segment and segment != "通过":
@@ -277,17 +412,37 @@ def _compact_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
             best_delta=float(stats["best_delta"]),
         )
 
+    exploration_summary: dict[str, dict[str, int]] = {}
+    same_cluster_rounds: dict[str, set[int]] = defaultdict(set)
+    lock_trigger_rounds: dict[str, set[int]] = defaultdict(set)
+    for entry in entries:
+        if str(entry.get("outcome", "")) != "exploration_blocked":
+            continue
+        cluster = str(entry.get("blocked_cluster", "")).strip() or cluster_key_for_entry(entry)
+        iteration = int(entry.get("iteration", 0) or 0)
+        if str(entry.get("block_kind", "")).strip() == "same_cluster" and iteration > 0:
+            same_cluster_rounds[cluster].add(iteration)
+        if int(entry.get("lock_rounds", 0) or 0) > 0 and iteration > 0:
+            lock_trigger_rounds[cluster].add(iteration)
+    for cluster in set(same_cluster_rounds) | set(lock_trigger_rounds):
+        exploration_summary[cluster] = {
+            "same_cluster_rounds": len(same_cluster_rounds.get(cluster, set())),
+            "lock_trigger_rounds": len(lock_trigger_rounds.get(cluster, set())),
+        }
+
     return {
         "entry_count": len(entries),
         "score_regime": _entry_score_regime(entries[-1]),
         "accepted_count": len(accepted),
         "rejected_count": len(rejected),
         "duplicate_skipped_count": duplicate_skipped_count,
+        "exploration_blocked_count": exploration_blocked_count,
         "early_rejected_count": early_rejected_count,
         "runtime_failed_count": runtime_failed_count,
         "accept_rate": len(accepted) / len(entries) if entries else 0.0,
         "tag_summary": tag_summary,
         "cluster_summary": cluster_summary,
+        "exploration_summary": exploration_summary,
         "region_summary": dict(region_stats),
         "top_failure_reasons": top_failures,
         "accepted_metric_ranges": accepted_metric_ranges,
@@ -383,12 +538,13 @@ def _format_compact_for_prompt(
     skipped_rounds = len(all_rounds) - len(rounds)
     total_accepted = sum(r.get("accepted_count", 0) for r in rounds)
     total_rejected = sum(r.get("rejected_count", 0) for r in rounds)
+    total_exploration_blocked = sum(r.get("exploration_blocked_count", 0) for r in rounds)
     total_early_rejected = sum(r.get("early_rejected_count", 0) for r in rounds)
     total_runtime_failed = sum(r.get("runtime_failed_count", 0) for r in rounds)
     total_entries = sum(r.get("entry_count", 0) for r in rounds)
     lines.append(
         f"共 {total_entries} 轮历史，{total_accepted} 次通过，"
-        f"{total_rejected} 次失败，其中提前淘汰 {total_early_rejected} 次，"
+        f"{total_rejected} 次失败，探索拦截 {total_exploration_blocked} 次，其中提前淘汰 {total_early_rejected} 次，"
         f"运行失败 {total_runtime_failed} 次，通过率 {total_accepted / total_entries:.0%}"
         if total_entries else "无历史"
     )
@@ -535,6 +691,270 @@ def _entries_for_score_regime(entries: list[dict[str, Any]], score_regime: str) 
     ]
 
 
+def _merged_exploration_history(
+    entries: list[dict[str, Any]],
+    *,
+    journal_path: Path | None,
+    score_regime: str,
+    current_iteration: int,
+) -> dict[str, dict[str, int]]:
+    merged: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"same_cluster_rounds": 0, "lock_trigger_rounds": 0}
+    )
+    compact_data = load_compact(journal_path) if journal_path is not None else {}
+    compacted_up_to = int(compact_data.get("compacted_up_to", 0) or 0)
+    compacted_up_to = max(0, min(compacted_up_to, len(entries)))
+    for round_data in compact_data.get("rounds", []):
+        if score_regime and str(round_data.get("score_regime", "")).strip() != score_regime:
+            continue
+        for cluster, stats in round_data.get("exploration_summary", {}).items():
+            merged[cluster]["same_cluster_rounds"] += int(stats.get("same_cluster_rounds", 0))
+            merged[cluster]["lock_trigger_rounds"] += int(stats.get("lock_trigger_rounds", 0))
+
+    local_same_cluster_rounds: dict[str, set[int]] = defaultdict(set)
+    local_lock_trigger_rounds: dict[str, set[int]] = defaultdict(set)
+    for entry in _entries_for_score_regime(entries[compacted_up_to:], score_regime):
+        if str(entry.get("outcome", "")) != "exploration_blocked":
+            continue
+        iteration = int(entry.get("iteration", 0) or 0)
+        if iteration <= 0 or iteration >= current_iteration:
+            continue
+        cluster = str(entry.get("blocked_cluster", "")).strip() or cluster_key_for_entry(entry)
+        if str(entry.get("block_kind", "")).strip() == "same_cluster":
+            local_same_cluster_rounds[cluster].add(iteration)
+        if int(entry.get("lock_rounds", 0) or 0) > 0:
+            local_lock_trigger_rounds[cluster].add(iteration)
+
+    for cluster, rounds in local_same_cluster_rounds.items():
+        merged[cluster]["same_cluster_rounds"] += len(rounds)
+    for cluster, rounds in local_lock_trigger_rounds.items():
+        merged[cluster]["lock_trigger_rounds"] += len(rounds)
+    return merged
+
+
+def _current_round_lock_state(
+    entries: list[dict[str, Any]],
+    *,
+    score_regime: str,
+    current_iteration: int,
+    include_current_round_locks: bool,
+) -> dict[str, dict[str, Any]]:
+    active: dict[str, dict[str, Any]] = {}
+    for entry in _entries_for_score_regime(entries, score_regime):
+        if str(entry.get("outcome", "")) != "exploration_blocked":
+            continue
+        lock_rounds = int(entry.get("lock_rounds", 0) or 0)
+        if lock_rounds <= 0:
+            continue
+        cluster = str(entry.get("blocked_cluster", "")).strip() or cluster_key_for_entry(entry)
+        trigger_iteration = int(entry.get("lock_trigger_iteration", entry.get("iteration", 0)) or 0)
+        expires_before = int(
+            entry.get("lock_expires_before_iteration", trigger_iteration + lock_rounds + 1) or 0
+        )
+        if include_current_round_locks:
+            is_active = trigger_iteration <= current_iteration < expires_before
+        else:
+            is_active = trigger_iteration < current_iteration < expires_before
+        if not is_active:
+            continue
+        remaining_rounds = max(0, expires_before - max(current_iteration, trigger_iteration + 1))
+        active[cluster] = {
+            "cluster": cluster,
+            "remaining_rounds": remaining_rounds,
+            "trigger_count": int(entry.get("lock_level", 0) or 0),
+            "lock_rounds": lock_rounds,
+            "lock_trigger_iteration": trigger_iteration,
+            "lock_expires_before_iteration": expires_before,
+            "reason": str(entry.get("gate_reason", "")).strip() or str(entry.get("note", "")).strip() or "-",
+        }
+    return active
+
+
+def _same_cluster_low_change_context(entries: list[dict[str, Any]], score_regime: str) -> dict[str, Any] | None:
+    tail = _low_change_tail(_entries_for_score_regime(entries, score_regime))
+    if not tail:
+        return None
+
+    cluster_counts = Counter(cluster_key_for_entry(entry) for entry in tail if cluster_key_for_entry(entry))
+    if not cluster_counts:
+        return None
+    cluster, count = cluster_counts.most_common(1)[0]
+    if count < 2:
+        return None
+
+    cluster_entries = [entry for entry in tail if cluster_key_for_entry(entry) == cluster]
+    tag_union: set[str] = set()
+    region_families: set[str] = set()
+    target_families: set[str] = set()
+    core_factor_names: set[str] = set()
+    entry_signatures: list[dict[str, Any]] = []
+    for entry in cluster_entries:
+        signature = exploration_signature_for_entry(entry)
+        entry_signatures.append(signature)
+        tag_union.update(signature["tags"])
+        region_families.update(signature["region_families"])
+        if signature["target_family"] not in {"", "unknown"}:
+            target_families.add(signature["target_family"])
+        core_factor_names.update(signature["core_factor_names"])
+
+    return {
+        "cluster": cluster,
+        "entries": cluster_entries,
+        "entry_signatures": entry_signatures,
+        "tag_union": tag_union,
+        "region_families": region_families,
+        "target_families": target_families,
+        "core_factor_names": core_factor_names,
+    }
+
+
+def _candidate_has_structural_novelty(
+    candidate_signature: dict[str, Any],
+    low_change_context: dict[str, Any],
+) -> bool:
+    candidate_regions = candidate_signature["region_families"]
+    candidate_target = candidate_signature["target_family"]
+    candidate_factors = candidate_signature["core_factor_names"]
+    candidate_tags = candidate_signature["tags"]
+
+    if candidate_regions and not candidate_regions.issubset(low_change_context["region_families"]):
+        return True
+    if candidate_target in {"long", "short"} and candidate_target not in low_change_context["target_families"]:
+        return True
+    if candidate_factors - low_change_context["core_factor_names"]:
+        return True
+    if candidate_tags:
+        overlap_ratio = len(candidate_tags & low_change_context["tag_union"]) / max(len(candidate_tags), 1)
+        if len(candidate_tags) >= 2 and overlap_ratio <= TAG_NOVELTY_MAX_OVERLAP:
+            return True
+    return False
+
+
+def build_exploration_guard_state(
+    entries: list[dict[str, Any]],
+    *,
+    journal_path: Path | None,
+    score_regime: str,
+    current_iteration: int,
+    include_current_round_locks: bool = False,
+) -> dict[str, Any]:
+    return {
+        "history_counts": _merged_exploration_history(
+            entries,
+            journal_path=journal_path,
+            score_regime=score_regime,
+            current_iteration=current_iteration,
+        ),
+        "active_locks": _current_round_lock_state(
+            entries,
+            score_regime=score_regime,
+            current_iteration=current_iteration,
+            include_current_round_locks=include_current_round_locks,
+        ),
+        "low_change_context": _same_cluster_low_change_context(entries, score_regime),
+    }
+
+
+def evaluate_candidate_exploration_guard(
+    candidate: Any,
+    entries: list[dict[str, Any]],
+    *,
+    journal_path: Path | None,
+    score_regime: str,
+    current_iteration: int,
+    lock_schedule: tuple[int, ...] = DEFAULT_CLUSTER_LOCK_STEPS,
+    include_current_round_locks: bool = False,
+) -> dict[str, Any] | None:
+    candidate_signature = exploration_signature_for_candidate(candidate)
+    candidate_cluster = str(candidate_signature["cluster_key"]).strip()
+    if not candidate_cluster:
+        return None
+
+    state = build_exploration_guard_state(
+        entries,
+        journal_path=journal_path,
+        score_regime=score_regime,
+        current_iteration=current_iteration,
+        include_current_round_locks=include_current_round_locks,
+    )
+    active_locks = state["active_locks"]
+    if candidate_cluster in active_locks:
+        lock = active_locks[candidate_cluster]
+        return {
+            "block_kind": "locked_cluster",
+            "stop_stage": "blocked_locked_cluster",
+            "blocked_cluster": candidate_cluster,
+            "blocked_reason": (
+                f"命中系统锁簇：`{candidate_cluster}` 仍在冷却中，"
+                f"剩余 {lock['remaining_rounds']} 轮。"
+            ),
+            "lock_applied": False,
+            "lock_rounds": 0,
+            "lock_level": int(lock.get("trigger_count", 0) or 0),
+            "lock_trigger_iteration": int(lock.get("lock_trigger_iteration", 0) or 0),
+            "lock_expires_before_iteration": int(lock.get("lock_expires_before_iteration", 0) or 0),
+            "current_locks": tuple(
+                f"{cluster}(剩余{payload['remaining_rounds']}轮)"
+                for cluster, payload in sorted(
+                    active_locks.items(),
+                    key=lambda item: (-item[1]["remaining_rounds"], item[0]),
+                )
+            ),
+        }
+
+    low_change_context = state["low_change_context"]
+    if low_change_context is None or candidate_cluster != low_change_context["cluster"]:
+        return None
+    if _candidate_has_structural_novelty(candidate_signature, low_change_context):
+        return None
+
+    history_counts = state["history_counts"]
+    same_cluster_rounds = int(history_counts.get(candidate_cluster, {}).get("same_cluster_rounds", 0))
+    lock_trigger_rounds = int(history_counts.get(candidate_cluster, {}).get("lock_trigger_rounds", 0))
+    current_round_count = same_cluster_rounds + 1
+    lock_applied = current_round_count >= 2
+    lock_level = lock_trigger_rounds + 1 if lock_applied else lock_trigger_rounds
+    if lock_applied:
+        schedule_index = min(max(lock_level - 1, 0), max(len(lock_schedule) - 1, 0))
+        lock_rounds = int(lock_schedule[schedule_index])
+        lock_expires_before_iteration = current_iteration + lock_rounds + 1
+        blocked_reason = (
+            f"同簇低变化近邻：`{candidate_cluster}` 最近持续低变化打转，"
+            f"当前候选未切出新交易路径；该簇将冷却 {lock_rounds} 轮。"
+        )
+    else:
+        lock_rounds = 0
+        lock_expires_before_iteration = 0
+        blocked_reason = (
+            f"同簇低变化近邻：`{candidate_cluster}` 最近持续低变化打转，"
+            "当前候选未切换方向簇，也没有形成足够明确的结构性换方向。"
+        )
+
+    return {
+        "block_kind": "same_cluster",
+        "stop_stage": "blocked_same_cluster",
+        "blocked_cluster": candidate_cluster,
+        "blocked_reason": blocked_reason,
+        "lock_applied": lock_applied,
+        "lock_rounds": lock_rounds,
+        "lock_level": lock_level,
+        "lock_trigger_iteration": current_iteration if lock_applied else 0,
+        "lock_expires_before_iteration": lock_expires_before_iteration,
+        "low_change_cluster": candidate_cluster,
+        "low_change_tags": tuple(sorted(low_change_context["tag_union"])),
+        "low_change_regions": tuple(sorted(low_change_context["region_families"])),
+        "low_change_targets": tuple(sorted(low_change_context["target_families"])),
+        "low_change_factors": tuple(sorted(low_change_context["core_factor_names"])),
+        "current_locks": tuple(
+            f"{cluster}(剩余{payload['remaining_rounds']}轮)"
+            for cluster, payload in sorted(
+                active_locks.items(),
+                key=lambda item: (-item[1]["remaining_rounds"], item[0]),
+            )
+        ),
+    }
+
+
 def _direction_risk_board(entries: list[dict[str, Any]], limit: int) -> list[str]:
     if not entries:
         return []
@@ -606,6 +1026,43 @@ def _direction_risk_board(entries: list[dict[str, Any]], limit: int) -> list[str
     return lines
 
 
+def _direction_cooling_board(
+    entries: list[dict[str, Any]],
+    limit: int,
+    *,
+    journal_path: Path | None,
+    score_regime: str,
+    current_iteration: int,
+) -> list[str]:
+    state = build_exploration_guard_state(
+        entries,
+        journal_path=journal_path,
+        score_regime=score_regime,
+        current_iteration=current_iteration,
+        include_current_round_locks=False,
+    )
+    active_locks = state["active_locks"]
+    lines = [
+        "方向冷却表（系统硬约束）:",
+        "| 方向簇 | 状态 | 剩余锁定轮次 | 触发次数 | 最近原因 |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    if not active_locks:
+        lines.append("| - | OPEN | 0 | 0 | 暂无被系统锁定的方向簇 |")
+        return lines
+
+    ordered = sorted(
+        active_locks.items(),
+        key=lambda item: (-item[1]["remaining_rounds"], -item[1]["trigger_count"], item[0]),
+    )
+    for cluster, payload in ordered[:limit]:
+        lines.append(
+            f"| {cluster} | COOLING | {payload['remaining_rounds']} | "
+            f"{payload['trigger_count']} | {_truncate(payload['reason'], 48) or '-'} |"
+        )
+    return lines
+
+
 def _overfit_risk_board(entries: list[dict[str, Any]], limit: int) -> list[str]:
     flagged_rows: list[tuple[float, str]] = []
     lines = [
@@ -656,13 +1113,11 @@ def _span(values: list[float]) -> float:
 def _low_change_tail(entries: list[dict[str, Any]], streak: int = LOW_CHANGE_STREAK) -> list[dict[str, Any]]:
     eligible = [
         entry for entry in entries
-        if _outcome_bucket(str(entry.get("outcome", ""))) in {"accepted", "rejected"}
+        if str(entry.get("outcome", "")) in {"accepted", "rejected"}
     ]
     if len(eligible) < streak:
         return []
     tail = eligible[-streak:]
-    if any(str(entry.get("gate_reason", "")).strip() != "通过" for entry in tail):
-        return []
     if any(abs(_score_value(entry.get("promotion_delta"))) > LOW_CHANGE_PROMOTION_DELTA_EPS for entry in tail):
         return []
     if _span([_score_value(entry.get("promotion_score")) for entry in tail]) > LOW_CHANGE_PROMOTION_SCORE_SPAN:
@@ -714,7 +1169,7 @@ def _exploration_trigger_lines(entries: list[dict[str, Any]], limit: int) -> lis
                 region_text = str(region).strip()
                 if region_text and region_text not in regions:
                     regions.append(region_text)
-            reason_text = str(entry.get("gate_reason", "")).strip()
+            reason_text = _entry_decision_reason(entry)
             if reason_text and reason_text not in reasons:
                 reasons.append(reason_text)
 
@@ -857,6 +1312,7 @@ def _display_outcome(raw_outcome: str) -> str:
         "accepted": "保留",
         "rejected": "未保留",
         "duplicate_skipped": "重复跳过",
+        "exploration_blocked": "探索拦截",
         "early_rejected": "提前淘汰",
         "runtime_failed": "运行失败",
     }.get(raw_outcome, raw_outcome or "-")
@@ -874,6 +1330,10 @@ def _display_stage(entry: dict[str, Any]) -> str:
         return "历史重复"
     if stage == "empty_diff":
         return "无有效diff"
+    if stage == "blocked_same_cluster":
+        return "同簇近邻"
+    if stage == "blocked_locked_cluster":
+        return "命中锁簇"
     if stage == "full_eval":
         return "完整评估"
     if str(entry.get("outcome", "")) in {"accepted", "rejected"}:
@@ -947,7 +1407,7 @@ def _format_recent_rounds_table(entries: list[dict[str, Any]], start_index: int)
         bull = _format_metric(_metric_from_entry(entry, "validation_bull_capture_score"))
         bear = _format_metric(_metric_from_entry(entry, "validation_bear_capture_score"))
         gap = _format_metric(_metric_from_entry(entry, "dev_validation_gap") or entry.get("promotion_gap"))
-        gate = _truncate(entry.get("gate_reason", "-"), 20) or "-"
+        gate = _truncate(_entry_decision_reason(entry), 20) or "-"
         lines.append(
             f"| {round_label} | {outcome} | {stage} | {quality} | {promotion} | "
             f"{hit_rate} | {bull} | {bear} | {gap} | {gate} |"
@@ -979,12 +1439,17 @@ def _empty_prompt_tables() -> list[str]:
         "| --- | --- | --- | --- | --- | --- | --- | --- |",
         "| - | 0 | 0 | 0 | 0 | 0.00 | OPEN | - |",
         "",
+        "方向冷却表（系统硬约束）:",
+        "| 方向簇 | 状态 | 剩余锁定轮次 | 触发次数 | 最近原因 |",
+        "| --- | --- | --- | --- | --- |",
+        "| - | OPEN | 0 | 0 | 暂无被系统锁定的方向簇 |",
+        "",
         "过拟合风险表（谨慎参考）:",
         "| 轮次 | 结果 | promotion | 风险 | 分数 | top1+ | chain+ | 覆盖 | 多空偏科 | 落差 | 建议 |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         "| - | - | - | 低 | 0 | - | - | - | - | - | 暂无需要降权的高风险轮次 |",
         "",
-        "最近未压缩轮次共 0 条：保留 0，未保留 0，重复跳过 0，提前淘汰 0，运行失败 0。",
+        "最近未压缩轮次共 0 条：保留 0，未保留 0，重复跳过 0，探索拦截 0，提前淘汰 0，运行失败 0。",
         "最近核心指标表:",
         "| 轮次 | 结果 | 阶段 | quality | promotion | val_hit | val_bull | val_bear | gap | gate |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
@@ -1116,9 +1581,15 @@ def build_journal_prompt_summary(
     limit: int = 6,
     journal_path: Path | None = None,
     current_score_regime: str = "",
+    current_iteration: int = 0,
 ) -> str:
     all_entries = list(entries)
     active_score_regime = current_score_regime or _latest_score_regime(all_entries)
+    if current_iteration <= 0:
+        current_iteration = max(
+            (int(entry.get("iteration", 0) or 0) for entry in all_entries),
+            default=0,
+        ) + 1
     current_entries = _entries_for_score_regime(all_entries, active_score_regime)
     parts: list[str] = []
     if not current_entries:
@@ -1135,6 +1606,17 @@ def build_journal_prompt_summary(
             board_lines = _direction_risk_board(board_entries, limit=min(8, limit))
             if board_lines:
                 parts.extend(board_lines)
+                parts.append("")
+
+            cooling_lines = _direction_cooling_board(
+                board_entries,
+                limit=min(8, limit),
+                journal_path=journal_path,
+                score_regime=active_score_regime,
+                current_iteration=current_iteration,
+            )
+            if cooling_lines:
+                parts.extend(cooling_lines)
                 parts.append("")
 
             overheat_lines = _cluster_overheat_lines(board_entries, limit=min(8, limit))
@@ -1155,12 +1637,14 @@ def build_journal_prompt_summary(
             accepted_count = sum(1 for entry in display_entries if entry.get("outcome") == "accepted")
             rejected_count = sum(1 for entry in display_entries if entry.get("outcome") == "rejected")
             duplicate_skipped_count = sum(1 for entry in display_entries if entry.get("outcome") == "duplicate_skipped")
+            exploration_blocked_count = sum(1 for entry in display_entries if entry.get("outcome") == "exploration_blocked")
             early_rejected_count = sum(1 for entry in display_entries if entry.get("outcome") == "early_rejected")
             runtime_failed_count = sum(1 for entry in display_entries if entry.get("outcome") == "runtime_failed")
             parts.append(
                 f"最近未压缩轮次共 {len(display_entries)} 条："
                 f"保留 {accepted_count}，未保留 {rejected_count}，"
                 f"重复跳过 {duplicate_skipped_count}，"
+                f"探索拦截 {exploration_blocked_count}，"
                 f"提前淘汰 {early_rejected_count}，运行失败 {runtime_failed_count}。"
             )
             failure_tag_lines = _recent_failure_tag_lines(display_entries, limit=min(8, limit))

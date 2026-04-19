@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import pandas as pd
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
@@ -13,6 +15,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 import backtest_macd_aggressive as backtest
 from codex_exec_client import StrategyClientConfig, StrategyGenerationTransientError, generate_json_object
+import freqtrade_macd_aggressive as ft_adapter
 from scripts.research_macd_aggressive_v2 import select_smoke_windows
 from research_v2.config import GateConfig
 from research_v2.evaluation import (
@@ -25,15 +28,23 @@ from research_v2.evaluation import (
 )
 from research_v2.charting import charts_available, render_performance_chart
 from research_v2.journal import (
+    build_exploration_guard_state,
     _format_compact_for_prompt,
     build_journal_prompt_summary,
     cluster_for_tags,
     cluster_key_for_components,
     cluster_key_for_entry,
+    evaluate_candidate_exploration_guard,
 )
 from research_v2.notifications import build_discord_summary_message
-from research_v2.prompting import EDITABLE_REGIONS
+from research_v2.prompting import (
+    EDITABLE_REGIONS,
+    build_strategy_exploration_repair_prompt,
+    build_strategy_research_prompt,
+)
 from research_v2.strategy_code import (
+    StrategyCandidate,
+    StrategyCoreFactor,
     StrategySourceError,
     validate_editable_region_boundaries,
     validate_strategy_source,
@@ -65,6 +76,29 @@ def make_gate_config(**overrides):
 
 
 class BacktestFixesTest(unittest.TestCase):
+    def test_aggregate_bars_rolls_up_flow_columns(self):
+        rows = [
+            {
+                "timestamp": index * 900_000,
+                "open": 100.0 + index,
+                "high": 101.0 + index,
+                "low": 99.0 + index,
+                "close": 100.5 + index,
+                "volume": 10.0 + index,
+                "trade_count": 100.0 + index,
+                "taker_buy_volume": 6.0 + index,
+                "taker_sell_volume": 4.0,
+            }
+            for index in range(4)
+        ]
+
+        aggregated = backtest._aggregate_bars(rows, 4)
+
+        self.assertEqual(len(aggregated), 1)
+        self.assertAlmostEqual(aggregated[0]["trade_count"], 406.0)
+        self.assertAlmostEqual(aggregated[0]["taker_buy_volume"], 30.0)
+        self.assertAlmostEqual(aggregated[0]["taker_sell_volume"], 16.0)
+
     def test_daily_equity_point_keeps_latest_market_close(self):
         points = []
 
@@ -506,6 +540,63 @@ class EvaluationFixesTest(unittest.TestCase):
 
 
 class StrategyValidationFixesTest(unittest.TestCase):
+    def test_validate_strategy_source_accepts_new_flow_params(self):
+        source = """
+# PARAMS_START
+PARAMS = {
+    'intraday_adx_min': 10,
+    'hourly_adx_min': 10,
+    'fourh_adx_min': 10,
+    'breakout_adx_min': 10,
+    'breakdown_adx_min': 10,
+    'breakout_lookback': 10,
+    'breakdown_lookback': 10,
+    'breakout_rsi_min': 40,
+    'breakout_rsi_max': 60,
+    'breakdown_rsi_min': 20,
+    'breakdown_rsi_max': 60,
+    'breakout_volume_ratio_min': 1.0,
+    'breakdown_volume_ratio_min': 1.0,
+    'breakout_trade_count_ratio_min': 1.0,
+    'breakdown_trade_count_ratio_min': 1.0,
+    'breakout_taker_buy_ratio_min': 0.55,
+    'breakdown_taker_sell_ratio_min': 0.55,
+    'breakout_flow_imbalance_min': 0.05,
+    'breakdown_flow_imbalance_max': -0.05,
+    'hourly_flow_confirmation_min': 0.02,
+    'fourh_flow_confirmation_min': 0.02,
+    'breakout_body_ratio_min': 0.3,
+    'breakdown_body_ratio_min': 0.3,
+    'breakout_close_pos_min': 0.5,
+    'breakdown_close_pos_max': 0.5,
+    'intraday_ema_fast': 9,
+    'intraday_ema_slow': 20,
+    'hourly_ema_fast': 10,
+    'hourly_ema_slow': 20,
+    'fourh_ema_fast': 10,
+    'fourh_ema_slow': 20,
+    'macd_fast': 12,
+    'macd_slow': 26,
+    'macd_signal': 9,
+    'volume_lookback': 10,
+    'flow_lookback': 12,
+}
+# PARAMS_END
+
+def _is_sideways_regime(*args, **kwargs):
+    return False
+
+def _trend_quality_ok(*args, **kwargs):
+    return True
+
+def _trend_followthrough_ok(*args, **kwargs):
+    return True
+
+def strategy(*args, **kwargs):
+    return None
+"""
+        validate_strategy_source(source)
+
     def test_validate_strategy_source_rejects_reversed_param_relations(self):
         source = """
 # PARAMS_START
@@ -608,8 +699,255 @@ def strategy(*args, **kwargs):
 
 
 class JournalPromptFixesTest(unittest.TestCase):
+    def test_build_strategy_prompt_mentions_15m_single_source_and_flow(self):
+        prompt = build_strategy_research_prompt(
+            evaluation_summary="诊断",
+            journal_summary="记忆",
+            previous_best_score=1.23,
+        )
+
+        self.assertIn("15m` 是唯一事实源", prompt)
+        self.assertIn("主动买卖量", prompt)
+
+    def test_build_strategy_exploration_repair_prompt_mentions_blocked_cluster(self):
+        prompt = build_strategy_exploration_repair_prompt(
+            candidate_id="candidate_1",
+            hypothesis="继续优化多头上车",
+            change_plan="调整 ownership 方向过滤",
+            change_tags=("ownership_takeover", "acceptance_continuity"),
+            edited_regions=("strategy",),
+            expected_effects=("提高多头到来阶段捕获",),
+            closest_failed_cluster="ownership_cluster",
+            novelty_proof="和最近失败方向相比，这次会换交易路径。",
+            block_kind="same_cluster",
+            blocked_cluster="ownership_cluster",
+            blocked_reason="同簇低变化近邻",
+            locked_clusters=("ownership_cluster(剩余3轮)",),
+            regeneration_attempt=1,
+        )
+
+        self.assertIn("blocked_cluster: ownership_cluster", prompt)
+        self.assertIn("ownership_cluster(剩余3轮)", prompt)
+        self.assertIn("必须绕开系统刚刚拒收的近邻方向", prompt)
+
     def test_cluster_for_tags_groups_ownership_variants(self):
         self.assertEqual(cluster_for_tags(["acceptance_continuity", "ownership_transfer"]), "ownership_cluster")
+
+
+class ExplorationGuardFixesTest(unittest.TestCase):
+    def _candidate(self, *, cluster="ownership_cluster", tags=("ownership_takeover", "acceptance_continuity"), regions=("strategy",), hypothesis="优化多头到来阶段", effects=("提高多头上车",), factors=()):
+        return StrategyCandidate(
+            candidate_id="candidate_guard",
+            hypothesis=hypothesis,
+            change_plan="调整策略",
+            closest_failed_cluster=cluster,
+            novelty_proof="这次会改变交易路径。",
+            change_tags=tuple(tags),
+            edited_regions=tuple(regions),
+            expected_effects=tuple(effects),
+            core_factors=tuple(factors),
+            strategy_code="def strategy():\n    return None\n",
+        )
+
+    def _scored_entry(self, iteration, *, cluster="ownership_cluster", outcome="rejected", tags=("ownership_takeover",), regions=("strategy",), promotion=0.40, quality=0.50):
+        return {
+            "iteration": iteration,
+            "candidate_id": f"entry_{iteration}",
+            "outcome": outcome,
+            "stop_stage": "full_eval",
+            "promotion_score": promotion,
+            "quality_score": quality,
+            "promotion_delta": 0.0,
+            "gate_reason": "通过",
+            "closest_failed_cluster": cluster,
+            "change_tags": list(tags),
+            "edited_regions": list(regions),
+            "hypothesis": "同簇近邻调整",
+            "expected_effects": ["提高多头上车"],
+            "metrics": {
+                "combined_trend_capture_score": 0.45,
+                "segment_hit_rate": 0.42,
+                "bull_capture_score": 0.20,
+                "bear_capture_score": 0.48,
+                "total_trades": 90.0,
+                "avg_fee_drag": 0.70,
+            },
+            "score_regime": "trend_capture_v5",
+        }
+
+    def test_evaluate_candidate_exploration_guard_blocks_same_cluster_low_novelty(self):
+        entries = [
+            self._scored_entry(1),
+            self._scored_entry(2),
+            self._scored_entry(3),
+        ]
+
+        block = evaluate_candidate_exploration_guard(
+            self._candidate(),
+            entries,
+            journal_path=None,
+            score_regime="trend_capture_v5",
+            current_iteration=4,
+        )
+
+        self.assertIsNotNone(block)
+        self.assertEqual(block["block_kind"], "same_cluster")
+        self.assertEqual(block["lock_rounds"], 0)
+
+    def test_evaluate_candidate_exploration_guard_applies_lock_on_second_blocked_round(self):
+        entries = [
+            {
+                "iteration": 1,
+                "candidate_id": "blocked_old",
+                "outcome": "exploration_blocked",
+                "stop_stage": "blocked_same_cluster",
+                "gate_reason": "同簇低变化近邻",
+                "block_kind": "same_cluster",
+                "blocked_cluster": "ownership_cluster",
+                "lock_rounds": 0,
+                "score_regime": "trend_capture_v5",
+            },
+            self._scored_entry(2),
+            self._scored_entry(3),
+            self._scored_entry(4),
+        ]
+
+        block = evaluate_candidate_exploration_guard(
+            self._candidate(),
+            entries,
+            journal_path=None,
+            score_regime="trend_capture_v5",
+            current_iteration=5,
+        )
+
+        self.assertIsNotNone(block)
+        self.assertEqual(block["block_kind"], "same_cluster")
+        self.assertEqual(block["lock_rounds"], 3)
+        self.assertEqual(block["lock_level"], 1)
+
+    def test_build_exploration_guard_state_avoids_double_count_with_compact(self):
+        entries = [
+            {
+                "iteration": 1,
+                "candidate_id": "blocked_compacted",
+                "outcome": "exploration_blocked",
+                "stop_stage": "blocked_same_cluster",
+                "gate_reason": "同簇低变化近邻",
+                "block_kind": "same_cluster",
+                "blocked_cluster": "ownership_cluster",
+                "lock_rounds": 0,
+                "score_regime": "trend_capture_v5",
+            },
+            {
+                "iteration": 2,
+                "candidate_id": "blocked_recent",
+                "outcome": "exploration_blocked",
+                "stop_stage": "blocked_same_cluster",
+                "gate_reason": "同簇低变化近邻",
+                "block_kind": "same_cluster",
+                "blocked_cluster": "ownership_cluster",
+                "lock_rounds": 0,
+                "score_regime": "trend_capture_v5",
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            journal_path = Path(tmpdir) / "journal.jsonl"
+            journal_path.write_text("")
+            journal_path.with_suffix(".compact.json").write_text(
+                json.dumps(
+                    {
+                        "compacted_up_to": 1,
+                        "rounds": [
+                            {
+                                "score_regime": "trend_capture_v5",
+                                "exploration_summary": {
+                                    "ownership_cluster": {
+                                        "same_cluster_rounds": 1,
+                                        "lock_trigger_rounds": 0,
+                                    }
+                                },
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+            state = build_exploration_guard_state(
+                entries,
+                journal_path=journal_path,
+                score_regime="trend_capture_v5",
+                current_iteration=3,
+            )
+
+        self.assertEqual(state["history_counts"]["ownership_cluster"]["same_cluster_rounds"], 2)
+
+    def test_journal_summary_emits_direction_cooling_board(self):
+        entries = [
+            {
+                "iteration": 4,
+                "candidate_id": "blocked_lock",
+                "outcome": "exploration_blocked",
+                "stop_stage": "blocked_same_cluster",
+                "promotion_score": None,
+                "quality_score": None,
+                "promotion_delta": None,
+                "gate_reason": "同簇低变化近邻：ownership_cluster 将冷却 3 轮",
+                "block_kind": "same_cluster",
+                "blocked_cluster": "ownership_cluster",
+                "lock_rounds": 3,
+                "lock_level": 1,
+                "lock_trigger_iteration": 4,
+                "lock_expires_before_iteration": 8,
+                "change_tags": ["ownership_takeover"],
+                "edited_regions": ["strategy"],
+                "hypothesis": "同簇近邻重复",
+                "score_regime": "trend_capture_v5",
+            }
+        ]
+
+        summary = build_journal_prompt_summary(
+            entries,
+            limit=8,
+            current_score_regime="trend_capture_v5",
+            current_iteration=5,
+        )
+
+        self.assertIn("方向冷却表", summary)
+        self.assertIn("ownership_cluster", summary)
+        self.assertIn("COOLING", summary)
+
+
+class FreqtradeAdapterFixesTest(unittest.TestCase):
+    def test_build_signal_frame_derives_higher_timeframes_from_15m_with_flow_columns(self):
+        rows = []
+        for index in range(64):
+            base_price = 100.0 + index * 0.5
+            volume = 50.0 + index
+            taker_buy_volume = volume * 0.58
+            rows.append(
+                {
+                    "timestamp": index * 900_000,
+                    "open": base_price,
+                    "high": base_price + 1.2,
+                    "low": base_price - 1.0,
+                    "close": base_price + 0.6,
+                    "volume": volume,
+                    "trade_count": 200 + index,
+                    "taker_buy_volume": taker_buy_volume,
+                    "taker_sell_volume": volume - taker_buy_volume,
+                }
+            )
+        df_15m = pd.DataFrame(rows)
+
+        signal_frame = ft_adapter.build_signal_frame(df_15m)
+
+        self.assertIn("trade_count_ratio_1h", signal_frame.columns)
+        self.assertIn("flow_imbalance_4h", signal_frame.columns)
+        tail = signal_frame.tail(1).iloc[0]
+        self.assertFalse(pd.isna(tail["trade_count_ratio_1h"]))
+        self.assertFalse(pd.isna(tail["flow_imbalance_4h"]))
 
     def test_cluster_key_prefers_stable_canonical_cluster(self):
         self.assertEqual(
@@ -805,6 +1143,72 @@ class JournalPromptFixesTest(unittest.TestCase):
         self.assertIn("探索触发（必须执行）", summary)
         self.assertIn("impulse_persistence", summary)
         self.assertIn("continuation_energy_decay", summary)
+
+    def test_journal_summary_emits_exploration_trigger_after_three_same_gate_rejections(self):
+        entries = []
+        for idx in range(3):
+            entries.append(
+                {
+                    "iteration": idx + 1,
+                    "candidate_id": f"gate_blocked_{idx}",
+                    "outcome": "rejected",
+                    "stop_stage": "full_eval",
+                    "promotion_score": 0.40,
+                    "quality_score": 0.33,
+                    "promotion_delta": 0.0,
+                    "gate_reason": "开发期滚动波动过大(0.46)",
+                    "change_tags": ["long_relay_entry", "fourh_participation"],
+                    "edited_regions": ["_trend_quality_ok"],
+                    "closest_failed_cluster": "participation_cluster",
+                    "hypothesis": "连续几轮都被同一个开发期 gate 拦下。",
+                    "core_factors": [
+                        {
+                            "name": "fourh_relay_ratio",
+                            "thesis": "4h 接力阈值过严会错过多头早段。",
+                            "current_signal": "最近几轮都在 participation_cluster 内低变化打转。",
+                        }
+                    ],
+                    "metrics": {
+                        "total_trades": 70.0,
+                        "avg_fee_drag": 0.64,
+                        "combined_trend_capture_score": 0.46,
+                        "segment_hit_rate": 0.46,
+                        "bull_capture_score": 0.16,
+                        "bear_capture_score": 0.60,
+                    },
+                    "score_regime": "trend_capture_v5",
+                }
+            )
+
+        summary = build_journal_prompt_summary(entries, limit=8, current_score_regime="trend_capture_v5")
+
+        self.assertIn("探索触发（必须执行）", summary)
+        self.assertIn("participation_cluster", summary)
+        self.assertIn("fourh_relay_ratio", summary)
+
+    def test_journal_summary_prefers_final_decision_reason_over_gate_pass_marker(self):
+        entries = [
+            {
+                "iteration": 11,
+                "candidate_id": "candidate_final_reason",
+                "outcome": "rejected",
+                "stop_stage": "full_eval",
+                "promotion_score": 0.48,
+                "quality_score": 0.77,
+                "promotion_delta": 0.0,
+                "gate_reason": "通过",
+                "note": "晋级分提升不足(0.00 <= 0.02)",
+                "change_tags": ["ownership_reset"],
+                "edited_regions": ["strategy"],
+                "hypothesis": "虽然通过 gate，但没有刷新最优。",
+                "score_regime": "trend_capture_v4",
+            }
+        ]
+
+        summary = build_journal_prompt_summary(entries, limit=8, current_score_regime="trend_capture_v4")
+
+        self.assertIn("晋级分提升不足", summary)
+        self.assertNotIn("| 11 | 未保留 | 完整评估 | 0.77 | 0.48 | - | - | - | - | 通过 |", summary)
 
     def test_journal_summary_emits_exploration_trigger_after_three_duplicate_skips(self):
         entries = []

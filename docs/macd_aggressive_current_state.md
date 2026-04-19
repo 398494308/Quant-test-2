@@ -7,6 +7,9 @@
 - 策略：`src/strategy_macd_aggressive.py`
 - 回测器：`src/backtest_macd_aggressive.py`
 - 当前评分口径：`trend_capture_v5`
+- 当前事实源：`15m`
+- `1h` / `4h` 只是由 `15m` 聚合出来的确认层
+- 成交量维度除了总量，还包含 `trade_count`、`taker_buy_volume`、`taker_sell_volume`
 
 ## 当前时间切分
 
@@ -87,6 +90,7 @@
 - validation 聚合诊断可见
 - hidden test 完全不可见
 - 最近轮次拆成“核心指标表 + 元信息摘要”
+- journal 里新增 `方向冷却表（系统硬约束）`
 - 防重复规则只保留一份，不再多处复写
 
 ## 当前 Discord 口径
@@ -113,7 +117,12 @@ Discord 现在优先播报：
 
 - `smoke` 先跑少量窗口
 - 候选报错时会在同一轮 repair
+- 同簇低变化近邻会在评估前被系统拦截，不再白跑 `smoke/full eval`
+- 被探索硬约束拦截后，会在同一轮里强制重生候选方向
+- 同一方向簇再次触发该机制后，会进入短期冷却锁
+- 冷却锁采用 `3 -> 6 -> 10` 轮递增
 - `duplicate source / duplicate hash / empty diff` 会写入 journal
+- `exploration_blocked` 表示候选在评估前就被系统探索硬约束拒收
 - heartbeat 会写出当前阶段和窗口名
 - provider timeout 默认 `600s`
 
@@ -121,6 +130,7 @@ Discord 现在优先播报：
 
 - 这是一次新的评分 regime 切换，旧 `trend_capture_v4` 历史不会再作为主参考。
 - 新 regime 下的 best 会在研究器下一次初始化或下一轮运行后重新沉淀。
+- 如果本地价格 CSV 还是旧格式，需要先重新运行 `python3 scripts/download_aggressive_data.py`，生成带 flow 列的新 `15m/1h/4h/1m` 数据。
 - 如果要看现在的真实基线，请直接跑：
 
 ```bash

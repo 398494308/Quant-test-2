@@ -1107,7 +1107,7 @@ def summarize_evaluation(
 
     weakest_signals = _aggregate_signal_stats(results, "eval")
     summary_lines = [
-        "研究评估摘要",
+        "研究评估摘要（15m 为唯一事实源，1h/4h 只是由 15m 聚合的确认层；成交量诊断同时看总量、主动买卖量和成交活跃度）",
         (
             "开发期滚动分(均值/中位/std/盈利窗比): "
             f"{development_mean_score:.2f} / {development_median_score:.2f} / "
@@ -1158,7 +1158,7 @@ def summarize_evaluation(
         summary_lines.extend(["", "拖累较大的信号:", *weakest_signals])
 
     prompt_lines = [
-        f"当前策略是 BTC 激进趋势策略：15m 执行，1h/4h 确认，目标是抓大行情的到来、陪跑主趋势、在掉头时退出或反手。",
+        f"当前策略是 BTC 激进趋势策略：15m 是唯一事实源，1h/4h 只是由 15m 聚合的确认层；突破除了总成交量，也会看主动买卖量和成交活跃度。目标是抓大行情的到来、陪跑主趋势、在掉头时退出或反手。",
         f"当前基底质量分={quality_score:.2f}，晋级分={promotion_score:.2f}，gate={gate_reason}",
         (
             f"开发期滚动分均值/中位/std/盈利窗比="

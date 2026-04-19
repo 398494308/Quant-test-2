@@ -48,14 +48,23 @@ from research_v2.evaluation import (
 from research_v2.journal import (
     append_journal_entry,
     build_journal_prompt_summary,
+    evaluate_candidate_exploration_guard,
     cluster_key_for_components,
+    exploration_signature_for_candidate,
     has_recent_code_hash,
     load_journal_entries,
+    region_families_for_regions,
+    target_family_from_text,
     maybe_compact,
 )
 from research_v2.notifications import build_discord_summary_message, load_discord_config, send_discord_message
-from research_v2.prompting import EDITABLE_REGIONS, build_candidate_response_schema, build_strategy_research_prompt
-from research_v2.prompting import build_strategy_runtime_repair_prompt
+from research_v2.prompting import (
+    EDITABLE_REGIONS,
+    build_candidate_response_schema,
+    build_strategy_exploration_repair_prompt,
+    build_strategy_research_prompt,
+    build_strategy_runtime_repair_prompt,
+)
 from research_v2.strategy_code import (
     StrategyCandidate,
     StrategyCoreFactor,
@@ -175,6 +184,14 @@ def reload_strategy_module() -> None:
 
 def _model_client_config():
     return replace(load_strategy_client_config(), approval_policy="never", sandbox="danger-full-access")
+
+
+def _cluster_lock_schedule() -> tuple[int, int, int]:
+    return (
+        RUNTIME.cluster_lock_rounds_stage1,
+        RUNTIME.cluster_lock_rounds_stage2,
+        RUNTIME.cluster_lock_rounds_stage3,
+    )
 
 
 @contextlib.contextmanager
@@ -591,6 +608,7 @@ def _build_model_candidate(
             limit=RUNTIME.max_recent_journal_entries,
             journal_path=RUNTIME.paths.journal_file,
             current_score_regime=SCORE_REGIME,
+            current_iteration=iteration_counter,
         ),
         previous_best_score=report.metrics["promotion_score"],
     )
@@ -680,8 +698,61 @@ def _repair_model_candidate(
             expected_effects=repaired.expected_effects,
             core_factors=repaired.core_factors,
             strategy_code=repaired.strategy_code,
-        )
+    )
     return repaired
+
+
+def _regenerate_model_candidate(
+    *,
+    base_source: str,
+    failed_candidate: StrategyCandidate,
+    block_info: dict[str, Any],
+    regeneration_attempt: int,
+    workspace_root: Path,
+) -> StrategyCandidate:
+    prompt = build_strategy_exploration_repair_prompt(
+        candidate_id=failed_candidate.candidate_id,
+        hypothesis=failed_candidate.hypothesis,
+        change_plan=failed_candidate.change_plan,
+        change_tags=failed_candidate.change_tags,
+        edited_regions=failed_candidate.edited_regions,
+        expected_effects=failed_candidate.expected_effects,
+        closest_failed_cluster=failed_candidate.closest_failed_cluster,
+        novelty_proof=failed_candidate.novelty_proof,
+        block_kind=str(block_info.get("block_kind", "")).strip() or "same_cluster",
+        blocked_cluster=str(block_info.get("blocked_cluster", "")).strip() or "-",
+        blocked_reason=str(block_info.get("blocked_reason", "")).strip() or "系统拒收",
+        locked_clusters=tuple(block_info.get("current_locks", ()) or ()),
+        regeneration_attempt=regeneration_attempt,
+    )
+    with _temporary_cwd(workspace_root):
+        payload = generate_json_object(
+            prompt=prompt,
+            system_prompt=(
+                "你是严谨的量化研究员。"
+                "只输出 JSON，不要解释，不要 markdown。"
+                "你正在同一轮里重生候选方向，不要把它当成新一轮研究。"
+                "你必须直接修改工作区中的 src/strategy_macd_aggressive.py。"
+                "不要在 JSON 中返回源码。"
+                "除 candidate_id 与 change_tags 外，其余说明字段必须使用简体中文。"
+            ),
+            max_output_tokens=RUNTIME.prompt_max_output_tokens,
+            config=_model_client_config(),
+            text_format=build_json_text_format(
+                schema=build_candidate_response_schema(),
+                schema_name="macd_aggressive_strategy_candidate_regeneration_v2",
+                strict=True,
+            ),
+            progress_callback=_build_model_progress_callback(
+                "model_regenerate",
+                repair_attempt=regeneration_attempt,
+            ),
+        )
+    return _candidate_from_payload(
+        payload,
+        workspace_strategy_file=workspace_root / MODEL_WORKSPACE_STRATEGY_PATH,
+        base_source=base_source,
+    )
 
 
 def build_strategy_candidate(base_source: str, *, workspace_root: Path) -> StrategyCandidate:
@@ -795,15 +866,18 @@ def _build_journal_entry(
     stop_stage: str,
     gate_reason: str | None = None,
     note: str | None = None,
+    extra_fields: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     base_promotion = best_report.metrics["promotion_score"] if best_report is not None else 0.0
     diff_summary = build_diff_summary(base_source, candidate.strategy_code, limit=18)
     promotion_score = candidate_report.metrics["promotion_score"] if candidate_report is not None else None
     quality_score = candidate_report.metrics["quality_score"] if candidate_report is not None else None
+    eval_gate_reason = candidate_report.gate_reason if candidate_report is not None else (gate_reason or "unknown")
     resolved_gate_reason = gate_reason or (
-        candidate_report.gate_reason if candidate_report is not None else "unknown"
+        eval_gate_reason
     )
-    return {
+    candidate_signature = exploration_signature_for_candidate(candidate)
+    entry = {
         "iteration": iteration_id,
         "timestamp": datetime.now(UTC).isoformat(),
         "candidate_id": candidate.candidate_id,
@@ -832,12 +906,24 @@ def _build_journal_entry(
         "promotion_score": promotion_score,
         "promotion_delta": promotion_score - base_promotion if promotion_score is not None else None,
         "gate_reason": resolved_gate_reason,
+        "decision_reason": resolved_gate_reason,
+        "eval_gate_reason": eval_gate_reason,
         "metrics": candidate_report.metrics if candidate_report is not None else {},
         "note": note or "",
         "code_hash": source_hash(candidate.strategy_code),
         "diff_summary": diff_summary,
+        "region_families": sorted(region_families_for_regions(candidate.edited_regions)),
+        "target_family": target_family_from_text(
+            candidate.change_tags,
+            candidate.hypothesis,
+            candidate.expected_effects,
+        ),
+        "core_factor_names": sorted(candidate_signature["core_factor_names"]),
         "score_regime": SCORE_REGIME,
     }
+    if extra_fields:
+        entry.update(extra_fields)
+    return entry
 
 
 def _promotion_acceptance_decision(report: EvaluationReport) -> tuple[bool, str]:
@@ -877,6 +963,43 @@ def _record_duplicate_skip(
             stop_stage=stop_stage,
             gate_reason=gate_reason,
             note=note,
+        ),
+    )
+    if maybe_compact(RUNTIME.paths.journal_file):
+        log_info("研究日志已压缩")
+
+
+def _record_exploration_block(
+    *,
+    iteration_id: int,
+    candidate: StrategyCandidate,
+    base_source: str,
+    block_info: dict[str, Any],
+) -> None:
+    append_journal_entry(
+        RUNTIME.paths.journal_file,
+        _build_journal_entry(
+            iteration_id=iteration_id,
+            candidate=candidate,
+            base_source=base_source,
+            candidate_report=None,
+            outcome="exploration_blocked",
+            stop_stage=str(block_info.get("stop_stage", "blocked_same_cluster")),
+            gate_reason=str(block_info.get("blocked_reason", "")).strip() or "探索方向被系统拒收",
+            note=str(block_info.get("blocked_reason", "")).strip() or "探索方向被系统拒收",
+            extra_fields={
+                "block_kind": str(block_info.get("block_kind", "")).strip(),
+                "blocked_cluster": str(block_info.get("blocked_cluster", "")).strip(),
+                "lock_rounds": int(block_info.get("lock_rounds", 0) or 0),
+                "lock_level": int(block_info.get("lock_level", 0) or 0),
+                "lock_trigger_iteration": int(block_info.get("lock_trigger_iteration", 0) or 0),
+                "lock_expires_before_iteration": int(block_info.get("lock_expires_before_iteration", 0) or 0),
+                "current_locks": list(block_info.get("current_locks", ()) or ()),
+                "low_change_tags": list(block_info.get("low_change_tags", ()) or ()),
+                "low_change_regions": list(block_info.get("low_change_regions", ()) or ()),
+                "low_change_targets": list(block_info.get("low_change_targets", ()) or ()),
+                "low_change_factors": list(block_info.get("low_change_factors", ()) or ()),
+            },
         ),
     )
     if maybe_compact(RUNTIME.paths.journal_file):
@@ -977,47 +1100,97 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
         write_strategy_source(workspace_strategy_file, best_source)
 
         candidate = build_strategy_candidate(best_source, workspace_root=workspace_root)
-        candidate_hash = source_hash(candidate.strategy_code)
-        journal_entries = load_journal_entries(RUNTIME.paths.journal_file)
+        for regeneration_attempt in range(0, max(0, RUNTIME.max_exploration_regen_attempts) + 1):
+            journal_entries = load_journal_entries(RUNTIME.paths.journal_file)
+            candidate_hash = source_hash(candidate.strategy_code)
 
-        if candidate_hash == source_hash(best_source):
-            _record_duplicate_skip(
-                iteration_id=iteration_id,
-                candidate=candidate,
-                base_source=best_source,
-                stop_stage="duplicate_source",
-                gate_reason="候选源码与当前最优完全相同",
-                note="模型未产生有效代码改动；本轮按重复探索记入研究历史。",
-            )
-            log_info(f"第 {iteration_id} 轮跳过: 候选源码与当前最优完全相同")
-            write_heartbeat("iteration_skipped", message=f"iteration {iteration_id} duplicate source")
-            return "duplicate_skipped"
-        if has_recent_code_hash(journal_entries, candidate_hash):
-            _record_duplicate_skip(
-                iteration_id=iteration_id,
-                candidate=candidate,
-                base_source=best_source,
-                stop_stage="duplicate_history",
-                gate_reason="候选源码命中最近研究历史",
-                note="模型重复产出了最近已出现过的候选源码；本轮按重复探索记入研究历史。",
-            )
-            log_info(f"第 {iteration_id} 轮跳过: 候选源码命中最近研究历史")
-            write_heartbeat("iteration_skipped", message=f"iteration {iteration_id} duplicate journal hash")
-            return "duplicate_skipped"
+            if candidate_hash == source_hash(best_source):
+                _record_duplicate_skip(
+                    iteration_id=iteration_id,
+                    candidate=candidate,
+                    base_source=best_source,
+                    stop_stage="duplicate_source",
+                    gate_reason="候选源码与当前最优完全相同",
+                    note="模型未产生有效代码改动；本轮按重复探索记入研究历史。",
+                )
+                log_info(f"第 {iteration_id} 轮跳过: 候选源码与当前最优完全相同")
+                write_heartbeat("iteration_skipped", message=f"iteration {iteration_id} duplicate source")
+                return "duplicate_skipped"
+            if has_recent_code_hash(journal_entries, candidate_hash):
+                _record_duplicate_skip(
+                    iteration_id=iteration_id,
+                    candidate=candidate,
+                    base_source=best_source,
+                    stop_stage="duplicate_history",
+                    gate_reason="候选源码命中最近研究历史",
+                    note="模型重复产出了最近已出现过的候选源码；本轮按重复探索记入研究历史。",
+                )
+                log_info(f"第 {iteration_id} 轮跳过: 候选源码命中最近研究历史")
+                write_heartbeat("iteration_skipped", message=f"iteration {iteration_id} duplicate journal hash")
+                return "duplicate_skipped"
 
-        diff_summary = build_diff_summary(best_source, candidate.strategy_code, limit=12)
-        if not diff_summary:
-            _record_duplicate_skip(
+            diff_summary = build_diff_summary(best_source, candidate.strategy_code, limit=12)
+            if not diff_summary:
+                _record_duplicate_skip(
+                    iteration_id=iteration_id,
+                    candidate=candidate,
+                    base_source=best_source,
+                    stop_stage="empty_diff",
+                    gate_reason="候选没有产生有效 diff",
+                    note="候选虽然通过了解析，但没有形成可验证的有效改动；本轮按重复探索记入研究历史。",
+                )
+                log_info(f"第 {iteration_id} 轮跳过: 候选没有产生有效 diff")
+                write_heartbeat("iteration_skipped", message=f"iteration {iteration_id} empty diff")
+                return "duplicate_skipped"
+
+            block_info = evaluate_candidate_exploration_guard(
+                candidate,
+                journal_entries,
+                journal_path=RUNTIME.paths.journal_file,
+                score_regime=SCORE_REGIME,
+                current_iteration=iteration_id,
+                lock_schedule=_cluster_lock_schedule(),
+                include_current_round_locks=True,
+            )
+            if block_info is None:
+                break
+
+            _record_exploration_block(
                 iteration_id=iteration_id,
                 candidate=candidate,
                 base_source=best_source,
-                stop_stage="empty_diff",
-                gate_reason="候选没有产生有效 diff",
-                note="候选虽然通过了解析，但没有形成可验证的有效改动；本轮按重复探索记入研究历史。",
+                block_info=block_info,
             )
-            log_info(f"第 {iteration_id} 轮跳过: 候选没有产生有效 diff")
-            write_heartbeat("iteration_skipped", message=f"iteration {iteration_id} empty diff")
-            return "duplicate_skipped"
+            log_info(
+                f"第 {iteration_id} 轮候选在评估前被系统拦截: "
+                f"{block_info['blocked_reason']}"
+            )
+            if regeneration_attempt >= RUNTIME.max_exploration_regen_attempts:
+                write_strategy_source(RUNTIME.paths.strategy_file, best_source)
+                reload_strategy_module()
+                write_heartbeat(
+                    "iteration_exploration_blocked",
+                    message=f"iteration {iteration_id} exploration blocked",
+                    block_kind=block_info["block_kind"],
+                    blocked_cluster=block_info["blocked_cluster"],
+                )
+                return "exploration_blocked"
+
+            write_heartbeat(
+                "candidate_regenerating",
+                message=f"iteration {iteration_id} regenerating candidate",
+                regeneration_attempt=regeneration_attempt + 1,
+                max_regeneration_attempts=RUNTIME.max_exploration_regen_attempts,
+                block_kind=block_info["block_kind"],
+                blocked_cluster=block_info["blocked_cluster"],
+            )
+            candidate = _regenerate_model_candidate(
+                base_source=best_source,
+                failed_candidate=candidate,
+                block_info=block_info,
+                regeneration_attempt=regeneration_attempt + 1,
+                workspace_root=workspace_root,
+            )
 
         try:
             candidate, candidate_report = _candidate_with_repair(
@@ -1094,6 +1267,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
         candidate_report=candidate_report,
         outcome="accepted" if accepted else "rejected",
         stop_stage="full_eval",
+        gate_reason=decision_reason if not accepted else None,
         note=entry_note,
     )
 
@@ -1262,7 +1436,7 @@ def main() -> int:
             continue
 
         if args.once:
-            return 0 if outcome in {"accepted", "rejected", "duplicate_skipped", "runtime_failed"} else 1
+            return 0 if outcome in {"accepted", "rejected", "duplicate_skipped", "runtime_failed", "exploration_blocked"} else 1
 
         write_heartbeat(
             "sleeping",

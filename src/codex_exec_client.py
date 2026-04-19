@@ -34,6 +34,7 @@ class StrategyClientConfig:
     codex_bin: str
     model: str
     reasoning_effort: str
+    approval_policy: str
     sandbox: str
     timeout_seconds: int
     use_ephemeral: bool
@@ -43,6 +44,7 @@ class StrategyClientConfig:
             f"runner={self.codex_bin} "
             f"model={self.model} "
             f"effort={self.reasoning_effort} "
+            f"approval={self.approval_policy} "
             f"sandbox={self.sandbox} "
             f"timeout={self.timeout_seconds}s "
             f"ephemeral={int(self.use_ephemeral)}"
@@ -61,8 +63,9 @@ def load_strategy_client_config() -> StrategyClientConfig:
         codex_bin=os.getenv("CODEX_BIN", "codex").strip() or "codex",
         model=os.getenv("CODEX_MODEL", os.getenv("OPENAI_MODEL", "gpt-5.4")).strip() or "gpt-5.4",
         reasoning_effort=os.getenv("CODEX_REASONING_EFFORT", "medium").strip() or "medium",
+        approval_policy=os.getenv("CODEX_APPROVAL_POLICY", "never").strip() or "never",
         sandbox=os.getenv("CODEX_SANDBOX", "read-only").strip() or "read-only",
-        timeout_seconds=int(os.getenv("CODEX_TIMEOUT_SECONDS", "420")),
+        timeout_seconds=int(os.getenv("CODEX_TIMEOUT_SECONDS", "600")),
         use_ephemeral=_env_flag("CODEX_EPHEMERAL", True),
     )
 
@@ -208,6 +211,8 @@ def generate_json_object(
 
     command = [
         client_config.codex_bin,
+        "-a",
+        client_config.approval_policy,
         "exec",
         "--cd",
         str(Path.cwd()),

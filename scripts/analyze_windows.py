@@ -189,7 +189,7 @@ def _run_trade_trace(
         execution_timestamps = [r["timestamp"] for r in execution_rows]
 
     # Load funding data
-    funding_file = str(REPO_ROOT / "data/funding/OKX_BTC_USDT_SWAP_funding_20240601_20260401.csv")
+    funding_file = str(bt.DEFAULT_FUNDING_FILE)
     funding_rows = []
     funding_timestamps = []
     if Path(funding_file).exists() and int(exit_p.get("funding_fee_enabled", 1)) > 0:

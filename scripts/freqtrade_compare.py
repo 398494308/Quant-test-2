@@ -44,13 +44,14 @@ def run_core_signal_check():
     """直接运行主策略函数，统计不受仓位管理影响的原始信号。"""
     bt_engine.load_ohlcv_data.cache_clear()
     intraday_all = bt_engine.load_ohlcv_data(str(BASE_DIR / "data/price/BTCUSDT_futures_15m_20240601_20260401.csv"))
-    hourly_all = bt_engine.load_ohlcv_data(str(BASE_DIR / "data/price/BTCUSDT_futures_1h_20240601_20260401.csv"))
+    hourly_all = bt_engine._aggregate_bars(intraday_all, 4)
     start_idx, end_idx = bt_engine._beijing_window_indices(intraday_all, START_DATE, END_DATE)
     if start_idx >= end_idx or not hourly_all:
         raise ValueError(f"missing data for window {START_DATE}~{END_DATE}")
 
     intraday_interval_ms = bt_engine._infer_interval_ms(intraday_all, 15)
     hourly_interval_ms = bt_engine._infer_interval_ms(hourly_all, 60)
+    flow_lookback = strat_module.PARAMS.get("flow_lookback", strat_module.PARAMS["volume_lookback"])
     intraday_state = bt_engine._prepare_state(
         intraday_all,
         strat_module.PARAMS["intraday_ema_fast"],
@@ -58,6 +59,7 @@ def run_core_signal_check():
         strat_module.PARAMS["macd_fast"],
         strat_module.PARAMS["macd_slow"],
         strat_module.PARAMS["macd_signal"],
+        flow_lookback=flow_lookback,
     )
     hourly_state = bt_engine._prepare_state(
         hourly_all,
@@ -67,8 +69,9 @@ def run_core_signal_check():
         strat_module.PARAMS["macd_slow"],
         strat_module.PARAMS["macd_signal"],
         strat_module.PARAMS.get("hourly_ema_anchor"),
+        flow_lookback=flow_lookback,
     )
-    four_hour_data = bt_engine._aggregate_bars(hourly_all, 4)
+    four_hour_data = bt_engine._aggregate_bars(intraday_all, 16)
     four_hour_state = bt_engine._prepare_state(
         four_hour_data,
         strat_module.PARAMS["fourh_ema_fast"],
@@ -76,6 +79,7 @@ def run_core_signal_check():
         strat_module.PARAMS["macd_fast"],
         strat_module.PARAMS["macd_slow"],
         strat_module.PARAMS["macd_signal"],
+        flow_lookback=flow_lookback,
     )
 
     four_hour_interval_ms = bt_engine._infer_interval_ms(four_hour_data, 240) if four_hour_data else 240 * 60_000
@@ -109,6 +113,13 @@ def run_core_signal_check():
             "adx": intraday_context["adx"],
             "atr": intraday_context["atr"],
             "atr_ratio": intraday_context["atr_ratio"],
+            "trade_count": intraday_context["trade_count"],
+            "trade_count_ratio": intraday_context["trade_count_ratio"],
+            "taker_buy_volume": intraday_context["taker_buy_volume"],
+            "taker_sell_volume": intraday_context["taker_sell_volume"],
+            "taker_buy_ratio": intraday_context["taker_buy_ratio"],
+            "taker_sell_ratio": intraday_context["taker_sell_ratio"],
+            "flow_imbalance": intraday_context["flow_imbalance"],
             "rsi": intraday_context["rsi"],
             "chop": intraday_context["chop"],
             "macd_line": intraday_context["macd_line"],
@@ -136,29 +147,12 @@ def run_freqtrade_signal_check():
     import pandas as pd
 
     df_15m = pd.read_csv(BASE_DIR / "data/price/BTCUSDT_futures_15m_20240601_20260401.csv")
-    df_1h = pd.read_csv(BASE_DIR / "data/price/BTCUSDT_futures_1h_20240601_20260401.csv")
-
-    df_1h_sorted = df_1h.sort_values("timestamp").reset_index(drop=True)
-    df_4h_rows = []
-    for i in range(0, len(df_1h_sorted) - 3, 4):
-        chunk = df_1h_sorted.iloc[i : i + 4]
-        df_4h_rows.append(
-            {
-                "timestamp": chunk.iloc[0]["timestamp"],
-                "open": chunk.iloc[0]["open"],
-                "high": chunk["high"].max(),
-                "low": chunk["low"].min(),
-                "close": chunk.iloc[-1]["close"],
-                "volume": chunk["volume"].sum(),
-            }
-        )
-    df_4h = pd.DataFrame(df_4h_rows)
 
     from backtest_macd_aggressive import _beijing_timestamp_ms
 
     start_ts = _beijing_timestamp_ms(START_DATE)
     end_ts = _beijing_timestamp_ms(END_DATE) + 24 * 60 * 60 * 1000
-    signal_frame = ft_adapter.build_signal_frame(df_15m, df_1h, df_4h)
+    signal_frame = ft_adapter.build_signal_frame(df_15m)
     mask = (signal_frame["timestamp"] >= start_ts) & (signal_frame["timestamp"] < end_ts)
     signal_frame = signal_frame[mask].copy().reset_index(drop=True)
 

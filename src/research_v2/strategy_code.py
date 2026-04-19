@@ -62,6 +62,14 @@ PARAM_BOUNDS: dict[str, tuple[float, float]] = {
     # 成交量
     "breakout_volume_ratio_min": (0.5, 5.0),
     "breakdown_volume_ratio_min": (0.5, 5.0),
+    "breakout_trade_count_ratio_min": (0.5, 4.0),
+    "breakdown_trade_count_ratio_min": (0.5, 4.0),
+    "breakout_taker_buy_ratio_min": (0.45, 0.95),
+    "breakdown_taker_sell_ratio_min": (0.45, 0.95),
+    "breakout_flow_imbalance_min": (-0.30, 0.90),
+    "breakdown_flow_imbalance_max": (-0.90, 0.30),
+    "hourly_flow_confirmation_min": (0.0, 0.40),
+    "fourh_flow_confirmation_min": (0.0, 0.40),
     # K 线形态
     "breakout_body_ratio_min": (0.1, 0.9),
     "breakdown_body_ratio_min": (0.1, 0.9),
@@ -80,6 +88,7 @@ PARAM_BOUNDS: dict[str, tuple[float, float]] = {
     "macd_signal": (3, 15),
     # 成交量回看
     "volume_lookback": (5, 40),
+    "flow_lookback": (3, 40),
 }
 
 PARAM_RELATIONS: tuple[tuple[str, str, str], ...] = (
