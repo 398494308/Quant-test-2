@@ -10,9 +10,19 @@ from typing import Any
 
 EDITABLE_REGIONS = (
     "PARAMS",
+    "_sideways_release_flags",
     "_is_sideways_regime",
+    "_flow_signal_metrics",
+    "_flow_confirmation_ok",
+    "_flow_entry_ok",
+    "_trend_quality_long",
+    "_trend_quality_short",
     "_trend_quality_ok",
+    "_trend_followthrough_long",
+    "_trend_followthrough_short",
     "_trend_followthrough_ok",
+    "_long_entry_signal",
+    "_short_entry_signal",
     "strategy",
 )
 
@@ -39,7 +49,7 @@ def build_candidate_response_schema() -> dict[str, Any]:
                 "type": "array",
                 "items": {"type": "string", "enum": list(EDITABLE_REGIONS)},
                 "minItems": 1,
-                "maxItems": len(EDITABLE_REGIONS),
+                "maxItems": 3,
             },
             "expected_effects": {
                 "type": "array",
@@ -86,6 +96,8 @@ def build_strategy_research_prompt(
     evaluation_summary: str,
     journal_summary: str,
     previous_best_score: float,
+    score_regime: str = "trend_capture_v6",
+    promotion_min_delta: float = 0.02,
 ) -> str:
     return f"""你是 BTC 合约激进趋势策略研究员。
 
@@ -97,7 +109,7 @@ def build_strategy_research_prompt(
 
 你的任务不是机械拨参数，而是围绕一个可证伪的假设，修改 `src/strategy_macd_aggressive.py`，提升这套策略对 BTC 大趋势的捕获能力。
 
-当前最优晋级分：{previous_best_score:.2f}
+当前 champion 参考晋级分：{previous_best_score:.2f}
 
 思考框架：
 - 先看方向风险表，确认哪些方向簇仍然可用，哪些已经过热或接近耗尽。
@@ -110,9 +122,9 @@ def build_strategy_research_prompt(
 {evaluation_summary}
 
 记忆使用规则：
-- 当前评分口径 `trend_capture_v5` 的近期轮次、方向风险表和过拟合风险表，是本轮唯一主参考。
+- 当前评分口径 `{score_regime}` 的近期轮次、方向风险表和过拟合风险表，是本轮唯一主参考。
 - 如果历史记忆里出现“旧评分口径弱参考”，只能把它当成因子家族或方向假设的弱启发。
-- 禁止把旧口径的分数、gate 通过/失败结论或旧 best，直接当成当前口径下仍然有效的证据。
+- 禁止把旧口径的分数、gate 通过/失败结论或旧 champion，直接当成当前口径下仍然有效的证据。
 
 历史研究记忆：
 {journal_summary}
@@ -124,15 +136,16 @@ def build_strategy_research_prompt(
 - 除 `src/strategy_macd_aggressive.py` 外，不要创建、修改或删除其他文件
 
 评分方式：
-- 当前评分口径是 `trend_capture_v5`。
+- 当前评分口径是 `{score_regime}`。
 - `development` 使用滚动 walk-forward 窗口，看均值、中位数、波动和盈利窗口占比。
 - `validation` 是单段连续 holdout，`promotion_score` 只看这里。
 - `test` 是隐藏验收集，你完全看不到，也不会参与本轮调参。
 - `trend_capture_score` 看三件事：到来阶段是否及时跟上、主趋势中段是否陪跑、掉头时是否及时退出或反手。
 - `return_score` 看连续路径最终把资金放大了多少。
 - `quality_score` 是开发期滚动窗口的均值分；`promotion_score` 是验证集连续分。
+- 只有在 `gate` 通过，且相对当前 champion 的有效 `promotion_delta > {promotion_min_delta:.2f}` 时，候选才有资格刷新当前主参考。
 - 验证集还会检查 `3` 个连续时间分块、开发期与验证集的分差、以及验证期多空交易支持是否过弱。
-- 选择期连续结果只做诊断，不直接决定能否刷新最优。
+- 选择期连续结果只做诊断，不直接决定能否刷新当前主参考。
 
 关键门禁（触碰即淘汰）：
 - development 滚动均值分不能太低
@@ -156,6 +169,7 @@ def build_strategy_research_prompt(
 - 探索轮允许结果变差，但不允许只换 tag、只换措辞、只拨轻微阈值，或只在同一 edited region family 里做近邻微调。
 - 若系统提示“同簇低变化近邻已被拒收”，下一次必须优先切到不同方向簇；若确实留在同簇，至少同时切换 edited region family 与 long-short target 或核心因子家族。
 - 若仍借鉴高风险轮次或留在热簇，`novelty_proof` 必须明确说明：本轮与最近失败方向的差异、会改变哪类交易路径、以及至少两个预计会明显变化的关键诊断。
+- 系统会根据真实代码 diff、参数变更族和 AST 结构自动派生 `system signature`；`edited_regions` / `change_tags` 只是你的说明，不能替代真实改动。
 
 硬约束：
 - 只允许修改 `src/strategy_macd_aggressive.py`。
@@ -163,7 +177,7 @@ def build_strategy_research_prompt(
 - 保留 `PARAMS`、`strategy()`、`_is_sideways_regime()`、`_trend_quality_ok()`、`_trend_followthrough_ok()` 这些符号。
 - 不要删除、改名或只改一半仍被下游条件复用的共享中间变量；若重构某个布尔变量或上下文变量，必须同步更新全部引用，禁止留下未定义局部变量。
 - 不要引入网络、文件、随机数、外部依赖。
-- 每轮只做一个明确假设，最多改 1 到 3 个区域。
+- 每轮只做一个明确假设，最多改 `1` 到 `3` 个区域。
 - 不要为了显得“有改动”而重写无关逻辑、批量改名、做大面积格式化，或新增与本轮假设无关的分支。
 - 禁止 hard code 针对单个日期、单个窗口、单段行情、固定价格路径或历史结果表做特判。
 - 代码必须保持简洁、结构化、可读；优先最小必要改动，避免重复条件、冗余 helper、臃肿嵌套和一次性补丁式写法。

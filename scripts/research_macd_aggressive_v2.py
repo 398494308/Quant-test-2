@@ -89,11 +89,12 @@ DISCORD_CONFIG = load_discord_config()
 EVAL_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "eval")
 VALIDATION_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "validation")
 TEST_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "test")
-SCORE_REGIME = "trend_capture_v5"
+SCORE_REGIME = "trend_capture_v6"
 MODEL_WORKSPACE_STRATEGY_PATH = Path("src/strategy_macd_aggressive.py")
 
 best_source = ""
 best_report: EvaluationReport | None = None
+champion_report: EvaluationReport | None = None
 iteration_counter = 0
 
 logging.basicConfig(
@@ -192,6 +193,52 @@ def _cluster_lock_schedule() -> tuple[int, int, int]:
         RUNTIME.cluster_lock_rounds_stage2,
         RUNTIME.cluster_lock_rounds_stage3,
     )
+
+
+def _load_saved_reference_state() -> dict[str, Any]:
+    if not RUNTIME.paths.best_state_file.exists():
+        return {}
+    try:
+        payload = json.loads(RUNTIME.paths.best_state_file.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _reference_role() -> str:
+    return "champion" if champion_report is not None else "baseline"
+
+
+def _reference_benchmark_report() -> EvaluationReport | None:
+    return champion_report or best_report
+
+
+def _reference_manifest_payload(
+    source: str,
+    report: EvaluationReport,
+    *,
+    shadow_test_metrics: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    reference_payload = {
+        "code_hash": source_hash(source),
+        "metrics": report.metrics,
+        "gate_passed": report.gate_passed,
+        "gate_reason": report.gate_reason,
+        "shadow_test_metrics": shadow_test_metrics or {},
+    }
+    return {
+        "updated_at": datetime.now(UTC).isoformat(),
+        "score_regime": SCORE_REGIME,
+        "reference_role": _reference_role(),
+        "code_hash": reference_payload["code_hash"],
+        "reference": reference_payload,
+        "champion": reference_payload if champion_report is not None else None,
+        # Backward-compatible top-level fields for existing readers.
+        "metrics": reference_payload["metrics"],
+        "gate_passed": reference_payload["gate_passed"],
+        "gate_reason": reference_payload["gate_reason"],
+        "shadow_test_metrics": reference_payload["shadow_test_metrics"],
+    }
 
 
 @contextlib.contextmanager
@@ -437,9 +484,9 @@ def _build_chart_note(message: str) -> str:
     )
 
 
-def _generate_new_best_charts(iteration_id: int) -> PerformanceChartPaths:
+def _generate_new_champion_charts(iteration_id: int) -> PerformanceChartPaths:
     if not charts_available():
-        log_info("跳过新最优图表：matplotlib 不可用")
+        log_info("跳过新 champion 图表：matplotlib 不可用")
         return PerformanceChartPaths(validation_chart=None, selection_chart=None)
 
     chart_dir = _chart_output_dir()
@@ -447,9 +494,9 @@ def _generate_new_best_charts(iteration_id: int) -> PerformanceChartPaths:
     prepared_context = _prepare_backtest_context()
 
     write_heartbeat(
-        "new_best_charting",
+        "new_champion_charting",
         message=f"iteration {iteration_id} charting validation",
-        phase="new_best_charting",
+        phase="new_champion_charting",
         current_window=validation_window.label,
         window_index=1,
         window_count=2,
@@ -468,27 +515,27 @@ def _generate_new_best_charts(iteration_id: int) -> PerformanceChartPaths:
     selection_result = _run_selection_period_backtest(
         prepared_context,
         include_diagnostics=True,
-        heartbeat_phase="new_best_charting",
+        heartbeat_phase="new_champion_charting",
     )
 
     validation_chart = chart_dir / (
-        f"new_best_{iteration_id:04d}_validation_{validation_window.start_date}_{validation_window.end_date}.png"
+        f"new_champion_{iteration_id:04d}_validation_{validation_window.start_date}_{validation_window.end_date}.png"
     )
     selection_start, selection_end = _selection_period_bounds(WINDOWS)
     selection_chart = chart_dir / (
-        f"new_best_{iteration_id:04d}_selection_{selection_start}_{selection_end}.png"
+        f"new_champion_{iteration_id:04d}_selection_{selection_start}_{selection_end}.png"
     )
 
     validation_chart = render_performance_chart(
         daily_equity_curve=validation_result.get("daily_equity_curve", []),
         output_path=validation_chart,
-        title=f"New Best #{iteration_id} Validation",
+        title=f"New Champion #{iteration_id} Validation",
         subtitle=f"{validation_window.start_date} to {validation_window.end_date}",
     )
     selection_chart = render_performance_chart(
         daily_equity_curve=selection_result.get("daily_equity_curve", []),
         output_path=selection_chart,
-        title=f"New Best #{iteration_id} Selection Period",
+        title=f"New Champion #{iteration_id} Selection Period",
         subtitle=f"{selection_start} to {selection_end}",
     )
 
@@ -584,6 +631,10 @@ def _candidate_from_payload(
         raise StrategySourceError("candidate missing change_tags")
     if not candidate.edited_regions:
         raise StrategySourceError("candidate missing edited_regions")
+    if len(candidate.edited_regions) > 3:
+        raise StrategySourceError("candidate edited_regions exceeds 3")
+    if len(set(candidate.edited_regions)) != len(candidate.edited_regions):
+        raise StrategySourceError("candidate edited_regions contains duplicates")
     if not candidate.closest_failed_cluster:
         raise StrategySourceError("candidate missing closest_failed_cluster")
     if not candidate.novelty_proof:
@@ -599,7 +650,10 @@ def _build_model_candidate(
 ) -> StrategyCandidate:
     report = best_report
     if report is None:
-        raise StrategySourceError("best report is not initialized")
+        raise StrategySourceError("reference report is not initialized")
+    benchmark_report = _reference_benchmark_report()
+    if benchmark_report is None:
+        raise StrategySourceError("reference benchmark is not initialized")
 
     prompt = build_strategy_research_prompt(
         evaluation_summary=report.prompt_summary_text,
@@ -610,7 +664,9 @@ def _build_model_candidate(
             current_score_regime=SCORE_REGIME,
             current_iteration=iteration_counter,
         ),
-        previous_best_score=report.metrics["promotion_score"],
+        previous_best_score=benchmark_report.metrics["promotion_score"],
+        score_regime=SCORE_REGIME,
+        promotion_min_delta=RUNTIME.promotion_min_delta,
     )
     with _temporary_cwd(workspace_root):
         payload = generate_json_object(
@@ -765,7 +821,7 @@ def build_strategy_candidate(base_source: str, *, workspace_root: Path) -> Strat
         raise
 
 
-# ==================== 最优状态管理 ====================
+# ==================== 主参考状态管理 ====================
 
 
 def _persist_best_state(
@@ -775,52 +831,62 @@ def _persist_best_state(
     shadow_test_metrics: dict[str, float] | None = None,
 ) -> None:
     RUNTIME.paths.best_state_file.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "updated_at": datetime.now(UTC).isoformat(),
-        "code_hash": source_hash(source),
-        "score_regime": SCORE_REGIME,
-        "metrics": report.metrics,
-        "gate_passed": report.gate_passed,
-        "gate_reason": report.gate_reason,
-        "shadow_test_metrics": shadow_test_metrics or {},
-    }
+    payload = _reference_manifest_payload(
+        source,
+        report,
+        shadow_test_metrics=shadow_test_metrics,
+    )
     RUNTIME.paths.best_state_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
     write_strategy_source(RUNTIME.paths.best_strategy_file, source)
 
 
 def initialize_best_state(force_rebuild: bool = False) -> None:
-    global best_source, best_report
+    global best_source, best_report, champion_report
 
-    if (
+    saved_state = _load_saved_reference_state()
+    saved_regime = str(saved_state.get("score_regime", "")).strip()
+    saved_reference = saved_state.get("reference")
+    can_load_saved_reference = (
         not force_rebuild
+        and saved_regime == SCORE_REGIME
+        and isinstance(saved_reference, dict)
         and RUNTIME.paths.best_strategy_file.exists()
-    ):
+    )
+
+    if can_load_saved_reference:
         best_source = load_strategy_source(RUNTIME.paths.best_strategy_file)
         write_strategy_source(RUNTIME.paths.strategy_file, best_source)
         reload_strategy_module()
         best_report = evaluate_current_strategy()
+        champion_report = (
+            best_report
+            if best_report.gate_passed and str(saved_state.get("reference_role", "")).strip() == "champion"
+            else None
+        )
         _persist_best_state(best_source, best_report)
         log_info(
-            "已加载已保存的最优基底: "
+            "已加载已保存主参考: "
+            f"role={_reference_role()}, "
             f"quality={best_report.metrics['quality_score']:.2f}, "
             f"promotion={best_report.metrics['promotion_score']:.2f}, "
             f"gate={best_report.gate_reason}"
         )
         write_heartbeat(
             "initialized",
-            message="loaded saved best baseline",
+            message="loaded saved reference",
+            reference_role=_reference_role(),
             promotion=best_report.metrics["promotion_score"],
             quality=best_report.metrics["quality_score"],
         )
         maybe_send_discord(
             build_discord_summary_message(
-                title="📌 研究器 v2 已加载最优基底",
+                title=f"📌 研究器 v2 已加载{_reference_role()}参考",
                 report=best_report,
                 eval_window_count=EVAL_WINDOW_COUNT,
                 validation_window_count=VALIDATION_WINDOW_COUNT,
                 test_window_count=TEST_WINDOW_COUNT,
             ),
-            context="initialize_saved_best",
+            context="initialize_saved_reference",
         )
         return
 
@@ -828,22 +894,25 @@ def initialize_best_state(force_rebuild: bool = False) -> None:
     validate_strategy_source(best_source)
     reload_strategy_module()
     best_report = evaluate_current_strategy()
+    champion_report = best_report if best_report.gate_passed else None
     _persist_best_state(best_source, best_report)
     log_info(
-        "研究基底初始化完成: "
+        "研究基线初始化完成: "
+        f"role={_reference_role()}, "
         f"quality={best_report.metrics['quality_score']:.2f}, "
         f"promotion={best_report.metrics['promotion_score']:.2f}, "
         f"gate={best_report.gate_reason}"
     )
     write_heartbeat(
         "initialized",
-        message="baseline ready",
+        message="reference ready",
+        reference_role=_reference_role(),
         promotion=best_report.metrics["promotion_score"],
         quality=best_report.metrics["quality_score"],
     )
     maybe_send_discord(
         build_discord_summary_message(
-            title="📌 研究器 v2 基底初始化完成",
+            title=f"📌 研究器 v2 {_reference_role()}参考初始化完成",
             report=best_report,
             eval_window_count=EVAL_WINDOW_COUNT,
             validation_window_count=VALIDATION_WINDOW_COUNT,
@@ -868,7 +937,8 @@ def _build_journal_entry(
     note: str | None = None,
     extra_fields: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    base_promotion = best_report.metrics["promotion_score"] if best_report is not None else 0.0
+    benchmark_report = _reference_benchmark_report()
+    base_promotion = benchmark_report.metrics["promotion_score"] if benchmark_report is not None else 0.0
     diff_summary = build_diff_summary(base_source, candidate.strategy_code, limit=18)
     promotion_score = candidate_report.metrics["promotion_score"] if candidate_report is not None else None
     quality_score = candidate_report.metrics["quality_score"] if candidate_report is not None else None
@@ -876,7 +946,15 @@ def _build_journal_entry(
     resolved_gate_reason = gate_reason or (
         eval_gate_reason
     )
-    candidate_signature = exploration_signature_for_candidate(candidate)
+    candidate_signature = exploration_signature_for_candidate(
+        candidate,
+        base_source=base_source,
+        editable_regions=EDITABLE_REGIONS,
+    )
+    actual_changed_regions = sorted(candidate_signature["changed_regions"])
+    actual_region_families = sorted(candidate_signature["region_families"])
+    actual_param_families = sorted(candidate_signature["param_families"])
+    actual_structural_tokens = sorted(candidate_signature["structural_tokens"])
     entry = {
         "iteration": iteration_id,
         "timestamp": datetime.now(UTC).isoformat(),
@@ -913,6 +991,12 @@ def _build_journal_entry(
         "code_hash": source_hash(candidate.strategy_code),
         "diff_summary": diff_summary,
         "region_families": sorted(region_families_for_regions(candidate.edited_regions)),
+        "system_changed_regions": actual_changed_regions,
+        "system_region_families": actual_region_families,
+        "system_param_families": actual_param_families,
+        "system_structural_tokens": actual_structural_tokens,
+        "system_signature_hash": candidate_signature["signature_hash"],
+        "declared_regions_match_system": sorted(candidate.edited_regions) == actual_changed_regions,
         "target_family": target_family_from_text(
             candidate.change_tags,
             candidate.hypothesis,
@@ -928,17 +1012,24 @@ def _build_journal_entry(
 
 def _promotion_acceptance_decision(report: EvaluationReport) -> tuple[bool, str]:
     if best_report is None:
-        return False, "best state is not initialized"
+        return False, "reference state is not initialized"
     if not report.gate_passed:
         return False, report.gate_reason
 
-    current_best_score = float(best_report.metrics["promotion_score"])
+    if champion_report is None and not best_report.gate_passed:
+        return True, "通过(首个 gate-passed champion)"
+
+    benchmark_report = _reference_benchmark_report()
+    if benchmark_report is None:
+        return False, "reference benchmark is not initialized"
+    current_best_score = float(benchmark_report.metrics["promotion_score"])
     candidate_score = float(report.metrics["promotion_score"])
     promotion_delta = candidate_score - current_best_score
     if promotion_delta <= RUNTIME.promotion_min_delta:
+        benchmark_label = "champion" if champion_report is not None else "baseline"
         return (
             False,
-            f"晋级分提升不足({promotion_delta:.2f} <= {RUNTIME.promotion_min_delta:.2f})",
+            f"相对当前{benchmark_label}晋级分提升不足({promotion_delta:.2f} <= {RUNTIME.promotion_min_delta:.2f})",
         )
     return True, "通过"
 
@@ -997,8 +1088,11 @@ def _record_exploration_block(
                 "current_locks": list(block_info.get("current_locks", ()) or ()),
                 "low_change_tags": list(block_info.get("low_change_tags", ()) or ()),
                 "low_change_regions": list(block_info.get("low_change_regions", ()) or ()),
+                "low_change_changed_regions": list(block_info.get("low_change_changed_regions", ()) or ()),
                 "low_change_targets": list(block_info.get("low_change_targets", ()) or ()),
                 "low_change_factors": list(block_info.get("low_change_factors", ()) or ()),
+                "low_change_param_families": list(block_info.get("low_change_param_families", ()) or ()),
+                "low_change_structural_tokens": list(block_info.get("low_change_structural_tokens", ()) or ()),
             },
         ),
     )
@@ -1074,10 +1168,10 @@ def _candidate_with_repair(
 
 
 def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str:
-    global best_source, best_report
+    global best_source, best_report, champion_report
 
     if best_report is None:
-        raise RuntimeError("best state is not initialized")
+        raise RuntimeError("reference state is not initialized")
 
     write_strategy_source(RUNTIME.paths.strategy_file, best_source)
     reload_strategy_module()
@@ -1110,10 +1204,10 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
                     candidate=candidate,
                     base_source=best_source,
                     stop_stage="duplicate_source",
-                    gate_reason="候选源码与当前最优完全相同",
+                    gate_reason="候选源码与当前主参考完全相同",
                     note="模型未产生有效代码改动；本轮按重复探索记入研究历史。",
                 )
-                log_info(f"第 {iteration_id} 轮跳过: 候选源码与当前最优完全相同")
+                log_info(f"第 {iteration_id} 轮跳过: 候选源码与当前主参考完全相同")
                 write_heartbeat("iteration_skipped", message=f"iteration {iteration_id} duplicate source")
                 return "duplicate_skipped"
             if has_recent_code_hash(journal_entries, candidate_hash):
@@ -1149,6 +1243,8 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
                 journal_path=RUNTIME.paths.journal_file,
                 score_regime=SCORE_REGIME,
                 current_iteration=iteration_id,
+                base_source=best_source,
+                editable_regions=EDITABLE_REGIONS,
                 lock_schedule=_cluster_lock_schedule(),
                 include_current_round_locks=True,
             )
@@ -1274,6 +1370,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
     if accepted:
         best_source = candidate.strategy_code
         best_report = candidate_report
+        champion_report = candidate_report
         shadow_test_metrics: dict[str, float] | None = None
         try:
             shadow_test_metrics = evaluate_hidden_test_metrics()
@@ -1285,7 +1382,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
                 f"hit={shadow_test_metrics['shadow_test_hit_rate']:.0%}"
             )
         except Exception as exc:
-            log_info(f"隐藏测试评估失败，但本轮 best 已按验证集保留: {exc}")
+            log_info(f"隐藏测试评估失败，但本轮 champion 已按验证集保留: {exc}")
             logging.exception("隐藏测试评估失败(iteration=%s)", iteration_id)
 
         _persist_best_state(best_source, best_report, shadow_test_metrics=shadow_test_metrics)
@@ -1293,30 +1390,31 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
         if maybe_compact(RUNTIME.paths.journal_file):
             log_info("研究日志已压缩")
         log_info(
-            f"🚀 第 {iteration_id} 轮产生新最优: "
+            f"🚀 第 {iteration_id} 轮产生新 champion: "
             f"quality={best_report.metrics['quality_score']:.2f}, "
             f"promotion={best_report.metrics['promotion_score']:.2f}"
         )
         log_info(candidate_report.summary_text)
         write_heartbeat(
-            "new_best",
-            message=f"iteration {iteration_id} accepted",
+            "new_champion",
+            message=f"iteration {iteration_id} champion accepted",
+            reference_role=_reference_role(),
             promotion=best_report.metrics["promotion_score"],
             quality=best_report.metrics["quality_score"],
             gate=best_report.gate_reason,
         )
         chart_paths = PerformanceChartPaths(validation_chart=None, selection_chart=None)
         try:
-            chart_paths = _generate_new_best_charts(iteration_id)
+            chart_paths = _generate_new_champion_charts(iteration_id)
             if chart_paths.selection_chart is not None:
                 log_info(f"选择期图已保存: {chart_paths.selection_chart}")
             if chart_paths.validation_chart is not None:
                 log_info(f"验证图已保存: {chart_paths.validation_chart}")
         except Exception as exc:
-            log_info(f"新最优图表生成失败: {exc}")
-            logging.exception("新最优图表生成失败(iteration=%s)", iteration_id)
+            log_info(f"新 champion 图表生成失败: {exc}")
+            logging.exception("新 champion 图表生成失败(iteration=%s)", iteration_id)
         discord_message = build_discord_summary_message(
-            title=f"🚀 研究器 v2 新最优 #{iteration_id}",
+            title=f"🚀 研究器 v2 新 champion #{iteration_id}",
             report=best_report,
             eval_window_count=EVAL_WINDOW_COUNT,
             validation_window_count=VALIDATION_WINDOW_COUNT,
@@ -1380,7 +1478,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="激进版 MACD 研究器 v2")
     parser.add_argument("--once", action="store_true", help="只跑一轮")
     parser.add_argument("--no-optimize", action="store_true", help="只做评估，不生成候选")
-    parser.add_argument("--reset-best", action="store_true", help="忽略历史最优，按当前源码重新初始化")
+    parser.add_argument(
+        "--reset-champion",
+        "--reset-best",
+        dest="reset_reference",
+        action="store_true",
+        help="忽略历史主参考，按当前源码重新初始化",
+    )
     args = parser.parse_args()
 
     RUNTIME.paths.log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1396,7 +1500,7 @@ def main() -> int:
             for window in WINDOWS
         )
     )
-    initialize_best_state(force_rebuild=args.reset_best)
+    initialize_best_state(force_rebuild=args.reset_reference)
 
     if args.no_optimize:
         return 0

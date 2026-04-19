@@ -100,7 +100,7 @@
 - 文件：`scripts/research_macd_aggressive_v2.py`
 - 允许模型直接改写策略源码
 - 但会经过源码校验、参数边界校验和研究历史去重
-- 评分核心是 `trend_capture_v4 + gate`
+- 评分核心是 `trend_capture_v6 + gate + overfit veto`
 
 当前主评分口径：
 
@@ -111,10 +111,11 @@
 - `return_score` 看的是整条路径最终把资金放大了多少
 - `quality_score = 0.70 * eval_trend_capture_score + 0.30 * eval_return_score`
 - `promotion_score = 0.70 * validation_trend_capture_score + 0.30 * validation_return_score`
-- `promotion_score` 只负责晋级，要求至少比当前 best 高 `0.02`
-- `validation` 连续路径会再按时间顺序切成 `3` 个分块；分块波动过大、最差块过弱或负分块太多时，即使总分过线也不会刷新 best
-- 全段连续收益和全段趋势分保留为诊断项，不再直接决定 best
+- `promotion_score` 只负责和当前 `champion` 比较，要求至少比当前 `champion` 高 `0.02`
+- `validation` 连续路径会再按时间顺序切成 `3` 个分块；分块波动过大、最差块过弱或负分块太多时，即使总分过线也不会刷新 `champion`
+- 全段连续收益和全段趋势分保留为诊断项，不再直接决定 `champion`
 - 爆仓和回撤保留为诊断项，但不再是主评分，也不再单独惩罚
+- 选择期过拟合集中度如果达到严重阈值，会直接触发 gate veto，不再只是提示项
 
 当前研究器的研究记忆与修复链路：
 
@@ -123,10 +124,11 @@
 - 若最近一段历史里同一方向簇占比过高且没有实质正 `delta`，prompt 会在方向风险表后追加“主簇过热”提示，默认要求下一轮优先跨簇。
 - prompt 第一屏的“最近未压缩轮次表”现在会正确吃到当前评分口径的最新历史，不再被旧口径 compact 索引错切掉。
 - 旧评分口径不会混进当前主表；它们只会在后面以“旧评分口径弱参考”出现，作为低优先级方向启发。
-- 防重复探索主要靠 prompt 约束，不做系统层面的硬性方向封禁。
+- 防重复探索不再主要靠 prompt 自报；系统会结合真实 diff、参数族变化和 AST 派生结构签名做硬拦截。
 - 候选必须输出 `closest_failed_cluster` 与 `novelty_proof`，说明本轮为什么不是重复试错。
 - 如果仍想留在“主簇过热”的方向簇里，`novelty_proof` 必须同时说明不同交易路径、至少两个会明显变化的关键诊断，以及为什么这不是只换 tag 或轻微阈值。
 - 若最近连续 3 轮都属于低变化轮次，prompt 会强制把下一轮视为“探索轮”，优先切换因子家族或编辑区域家族。
+- `edited_regions` 现在最多允许 `1-3` 个；系统只把真实 diff 派生出来的 changed regions 当成主依据。
 - 每轮先跑少量 `smoke` 窗口；若代码运行报错，会在同一轮把错误回传给模型做 repair，而不是直接开始下一轮。
 - 若 repair 次数耗尽，这轮会被记成 `runtime_failed`，同样进入 journal 和记忆压缩。
 - `heartbeat` 会持续写出当前阶段和窗口索引，便于定位是卡在 `smoke`、`full_eval` 还是 repair。

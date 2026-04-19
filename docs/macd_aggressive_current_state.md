@@ -6,7 +6,7 @@
 - 研究器：`scripts/research_macd_aggressive_v2.py`
 - 策略：`src/strategy_macd_aggressive.py`
 - 回测器：`src/backtest_macd_aggressive.py`
-- 当前评分口径：`trend_capture_v5`
+- 当前评分口径：`trend_capture_v6`
 - 当前事实源：`15m`
 - `1h` / `4h` 只是由 `15m` 聚合出来的确认层
 - 成交量维度除了总量，还包含 `trade_count`、`taker_buy_volume`、`taker_sell_volume`
@@ -41,11 +41,11 @@
   开发期滚动窗口的均值分
 
 - `promotion_score`
-  验证集单段连续分
+  验证集单段连续分；只有先过 gate，才会拿它和当前 `champion` 比较
 
 隐藏验收：
 
-- hidden `test` 只在新 best 时评估
+- hidden `test` 只在新 `champion` 时评估
 - hidden `test` 不参与 `quality_score`
 - hidden `test` 不参与 `promotion_score`
 - hidden `test` 不会进入 prompt 和记忆表
@@ -68,7 +68,7 @@
 - 手续费拖累
 - 验证期多空交易支持
 
-过拟合集中度仍会诊断，但现在主要用于提示和历史降权参考。
+过拟合集中度仍会诊断，但严重集中度会直接触发 gate veto；高风险轮次也会继续在 journal 里降权。
 
 ## 当前 prompt 结构
 
@@ -92,6 +92,7 @@
 - 最近轮次拆成“核心指标表 + 元信息摘要”
 - journal 里新增 `方向冷却表（系统硬约束）`
 - 防重复规则只保留一份，不再多处复写
+- `edited_regions` 最多 `1-3` 个，系统会用真实 diff / AST 派生的 `system signature` 复核
 
 ## 当前 Discord 口径
 
@@ -99,7 +100,7 @@ Discord 现在优先播报：
 
 - `选择期连续收益`
 - `验证连续收益`
-- 新 best 时额外播报 `隐藏测试连续收益`
+- 新 `champion` 时额外播报 `隐藏测试连续收益`
 
 然后再播报：
 
@@ -121,6 +122,7 @@ Discord 现在优先播报：
 - 被探索硬约束拦截后，会在同一轮里强制重生候选方向
 - 同一方向簇再次触发该机制后，会进入短期冷却锁
 - 冷却锁采用 `3 -> 6 -> 10` 轮递增
+- 低变化近邻判定会同时看真实 diff、参数族变化和 AST 派生结构签名
 - `duplicate source / duplicate hash / empty diff` 会写入 journal
 - `exploration_blocked` 表示候选在评估前就被系统探索硬约束拒收
 - heartbeat 会写出当前阶段和窗口名
@@ -129,7 +131,7 @@ Discord 现在优先播报：
 ## 当前需要注意
 
 - 这是一次新的评分 regime 切换，旧 `trend_capture_v4` 历史不会再作为主参考。
-- 新 regime 下的 best 会在研究器下一次初始化或下一轮运行后重新沉淀。
+- 新 regime 下的 `champion / baseline` 会在研究器下一次初始化或下一轮运行后重新沉淀。
 - 如果本地价格 CSV 还是旧格式，需要先重新运行 `python3 scripts/download_aggressive_data.py`，生成带 flow 列的新 `15m/1h/4h/1m` 数据。
 - 如果要看现在的真实基线，请直接跑：
 

@@ -1101,6 +1101,16 @@ def summarize_evaluation(
             "验证空头交易支持不足"
             f"({validation_short_trades} < {gates.min_trade_support_per_side})"
         )
+    if overfit_report.hard_fail:
+        gate_reasons.append(
+            "选择期过拟合集中度严重"
+            f"({'; '.join(overfit_report.hard_reasons)})"
+        )
+    elif overfit_report.risk_score >= OVERFIT_GATE_SCORE:
+        gate_reasons.append(
+            "选择期过拟合风险过高"
+            f"({overfit_report.risk_score:.0f})"
+        )
 
     gate_passed = not gate_reasons
     gate_reason = "通过" if gate_passed else "；".join(gate_reasons)
@@ -1136,7 +1146,8 @@ def summarize_evaluation(
             f"单段正向贡献={overfit_report.top1_positive_share:.0%}，"
             f"同向链贡献={overfit_report.max_chain_positive_share:.0%}，"
             f"覆盖率={overfit_report.coverage_ratio:.0%}，"
-            f"多空落差={overfit_report.bull_bear_gap:.2f}"
+            f"多空落差={overfit_report.bull_bear_gap:.2f}，"
+            f"处置={overfit_reference_action(overfit_report.risk_score, overfit_report.hard_fail)}"
         ),
         f"选择期连续趋势捕获分 / 收益分: {selection_trend_report.trend_score:.2f} / {selection_trend_report.return_score:.2f}",
         f"选择期连续到来 / 陪跑 / 掉头: {selection_trend_report.arrival_score:.2f} / {selection_trend_report.escort_score:.2f} / {selection_trend_report.turn_score:.2f}",
@@ -1218,7 +1229,8 @@ def summarize_evaluation(
             f"单段正向贡献={overfit_report.top1_positive_share:.0%}，"
             f"同向链贡献={overfit_report.max_chain_positive_share:.0%}，"
             f"覆盖率={overfit_report.coverage_ratio:.0%}，"
-            f"多空落差={overfit_report.bull_bear_gap:.2f}"
+            f"多空落差={overfit_report.bull_bear_gap:.2f}，"
+            f"处置={overfit_reference_action(overfit_report.risk_score, overfit_report.hard_fail)}"
         ),
         f"开发期4h唯一路径点={eval_path.unique_points}，重叠点={eval_path.overlap_points}，被覆盖点={eval_path.dropped_points}",
         f"手续费拖累={avg_fee_drag:.2f}%，开发期交易={eval_trades}，验证交易={validation_trades}，爆仓={liquidations}",

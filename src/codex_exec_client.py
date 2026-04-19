@@ -157,6 +157,19 @@ def _emit_progress(callback: ProgressCallback | None, **payload: Any) -> None:
         return
 
 
+def _resolve_timeout_seconds(
+    timeout: float | tuple[float, float] | None,
+    *,
+    default_seconds: int,
+) -> int:
+    if timeout is None:
+        return default_seconds
+    if isinstance(timeout, tuple):
+        values = [float(value) for value in timeout if value is not None]
+        return max(1, int(max(values, default=default_seconds)))
+    return max(1, int(float(timeout)))
+
+
 def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
     if process.poll() is not None:
         return
@@ -199,8 +212,6 @@ def generate_json_object(
     text_format: dict[str, Any] | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
-    del max_output_tokens, timeout
-
     client_config = config or load_strategy_client_config()
     if shutil.which(client_config.codex_bin) is None:
         raise StrategyGenerationError(f"missing Codex CLI binary: {client_config.codex_bin}")
@@ -226,6 +237,8 @@ def generate_json_object(
         "-c",
         f'model_reasoning_effort="{client_config.reasoning_effort}"',
     ]
+    if max_output_tokens > 0:
+        command.extend(["-c", f"model_max_output_tokens={int(max_output_tokens)}"])
     if client_config.use_ephemeral:
         command.append("--ephemeral")
 
@@ -253,14 +266,18 @@ def generate_json_object(
             start_new_session=True,
         )
         started_at = time.monotonic()
-        deadline = started_at + float(client_config.timeout_seconds)
+        timeout_seconds = _resolve_timeout_seconds(
+            timeout,
+            default_seconds=client_config.timeout_seconds,
+        )
+        deadline = started_at + float(timeout_seconds)
         input_text: str | None = full_prompt
         try:
             _emit_progress(
                 progress_callback,
                 event="started",
                 pid=process.pid,
-                timeout_seconds=client_config.timeout_seconds,
+                timeout_seconds=timeout_seconds,
                 model=client_config.model,
                 reasoning_effort=client_config.reasoning_effort,
             )
@@ -274,10 +291,10 @@ def generate_json_object(
                         event="timeout",
                         pid=process.pid,
                         elapsed_seconds=elapsed_seconds,
-                        timeout_seconds=client_config.timeout_seconds,
+                        timeout_seconds=timeout_seconds,
                     )
                     raise StrategyGenerationTransientError(
-                        f"codex exec timed out after {client_config.timeout_seconds}s"
+                        f"codex exec timed out after {timeout_seconds}s"
                     )
                 try:
                     stdout, stderr = process.communicate(
@@ -292,7 +309,7 @@ def generate_json_object(
                         event="heartbeat",
                         pid=process.pid,
                         elapsed_seconds=int(max(0.0, time.monotonic() - started_at)),
-                        timeout_seconds=client_config.timeout_seconds,
+                        timeout_seconds=timeout_seconds,
                         model=client_config.model,
                         reasoning_effort=client_config.reasoning_effort,
                     )
@@ -305,7 +322,7 @@ def generate_json_object(
             event="completed",
             pid=process.pid,
             elapsed_seconds=int(max(0.0, time.monotonic() - started_at)),
-            timeout_seconds=client_config.timeout_seconds,
+            timeout_seconds=timeout_seconds,
             returncode=process.returncode,
         )
 

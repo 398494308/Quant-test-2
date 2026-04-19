@@ -347,7 +347,7 @@ def build_discord_summary_message(
         f"门禁：{_single_line(report.gate_reason, limit=280)}",
     ]
     if shadow_test_metrics is not None:
-        parts.append("隐藏测试说明：这部分不参与本次 best 选择，只做最终验收。")
+        parts.append("隐藏测试说明：这部分不参与本次 champion 选择，只做最终验收。")
     if candidate is not None:
         parts.extend(
             [

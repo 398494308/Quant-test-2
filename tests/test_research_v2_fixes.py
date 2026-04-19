@@ -16,6 +16,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 import backtest_macd_aggressive as backtest
 from codex_exec_client import StrategyClientConfig, StrategyGenerationTransientError, generate_json_object
 import freqtrade_macd_aggressive as ft_adapter
+import scripts.research_macd_aggressive_v2 as research_script
 from scripts.research_macd_aggressive_v2 import select_smoke_windows
 from research_v2.config import GateConfig
 from research_v2.evaluation import (
@@ -39,6 +40,7 @@ from research_v2.journal import (
 from research_v2.notifications import build_discord_summary_message
 from research_v2.prompting import (
     EDITABLE_REGIONS,
+    build_candidate_response_schema,
     build_strategy_exploration_repair_prompt,
     build_strategy_research_prompt,
 )
@@ -46,6 +48,7 @@ from research_v2.strategy_code import (
     StrategyCandidate,
     StrategyCoreFactor,
     StrategySourceError,
+    build_system_edit_signature,
     validate_editable_region_boundaries,
     validate_strategy_source,
 )
@@ -520,7 +523,8 @@ class EvaluationFixesTest(unittest.TestCase):
             },
         )
 
-        self.assertTrue(report.gate_passed)
+        self.assertFalse(report.gate_passed)
+        self.assertIn("选择期过拟合", report.gate_reason)
         self.assertGreater(report.metrics["overfit_risk_score"], 0.0)
         self.assertGreater(report.metrics["overfit_top1_positive_share"], 0.60)
         self.assertEqual(report.metrics["overfit_hard_fail"], 1.0)
@@ -699,6 +703,11 @@ def strategy(*args, **kwargs):
 
 
 class JournalPromptFixesTest(unittest.TestCase):
+    def test_candidate_schema_limits_edited_regions_to_three(self):
+        schema = build_candidate_response_schema()
+
+        self.assertEqual(schema["properties"]["edited_regions"]["maxItems"], 3)
+
     def test_build_strategy_prompt_mentions_15m_single_source_and_flow(self):
         prompt = build_strategy_research_prompt(
             evaluation_summary="诊断",
@@ -708,6 +717,7 @@ class JournalPromptFixesTest(unittest.TestCase):
 
         self.assertIn("15m` 是唯一事实源", prompt)
         self.assertIn("主动买卖量", prompt)
+        self.assertIn("promotion_delta > 0.02", prompt)
 
     def test_build_strategy_exploration_repair_prompt_mentions_blocked_cluster(self):
         prompt = build_strategy_exploration_repair_prompt(
@@ -735,6 +745,64 @@ class JournalPromptFixesTest(unittest.TestCase):
 
 
 class ExplorationGuardFixesTest(unittest.TestCase):
+    def test_build_system_edit_signature_detects_real_changed_regions_and_param_families(self):
+        base_source = """
+# PARAMS_START
+PARAMS = {'breakout_volume_ratio_min': 1.0}
+# PARAMS_END
+
+def _sideways_release_flags(*args, **kwargs):
+    return {}
+
+def _is_sideways_regime(*args, **kwargs):
+    return False
+
+def _flow_signal_metrics(*args, **kwargs):
+    return {}
+
+def _flow_confirmation_ok(*args, **kwargs):
+    return True
+
+def _flow_entry_ok(*args, **kwargs):
+    return True
+
+def _trend_quality_long(*args, **kwargs):
+    return True
+
+def _trend_quality_short(*args, **kwargs):
+    return True
+
+def _trend_quality_ok(*args, **kwargs):
+    return True
+
+def _trend_followthrough_long(*args, **kwargs):
+    return True
+
+def _trend_followthrough_short(*args, **kwargs):
+    return True
+
+def _trend_followthrough_ok(*args, **kwargs):
+    return True
+
+def _long_entry_signal(*args, **kwargs):
+    return None
+
+def _short_entry_signal(*args, **kwargs):
+    return None
+
+def strategy(*args, **kwargs):
+    return None
+"""
+        candidate_source = base_source.replace(
+            "'breakout_volume_ratio_min': 1.0",
+            "'breakout_volume_ratio_min': 1.2, 'breakout_flow_imbalance_min': 0.05",
+        )
+        signature = build_system_edit_signature(base_source, candidate_source, EDITABLE_REGIONS)
+
+        self.assertEqual(signature["changed_regions"], ("PARAMS",))
+        self.assertIn("flow", signature["param_families"])
+        self.assertIn("PARAMS", signature["structural_tokens"])
+
     def _candidate(self, *, cluster="ownership_cluster", tags=("ownership_takeover", "acceptance_continuity"), regions=("strategy",), hypothesis="优化多头到来阶段", effects=("提高多头上车",), factors=()):
         return StrategyCandidate(
             candidate_id="candidate_guard",
@@ -793,6 +861,111 @@ class ExplorationGuardFixesTest(unittest.TestCase):
         self.assertIsNotNone(block)
         self.assertEqual(block["block_kind"], "same_cluster")
         self.assertEqual(block["lock_rounds"], 0)
+
+    def test_evaluate_candidate_exploration_guard_uses_system_changed_regions_over_declared_metadata(self):
+        base_source = """
+# PARAMS_START
+PARAMS = {'breakout_volume_ratio_min': 1.0}
+# PARAMS_END
+
+def _sideways_release_flags(*args, **kwargs):
+    return {}
+
+def _is_sideways_regime(*args, **kwargs):
+    return False
+
+def _flow_signal_metrics(*args, **kwargs):
+    return {}
+
+def _flow_confirmation_ok(*args, **kwargs):
+    return True
+
+def _flow_entry_ok(*args, **kwargs):
+    return True
+
+def _trend_quality_long(*args, **kwargs):
+    return True
+
+def _trend_quality_short(*args, **kwargs):
+    return True
+
+def _trend_quality_ok(*args, **kwargs):
+    return True
+
+def _trend_followthrough_long(*args, **kwargs):
+    return True
+
+def _trend_followthrough_short(*args, **kwargs):
+    return True
+
+def _trend_followthrough_ok(*args, **kwargs):
+    return True
+
+def _long_entry_signal(*args, **kwargs):
+    return None
+
+def _short_entry_signal(*args, **kwargs):
+    return None
+
+def strategy(*args, **kwargs):
+    return None
+"""
+        candidate_source = base_source.replace(
+            "'breakout_volume_ratio_min': 1.0",
+            "'breakout_volume_ratio_min': 1.1",
+        )
+        candidate = self._candidate(regions=("strategy",))
+        candidate = StrategyCandidate(
+            candidate_id=candidate.candidate_id,
+            hypothesis=candidate.hypothesis,
+            change_plan=candidate.change_plan,
+            closest_failed_cluster=candidate.closest_failed_cluster,
+            novelty_proof=candidate.novelty_proof,
+            change_tags=candidate.change_tags,
+            edited_regions=("strategy",),
+            expected_effects=candidate.expected_effects,
+            core_factors=candidate.core_factors,
+            strategy_code=candidate_source,
+        )
+        entries = [
+            {
+                **self._scored_entry(1),
+                "system_changed_regions": ["PARAMS"],
+                "system_region_families": ["params"],
+                "system_param_families": ["breakout"],
+                "system_structural_tokens": ["PARAMS", "breakout"],
+                "system_signature_hash": "sig_a",
+            },
+            {
+                **self._scored_entry(2),
+                "system_changed_regions": ["PARAMS"],
+                "system_region_families": ["params"],
+                "system_param_families": ["breakout"],
+                "system_structural_tokens": ["PARAMS", "breakout"],
+                "system_signature_hash": "sig_b",
+            },
+            {
+                **self._scored_entry(3),
+                "system_changed_regions": ["PARAMS"],
+                "system_region_families": ["params"],
+                "system_param_families": ["breakout"],
+                "system_structural_tokens": ["PARAMS", "breakout"],
+                "system_signature_hash": "sig_c",
+            },
+        ]
+
+        block = evaluate_candidate_exploration_guard(
+            candidate,
+            entries,
+            journal_path=None,
+            score_regime="trend_capture_v5",
+            current_iteration=4,
+            base_source=base_source,
+            editable_regions=EDITABLE_REGIONS,
+        )
+
+        self.assertIsNotNone(block)
+        self.assertEqual(block["block_kind"], "same_cluster")
 
     def test_evaluate_candidate_exploration_guard_applies_lock_on_second_blocked_round(self):
         entries = [
@@ -1523,6 +1696,7 @@ class CodexExecClientTest(unittest.TestCase):
 
         command = popen.call_args.args[0]
         self.assertEqual(command[:4], ["codex", "-a", "never", "exec"])
+        self.assertIn("model_max_output_tokens=3200", command)
 
     def test_generate_json_object_kills_process_group_after_timeout(self):
         class FakePopen:
@@ -1578,6 +1752,54 @@ class CodexExecClientTest(unittest.TestCase):
                             )
 
         self.assertGreaterEqual(killpg.call_count, 1)
+
+
+class ReferenceStateFixesTest(unittest.TestCase):
+    def test_reference_manifest_uses_baseline_role_when_no_champion(self):
+        report = EvaluationReport(
+            metrics={"promotion_score": 0.31, "quality_score": 0.22},
+            gate_passed=False,
+            gate_reason="开发期滚动波动过大(0.46)",
+            summary_text="",
+            prompt_summary_text="",
+        )
+        original_champion = research_script.champion_report
+        try:
+            research_script.champion_report = None
+            payload = research_script._reference_manifest_payload("def strategy():\n    return None\n", report)
+        finally:
+            research_script.champion_report = original_champion
+
+        self.assertEqual(payload["reference_role"], "baseline")
+        self.assertIsNone(payload["champion"])
+
+    def test_promotion_acceptance_accepts_first_gate_passed_champion_when_baseline_fails(self):
+        baseline_report = EvaluationReport(
+            metrics={"promotion_score": 0.40, "quality_score": 0.33},
+            gate_passed=False,
+            gate_reason="开发期滚动波动过大(0.46)",
+            summary_text="",
+            prompt_summary_text="",
+        )
+        candidate_report = EvaluationReport(
+            metrics={"promotion_score": 0.36, "quality_score": 0.30},
+            gate_passed=True,
+            gate_reason="通过",
+            summary_text="",
+            prompt_summary_text="",
+        )
+        original_best_report = research_script.best_report
+        original_champion = research_script.champion_report
+        try:
+            research_script.best_report = baseline_report
+            research_script.champion_report = None
+            accepted, reason = research_script._promotion_acceptance_decision(candidate_report)
+        finally:
+            research_script.best_report = original_best_report
+            research_script.champion_report = original_champion
+
+        self.assertTrue(accepted)
+        self.assertIn("首个 gate-passed champion", reason)
 
 
 class DiscordSummaryFormattingTest(unittest.TestCase):

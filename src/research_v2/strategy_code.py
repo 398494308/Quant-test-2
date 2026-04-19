@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -100,6 +101,8 @@ PARAM_RELATIONS: tuple[tuple[str, str, str], ...] = (
     ("macd_fast", "<", "macd_slow"),
 )
 
+STRUCTURAL_LITERAL_PATTERN = re.compile(r"[a-z][a-z0-9_]{2,}")
+
 def load_strategy_source(path: Path) -> str:
     return path.read_text()
 
@@ -191,6 +194,157 @@ def _mask_editable_regions(source: str, editable_regions: tuple[str, ...]) -> st
         cursor = end
     parts.append(normalized[cursor:])
     return "".join(parts)
+
+
+def _editable_region_source_map(source: str, editable_regions: tuple[str, ...]) -> dict[str, str]:
+    normalized = normalize_strategy_source(source)
+    return {
+        region_name: normalized[start:end]
+        for start, end, region_name in _editable_spans(normalized, editable_regions)
+    }
+
+
+def changed_editable_regions(
+    base_source: str,
+    candidate_source: str,
+    editable_regions: tuple[str, ...],
+) -> tuple[str, ...]:
+    base_regions = _editable_region_source_map(base_source, editable_regions)
+    candidate_regions = _editable_region_source_map(candidate_source, editable_regions)
+    changed = [
+        region_name
+        for region_name in editable_regions
+        if base_regions.get(region_name, "") != candidate_regions.get(region_name, "")
+    ]
+    return tuple(changed)
+
+
+def _function_node_map(source: str, region_names: tuple[str, ...]) -> dict[str, ast.FunctionDef]:
+    tree = ast.parse(normalize_strategy_source(source))
+    return {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in region_names
+    }
+
+
+def _param_keys_changed(base_source: str, candidate_source: str) -> tuple[str, ...]:
+    base_params = extract_params(base_source)
+    candidate_params = extract_params(candidate_source)
+    keys = sorted(set(base_params) | set(candidate_params))
+    changed = [
+        key
+        for key in keys
+        if base_params.get(key) != candidate_params.get(key)
+    ]
+    return tuple(changed)
+
+
+def param_family_for_key(param_key: str) -> str:
+    key = str(param_key).strip().lower()
+    if not key:
+        return "unknown"
+    if any(token in key for token in ("trade_count", "taker", "flow")):
+        return "flow"
+    for prefix in (
+        "breakout",
+        "breakdown",
+        "intraday",
+        "hourly",
+        "fourh",
+        "launch",
+        "long",
+        "short",
+        "macd",
+    ):
+        if key.startswith(prefix + "_") or key == prefix:
+            return prefix
+    return key.split("_", 1)[0]
+
+
+def _call_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return ""
+
+
+def _node_string_literals(node: ast.AST) -> set[str]:
+    literals: set[str] = set()
+    for child in ast.walk(node):
+        if isinstance(child, ast.Constant) and isinstance(child.value, str):
+            text = child.value.strip()
+            if STRUCTURAL_LITERAL_PATTERN.fullmatch(text):
+                literals.add(text)
+    return literals
+
+
+def _called_helper_names(node: ast.AST) -> set[str]:
+    names: set[str] = set()
+    for child in ast.walk(node):
+        if isinstance(child, ast.Call):
+            call_name = _call_name(child.func).strip()
+            if call_name:
+                names.add(call_name)
+    return names
+
+
+def build_system_edit_signature(
+    base_source: str,
+    candidate_source: str,
+    editable_regions: tuple[str, ...],
+) -> dict[str, object]:
+    changed_regions = changed_editable_regions(base_source, candidate_source, editable_regions)
+    changed_param_keys = _param_keys_changed(base_source, candidate_source)
+    param_families = tuple(
+        sorted({param_family_for_key(key) for key in changed_param_keys})
+    )
+
+    function_names = tuple(
+        region_name
+        for region_name in changed_regions
+        if region_name != "PARAMS"
+    )
+    function_nodes = _function_node_map(candidate_source, function_names)
+
+    changed_literals: set[str] = set()
+    helper_calls: set[str] = set()
+    for function_name in function_names:
+        node = function_nodes.get(function_name)
+        if node is None:
+            continue
+        changed_literals.update(_node_string_literals(node))
+        helper_calls.update(_called_helper_names(node))
+
+    structural_tokens = tuple(
+        sorted(
+            {
+                *changed_regions,
+                *param_families,
+                *changed_literals,
+                *helper_calls,
+            }
+        )
+    )
+    signature_payload = {
+        "changed_regions": list(changed_regions),
+        "changed_param_keys": list(changed_param_keys),
+        "param_families": list(param_families),
+        "changed_literals": sorted(changed_literals),
+        "helper_calls": sorted(helper_calls),
+    }
+    return {
+        "changed_regions": changed_regions,
+        "changed_param_keys": changed_param_keys,
+        "param_families": param_families,
+        "changed_literals": tuple(sorted(changed_literals)),
+        "helper_calls": tuple(sorted(helper_calls)),
+        "structural_tokens": structural_tokens,
+        "signature_hash": hashlib.sha256(
+            json.dumps(signature_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest(),
+    }
 
 
 def validate_editable_region_boundaries(

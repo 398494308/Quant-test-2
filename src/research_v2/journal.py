@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from research_v2.evaluation import OVERFIT_WARN_SCORE, overfit_reference_action, overfit_risk_level_from_score
+from research_v2.strategy_code import build_system_edit_signature
 
 
 # ==================== 常量 ====================
@@ -43,6 +44,7 @@ CLUSTER_OVERHEAT_MIN_ROUNDS = 6
 CLUSTER_OVERHEAT_SHARE = 0.60
 DEFAULT_CLUSTER_LOCK_STEPS = (3, 6, 10)
 TAG_NOVELTY_MAX_OVERLAP = 0.34
+STRUCTURAL_TOKEN_NOVELTY_MAX_OVERLAP = 0.60
 LONG_TARGET_KEYWORDS = (
     "long",
     "bull",
@@ -212,11 +214,29 @@ def _risk_label(*, attempts: int, failures: int, zero_delta: int, runtime_errors
 
 
 def region_families_for_regions(regions: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    family_map = {
+        "PARAMS": "params",
+        "_is_sideways_regime": "sideways",
+        "_sideways_release_flags": "sideways",
+        "_flow_signal_metrics": "flow",
+        "_flow_confirmation_ok": "flow",
+        "_flow_entry_ok": "flow",
+        "_trend_quality_ok": "trend_quality",
+        "_trend_quality_long": "trend_quality",
+        "_trend_quality_short": "trend_quality",
+        "_trend_followthrough_ok": "followthrough",
+        "_trend_followthrough_long": "followthrough",
+        "_trend_followthrough_short": "followthrough",
+        "_long_entry_signal": "long_entry",
+        "_short_entry_signal": "short_entry",
+        "strategy": "strategy",
+    }
     normalized = []
     for region in regions:
         name = str(region).strip()
-        if name and name not in normalized:
-            normalized.append(name)
+        family = family_map.get(name, name)
+        if family and family not in normalized:
+            normalized.append(family)
     return tuple(normalized)
 
 
@@ -244,11 +264,20 @@ def target_family_from_text(
 
 
 def exploration_signature_for_entry(entry: dict[str, Any]) -> dict[str, Any]:
-    stored_regions = entry.get("region_families", [])
+    stored_regions = entry.get("system_region_families", []) or entry.get("region_families", [])
     if stored_regions:
         region_families = tuple(str(item).strip() for item in stored_regions if str(item).strip())
     else:
-        region_families = region_families_for_regions(entry.get("edited_regions", []))
+        region_families = region_families_for_regions(
+            entry.get("system_changed_regions", []) or entry.get("edited_regions", [])
+        )
+
+    stored_changed_regions = entry.get("system_changed_regions", []) or entry.get("edited_regions", [])
+    changed_regions = {
+        str(item).strip()
+        for item in stored_changed_regions
+        if str(item).strip()
+    }
 
     stored_target = str(entry.get("target_family", "")).strip()
     if stored_target:
@@ -274,6 +303,17 @@ def exploration_signature_for_entry(entry: dict[str, Any]) -> dict[str, Any]:
             if isinstance(factor, dict) and str(factor.get("name", "")).strip()
         }
 
+    param_families = {
+        str(item).strip()
+        for item in entry.get("system_param_families", [])
+        if str(item).strip()
+    }
+    structural_tokens = {
+        str(item).strip()
+        for item in entry.get("system_structural_tokens", [])
+        if str(item).strip()
+    }
+
     return {
         "cluster_key": cluster_key_for_entry(entry),
         "tags": {
@@ -282,12 +322,60 @@ def exploration_signature_for_entry(entry: dict[str, Any]) -> dict[str, Any]:
             if str(tag).strip()
         },
         "region_families": set(region_families),
+        "changed_regions": changed_regions,
         "target_family": target_family,
         "core_factor_names": core_factor_names,
+        "param_families": param_families,
+        "structural_tokens": structural_tokens,
+        "signature_hash": str(entry.get("system_signature_hash", "")).strip(),
     }
 
 
-def exploration_signature_for_candidate(candidate: Any) -> dict[str, Any]:
+def exploration_signature_for_candidate(
+    candidate: Any,
+    *,
+    base_source: str | None = None,
+    editable_regions: tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    system_signature: dict[str, object] | None = None
+    if base_source is not None and editable_regions:
+        system_signature = build_system_edit_signature(
+            base_source,
+            getattr(candidate, "strategy_code", ""),
+            editable_regions,
+        )
+
+    if system_signature is not None:
+        changed_regions = {
+            str(item).strip()
+            for item in system_signature["changed_regions"]
+            if str(item).strip()
+        }
+        region_families = set(
+            region_families_for_regions(tuple(sorted(changed_regions)))
+        )
+        param_families = {
+            str(item).strip()
+            for item in system_signature["param_families"]
+            if str(item).strip()
+        }
+        structural_tokens = {
+            str(item).strip()
+            for item in system_signature["structural_tokens"]
+            if str(item).strip()
+        }
+        signature_hash = str(system_signature["signature_hash"]).strip()
+    else:
+        changed_regions = {
+            str(item).strip()
+            for item in getattr(candidate, "edited_regions", ())
+            if str(item).strip()
+        }
+        region_families = set(region_families_for_regions(getattr(candidate, "edited_regions", ())))
+        param_families = set()
+        structural_tokens = set()
+        signature_hash = ""
+
     return {
         "cluster_key": cluster_key_for_components(
             getattr(candidate, "closest_failed_cluster", ""),
@@ -298,7 +386,8 @@ def exploration_signature_for_candidate(candidate: Any) -> dict[str, Any]:
             for tag in getattr(candidate, "change_tags", ())
             if str(tag).strip()
         },
-        "region_families": set(region_families_for_regions(getattr(candidate, "edited_regions", ()))),
+        "region_families": region_families,
+        "changed_regions": changed_regions,
         "target_family": target_family_from_text(
             getattr(candidate, "change_tags", ()),
             getattr(candidate, "hypothesis", ""),
@@ -309,6 +398,9 @@ def exploration_signature_for_candidate(candidate: Any) -> dict[str, Any]:
             for factor in getattr(candidate, "core_factors", ())
             if str(getattr(factor, "name", "")).strip()
         },
+        "param_families": param_families,
+        "structural_tokens": structural_tokens,
+        "signature_hash": signature_hash,
     }
 
 
@@ -785,17 +877,26 @@ def _same_cluster_low_change_context(entries: list[dict[str, Any]], score_regime
     cluster_entries = [entry for entry in tail if cluster_key_for_entry(entry) == cluster]
     tag_union: set[str] = set()
     region_families: set[str] = set()
+    changed_regions: set[str] = set()
     target_families: set[str] = set()
     core_factor_names: set[str] = set()
+    param_families: set[str] = set()
+    structural_tokens: set[str] = set()
+    signature_hashes: set[str] = set()
     entry_signatures: list[dict[str, Any]] = []
     for entry in cluster_entries:
         signature = exploration_signature_for_entry(entry)
         entry_signatures.append(signature)
         tag_union.update(signature["tags"])
         region_families.update(signature["region_families"])
+        changed_regions.update(signature["changed_regions"])
         if signature["target_family"] not in {"", "unknown"}:
             target_families.add(signature["target_family"])
         core_factor_names.update(signature["core_factor_names"])
+        param_families.update(signature["param_families"])
+        structural_tokens.update(signature["structural_tokens"])
+        if signature["signature_hash"]:
+            signature_hashes.add(signature["signature_hash"])
 
     return {
         "cluster": cluster,
@@ -803,8 +904,12 @@ def _same_cluster_low_change_context(entries: list[dict[str, Any]], score_regime
         "entry_signatures": entry_signatures,
         "tag_union": tag_union,
         "region_families": region_families,
+        "changed_regions": changed_regions,
         "target_families": target_families,
         "core_factor_names": core_factor_names,
+        "param_families": param_families,
+        "structural_tokens": structural_tokens,
+        "signature_hashes": signature_hashes,
     }
 
 
@@ -813,16 +918,30 @@ def _candidate_has_structural_novelty(
     low_change_context: dict[str, Any],
 ) -> bool:
     candidate_regions = candidate_signature["region_families"]
+    candidate_changed_regions = candidate_signature["changed_regions"]
     candidate_target = candidate_signature["target_family"]
     candidate_factors = candidate_signature["core_factor_names"]
     candidate_tags = candidate_signature["tags"]
+    candidate_param_families = candidate_signature["param_families"]
+    candidate_structural_tokens = candidate_signature["structural_tokens"]
+    candidate_signature_hash = candidate_signature["signature_hash"]
 
     if candidate_regions and not candidate_regions.issubset(low_change_context["region_families"]):
+        return True
+    if candidate_changed_regions and not candidate_changed_regions.issubset(low_change_context["changed_regions"]):
         return True
     if candidate_target in {"long", "short"} and candidate_target not in low_change_context["target_families"]:
         return True
     if candidate_factors - low_change_context["core_factor_names"]:
         return True
+    if candidate_param_families - low_change_context["param_families"]:
+        return True
+    if candidate_signature_hash and candidate_signature_hash in low_change_context["signature_hashes"]:
+        return False
+    if candidate_structural_tokens:
+        overlap_ratio = len(candidate_structural_tokens & low_change_context["structural_tokens"]) / max(len(candidate_structural_tokens), 1)
+        if len(candidate_structural_tokens) >= 4 and overlap_ratio <= STRUCTURAL_TOKEN_NOVELTY_MAX_OVERLAP:
+            return True
     if candidate_tags:
         overlap_ratio = len(candidate_tags & low_change_context["tag_union"]) / max(len(candidate_tags), 1)
         if len(candidate_tags) >= 2 and overlap_ratio <= TAG_NOVELTY_MAX_OVERLAP:
@@ -862,10 +981,16 @@ def evaluate_candidate_exploration_guard(
     journal_path: Path | None,
     score_regime: str,
     current_iteration: int,
+    base_source: str | None = None,
+    editable_regions: tuple[str, ...] | None = None,
     lock_schedule: tuple[int, ...] = DEFAULT_CLUSTER_LOCK_STEPS,
     include_current_round_locks: bool = False,
 ) -> dict[str, Any] | None:
-    candidate_signature = exploration_signature_for_candidate(candidate)
+    candidate_signature = exploration_signature_for_candidate(
+        candidate,
+        base_source=base_source,
+        editable_regions=editable_regions,
+    )
     candidate_cluster = str(candidate_signature["cluster_key"]).strip()
     if not candidate_cluster:
         return None
@@ -943,8 +1068,11 @@ def evaluate_candidate_exploration_guard(
         "low_change_cluster": candidate_cluster,
         "low_change_tags": tuple(sorted(low_change_context["tag_union"])),
         "low_change_regions": tuple(sorted(low_change_context["region_families"])),
+        "low_change_changed_regions": tuple(sorted(low_change_context["changed_regions"])),
         "low_change_targets": tuple(sorted(low_change_context["target_families"])),
         "low_change_factors": tuple(sorted(low_change_context["core_factor_names"])),
+        "low_change_param_families": tuple(sorted(low_change_context["param_families"])),
+        "low_change_structural_tokens": tuple(sorted(low_change_context["structural_tokens"])),
         "current_locks": tuple(
             f"{cluster}(剩余{payload['remaining_rounds']}轮)"
             for cluster, payload in sorted(
@@ -1483,7 +1611,7 @@ def _legacy_regime_reference_lines(
     lines = [
         "旧评分口径弱参考（不可主导本轮）:",
         f"- 当前主参考只能是 `{current_score_regime}` 的近期轮次、方向风险表和过拟合风险表。",
-        "- 旧口径只可作为因子家族或方向假设的弱启发；禁止把旧分数、旧 gate 结论或旧 best 直接当成当前有效证据。",
+        "- 旧口径只可作为因子家族或方向假设的弱启发；禁止把旧分数、旧 gate 结论或旧 champion 直接当成当前有效证据。",
         "- 如果旧口径结论与当前口径近期失败记忆冲突，一律以当前口径为准。",
     ]
 
