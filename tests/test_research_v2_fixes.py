@@ -33,6 +33,7 @@ from research_v2.evaluation import (
 from research_v2.charting import charts_available, render_performance_chart
 from research_v2.journal import (
     ORDINARY_REGION_FAMILIES,
+    append_journal_archive,
     build_exploration_guard_state,
     _format_compact_for_prompt,
     build_journal_prompt_summary,
@@ -49,6 +50,7 @@ from research_v2.prompting import (
     build_candidate_response_schema,
     build_strategy_exploration_repair_prompt,
     build_strategy_research_prompt,
+    build_strategy_system_prompt,
 )
 from research_v2.strategy_code import (
     REQUIRED_FUNCTIONS,
@@ -954,38 +956,36 @@ class JournalPromptFixesTest(unittest.TestCase):
 
         self.assertEqual(schema["properties"]["edited_regions"]["maxItems"], len(EDITABLE_REGIONS))
 
-    def test_build_strategy_prompt_mentions_15m_single_source_and_flow(self):
-        prompt = build_strategy_research_prompt(
-            evaluation_summary="诊断",
-            journal_summary="记忆",
-            previous_best_score=1.23,
-        )
+    def test_build_strategy_system_prompt_mentions_15m_single_source_and_flow(self):
+        prompt = build_strategy_system_prompt()
 
         self.assertIn("15m` 是唯一事实源", prompt)
         self.assertIn("方向流量代理", prompt)
-        self.assertIn("promotion_delta > 0.02", prompt)
+        self.assertIn("state/research_macd_aggressive_v2_memory", prompt)
 
-    def test_build_strategy_prompt_mentions_all_required_symbols(self):
+    def test_build_strategy_runtime_prompt_mentions_promotion_gate(self):
         prompt = build_strategy_research_prompt(
             evaluation_summary="诊断",
             journal_summary="记忆",
             previous_best_score=1.23,
         )
+
+        self.assertIn("promotion_delta > 0.02", prompt)
+        self.assertIn("当前回合任务", prompt)
+
+    def test_build_strategy_system_prompt_mentions_all_required_symbols(self):
+        prompt = build_strategy_system_prompt()
 
         for function_name in REQUIRED_FUNCTIONS:
             self.assertIn(f"`{function_name}()`", prompt)
 
-    def test_build_strategy_prompt_mentions_ordinary_family_budget(self):
-        prompt = build_strategy_research_prompt(
-            evaluation_summary="诊断",
-            journal_summary="记忆",
-            previous_best_score=1.23,
-        )
+    def test_build_strategy_system_prompt_mentions_ordinary_family_budget(self):
+        prompt = build_strategy_system_prompt()
 
         self.assertIn("`strategy()` 与 `PARAMS` 属于特殊区域", prompt)
         for family_name in ORDINARY_REGION_FAMILIES:
             self.assertIn(f"`{family_name}`", prompt)
-        self.assertIn("选择 `1-3` 个普通 family", prompt)
+        self.assertIn("普通 family", prompt)
 
     def test_build_strategy_exploration_repair_prompt_mentions_blocked_cluster(self):
         prompt = build_strategy_exploration_repair_prompt(
@@ -1069,7 +1069,7 @@ class JournalPromptFixesTest(unittest.TestCase):
                     base_source=base_source,
                 )
 
-    def test_candidate_from_payload_rejects_more_than_three_ordinary_families(self):
+    def test_candidate_from_payload_allows_four_ordinary_families(self):
         base_source = self._minimal_strategy_source()
         candidate_source = base_source
         candidate_source = candidate_source.replace(
@@ -1115,12 +1115,12 @@ class JournalPromptFixesTest(unittest.TestCase):
                 "core_factors": [],
             }
 
-            with self.assertRaisesRegex(StrategySourceError, "ordinary region families exceed 3"):
-                research_script._candidate_from_payload(
-                    payload,
-                    workspace_strategy_file=workspace_strategy_file,
-                    base_source=base_source,
-                )
+            candidate = research_script._candidate_from_payload(
+                payload,
+                workspace_strategy_file=workspace_strategy_file,
+                base_source=base_source,
+            )
+            self.assertEqual(candidate.candidate_id, "candidate_four_families")
 
     def test_cluster_for_tags_groups_ownership_variants(self):
         self.assertEqual(cluster_for_tags(["acceptance_continuity", "ownership_transfer"]), "ownership_cluster")
@@ -1866,7 +1866,7 @@ class FreqtradeAdapterFixesTest(unittest.TestCase):
 
         summary = build_journal_prompt_summary(entries, limit=2, current_score_regime="trend_capture_v4")
 
-        self.assertIn("最近未压缩轮次共 5 条", summary)
+        self.assertIn("当前 stage（自 round 1 激活以来） 共 5 条", summary)
         self.assertIn("以下表格与元信息仅展示最近 2 条", summary)
         self.assertIn("candidate_5", summary)
         self.assertIn("candidate_4", summary)
@@ -1926,7 +1926,7 @@ class FreqtradeAdapterFixesTest(unittest.TestCase):
         summary = build_journal_prompt_summary([], limit=8)
 
         self.assertIn("方向风险表", summary)
-        self.assertIn("最近核心指标表", summary)
+        self.assertIn("当前 stage 核心指标表", summary)
         self.assertIn("等待新历史", summary)
 
     def test_journal_summary_keeps_current_regime_recent_rows_after_global_compaction(self):
@@ -1990,10 +1990,122 @@ class FreqtradeAdapterFixesTest(unittest.TestCase):
                 current_score_regime="trend_capture_v4",
             )
 
-        self.assertIn("最近未压缩轮次共 5 条", summary)
+        self.assertIn("当前 stage（自 round 31 激活以来） 共 5 条", summary)
         self.assertIn("current_0", summary)
         self.assertIn("current_4", summary)
         self.assertNotIn("legacy_29", summary)
+
+    def test_journal_summary_uses_active_stage_iteration_boundary(self):
+        entries = [
+            {
+                "iteration": 1,
+                "candidate_id": "bootstrap_1",
+                "outcome": "rejected",
+                "stop_stage": "full_eval",
+                "promotion_score": 0.22,
+                "quality_score": 0.30,
+                "promotion_delta": 0.0,
+                "gate_reason": "通过",
+                "change_tags": ["legacy_breakout"],
+                "edited_regions": ["strategy"],
+                "hypothesis": "旧 stage 历史",
+                "score_regime": "trend_capture_v4",
+            },
+            {
+                "iteration": 2,
+                "candidate_id": "bootstrap_2",
+                "outcome": "accepted",
+                "stop_stage": "full_eval",
+                "promotion_score": 0.28,
+                "quality_score": 0.34,
+                "promotion_delta": 0.05,
+                "gate_reason": "通过",
+                "change_tags": ["legacy_breakout"],
+                "edited_regions": ["strategy"],
+                "hypothesis": "旧 stage 终点",
+                "score_regime": "trend_capture_v4",
+            },
+            {
+                "iteration": 3,
+                "candidate_id": "current_1",
+                "outcome": "behavioral_noop",
+                "stop_stage": "behavioral_noop",
+                "promotion_score": None,
+                "quality_score": None,
+                "promotion_delta": None,
+                "gate_reason": "smoke 行为指纹与当前主参考完全一致",
+                "change_tags": ["ownership_takeover"],
+                "edited_regions": ["strategy"],
+                "hypothesis": "当前 stage",
+                "score_regime": "trend_capture_v4",
+            },
+        ]
+
+        summary = build_journal_prompt_summary(
+            entries,
+            limit=8,
+            current_score_regime="trend_capture_v4",
+            active_stage_iteration=3,
+            reference_role="champion",
+        )
+
+        self.assertIn("当前 champion stage", summary)
+        self.assertIn("round 3", summary)
+        self.assertIn("当前 champion stage（自 round 3 激活以来） 共 1 条", summary)
+        self.assertIn("历史 stage 摘要", summary)
+        self.assertIn("bootstrap", summary)
+
+    def test_journal_summary_writes_memory_snapshots(self):
+        entries = [
+            {
+                "iteration": 5,
+                "candidate_id": "current_stage_candidate",
+                "outcome": "behavioral_noop",
+                "stop_stage": "behavioral_noop",
+                "promotion_score": None,
+                "quality_score": None,
+                "promotion_delta": None,
+                "gate_reason": "smoke 行为指纹与当前主参考完全一致",
+                "change_tags": ["ownership_takeover"],
+                "edited_regions": ["strategy"],
+                "hypothesis": "当前 stage",
+                "score_regime": "trend_capture_v4",
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            memory_root = Path(tmpdir) / "memory"
+            build_journal_prompt_summary(
+                entries,
+                limit=8,
+                current_score_regime="trend_capture_v4",
+                active_stage_iteration=5,
+                memory_root=memory_root,
+            )
+
+            self.assertTrue((memory_root / "summaries/current_stage_rounds.json").exists())
+            self.assertTrue((memory_root / "summaries/past_stage_summaries.json").exists())
+            self.assertTrue((memory_root / "summaries/all_time_tables.json").exists())
+            self.assertTrue((memory_root / "prompt/latest_history_package.md").exists())
+
+    def test_append_journal_archive_writes_raw_history_files(self):
+        entry = {
+            "iteration": 7,
+            "candidate_id": "archive_test",
+            "outcome": "rejected",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            memory_root = Path(tmpdir) / "memory"
+            append_journal_archive(memory_root, entry)
+
+            raw_history = memory_root / "raw/full_history.jsonl"
+            raw_rounds = memory_root / "raw/rounds"
+
+            self.assertTrue(raw_history.exists())
+            self.assertTrue(raw_rounds.exists())
+            self.assertIn("archive_test", raw_history.read_text())
+            self.assertEqual(len(list(raw_rounds.glob("*.json"))), 1)
 
     def test_journal_summary_appends_legacy_regime_as_secondary_reference(self):
         entries = [
@@ -2270,12 +2382,19 @@ class ReferenceStateFixesTest(unittest.TestCase):
         original_champion = research_script.champion_report
         try:
             research_script.champion_report = None
-            payload = research_script._reference_manifest_payload("def strategy():\n    return None\n", report)
+            payload = research_script._reference_manifest_payload(
+                "def strategy():\n    return None\n",
+                report,
+                stage_started_at="2026-04-20T00:00:00+00:00",
+                stage_iteration=7,
+            )
         finally:
             research_script.champion_report = original_champion
 
         self.assertEqual(payload["reference_role"], "baseline")
         self.assertIsNone(payload["champion"])
+        self.assertEqual(payload["reference_stage_started_at"], "2026-04-20T00:00:00+00:00")
+        self.assertEqual(payload["reference_stage_iteration"], 7)
 
     def test_promotion_acceptance_accepts_first_gate_passed_champion_when_baseline_fails(self):
         baseline_report = EvaluationReport(
@@ -2324,6 +2443,7 @@ class ReferenceStateFixesTest(unittest.TestCase):
                 strategy_file=temp_root / "src/strategy_macd_aggressive.py",
                 log_file=temp_root / "logs/research.log",
                 journal_file=temp_root / "state/journal.jsonl",
+                memory_dir=temp_root / "state/memory",
                 heartbeat_file=temp_root / "state/heartbeat.json",
                 best_state_file=temp_root / "state/best.json",
                 best_strategy_file=temp_root / "backups/best.py",

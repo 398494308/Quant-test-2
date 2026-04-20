@@ -119,16 +119,23 @@
 
 当前研究器的研究记忆与修复链路：
 
-- prompt 开头会先强调：这是一套 `15m` 执行、`1h + 4h` 确认的 BTC 激进趋势策略，目标是抓大行情，而不是做低波动收益平滑。
-- prompt 第一屏先显示方向风险表，按方向簇聚合近期失败、零增益和运行报错。
+- prompt 现在拆成 `system prompt + runtime prompt + history package` 三层。
+- `system prompt` 只放稳定信息：项目目标、文件职责、编辑边界、输出规则。
+- `runtime prompt` 只放本轮动态信息：当前诊断、当前口径 gate、本轮执行框架和行为无变化约束。
+- `history package` 改成按当前主参考的 `stage` 来组织，而不是固定“最近 N 轮”。
+- 当前 `stage` 的边界来自 `best_state` 里的 `reference_stage_started_at / reference_stage_iteration`；研究器重启后不会把当前 `baseline/champion` 阶段切乱。
+- prompt 第一屏仍先显示方向风险表，按当前 `stage` 的方向簇聚合失败、零增益和运行报错。
 - 若最近一段历史里同一方向簇占比过高且没有实质正 `delta`，prompt 会在方向风险表后追加“主簇过热”提示，默认要求下一轮优先跨簇。
-- prompt 第一屏的“最近未压缩轮次表”现在会正确吃到当前评分口径的最新历史，不再被旧口径 compact 索引错切掉。
+- 当前 `stage` 只在 prompt 里展示最近有限条表格和元信息，避免长串 noop 淹没当前硬约束；完整 `stage` 与全量原始历史会单独落到 memory 目录。
 - 旧评分口径不会混进当前主表；它们只会在后面以“旧评分口径弱参考”出现，作为低优先级方向启发。
+- 老 `stage` 不会丢失，会被压缩成 `历史 stage 摘要`；同时还会生成当前评分口径的 `全局方向统计`，给模型看跨 stage 的长期模式。
+- 每条 journal 都会同步归档到 `state/research_macd_aggressive_v2_memory/raw/full_history.jsonl` 和 `raw/rounds/*.json`。
 - 防重复探索不再主要靠 prompt 自报；系统会结合真实 diff、参数族变化和 AST 派生结构签名做硬拦截。
 - 候选必须输出 `closest_failed_cluster` 与 `novelty_proof`，说明本轮为什么不是重复试错。
 - 如果仍想留在“主簇过热”的方向簇里，`novelty_proof` 必须同时说明不同交易路径、至少两个会明显变化的关键诊断，以及为什么这不是只换 tag 或轻微阈值。
 - 若最近连续 3 轮都属于低变化轮次，prompt 会强制把下一轮视为“探索轮”，优先切换因子家族或编辑区域家族。
-- `edited_regions` 现在最多允许 `1-3` 个；系统只把真实 diff 派生出来的 changed regions 当成主依据。
+- ordinary family 现在只保留“至少改 `1` 个”的下限；`1-3` 仍是 prompt 里的默认软引导，但连续 `behavioral_noop` 后允许直接覆盖更多 family。系统只把真实 diff 派生出来的 changed regions 当成主依据。
+- 研究器的 `behavioral_noop` 反馈会直接点名当前该优先检查的 choke point：长侧优先看 `long_outer_context_ok` 与 `long_final_veto_clear`，空侧优先看 `short_outer_context_ok` 与 `short_final_veto_clear`。
 - 每轮先跑少量 `smoke` 窗口；若代码运行报错，会在同一轮把错误回传给模型做 repair，而不是直接开始下一轮。
 - 若 repair 次数耗尽，这轮会被记成 `runtime_failed`，同样进入 journal 和记忆压缩。
 - `heartbeat` 会持续写出当前阶段和窗口索引，便于定位是卡在 `smoke`、`full_eval` 还是 repair。

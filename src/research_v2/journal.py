@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter, defaultdict
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -98,6 +99,43 @@ def append_journal_entry(path: Path, entry: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as handle:
         handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def _memory_archive_paths(memory_root: Path) -> dict[str, Path]:
+    return {
+        "raw_history": memory_root / "raw/full_history.jsonl",
+        "raw_rounds_dir": memory_root / "raw/rounds",
+        "current_stage": memory_root / "summaries/current_stage_rounds.json",
+        "past_stages": memory_root / "summaries/past_stage_summaries.json",
+        "all_time_tables": memory_root / "summaries/all_time_tables.json",
+        "latest_prompt": memory_root / "prompt/latest_history_package.md",
+    }
+
+
+def _slugify_archive_name(value: Any, *, default: str) -> str:
+    text = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(value or "").strip()).strip("_").lower()
+    return text or default
+
+
+def append_journal_archive(memory_root: Path, entry: dict[str, Any]) -> None:
+    paths = _memory_archive_paths(memory_root)
+    raw_history_path = paths["raw_history"]
+    raw_history_path.parent.mkdir(parents=True, exist_ok=True)
+    with raw_history_path.open("a") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    rounds_dir = paths["raw_rounds_dir"]
+    rounds_dir.mkdir(parents=True, exist_ok=True)
+    iteration = int(entry.get("iteration", 0) or 0)
+    candidate_slug = _slugify_archive_name(entry.get("candidate_id"), default="candidate")
+    outcome_slug = _slugify_archive_name(entry.get("outcome"), default="entry")
+    base_name = f"round_{iteration:04d}_{candidate_slug}_{outcome_slug}.json"
+    round_path = rounds_dir / base_name
+    suffix = 2
+    while round_path.exists():
+        round_path = rounds_dir / f"{base_name[:-5]}_{suffix}.json"
+        suffix += 1
+    round_path.write_text(json.dumps(entry, ensure_ascii=False, indent=2))
 
 
 # ==================== 压缩（compact） ====================
@@ -1510,6 +1548,305 @@ def _cluster_overheat_lines(entries: list[dict[str, Any]], limit: int) -> list[s
 # ==================== 摘要生成 ====================
 
 
+def _entry_iteration(entry: dict[str, Any]) -> int:
+    try:
+        return int(entry.get("iteration", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    normalized = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _partition_entries_by_stage(
+    entries: list[dict[str, Any]],
+    *,
+    score_regime: str,
+    active_stage_started_at: str = "",
+    active_stage_iteration: int = 0,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    current_entries = _entries_for_score_regime(entries, score_regime)
+    if not current_entries:
+        return [], [], {"stage_iteration": 0, "stage_started_at": str(active_stage_started_at or "").strip()}
+
+    boundary_iteration = max(0, int(active_stage_iteration or 0))
+    stage_started_at = str(active_stage_started_at or "").strip()
+    if boundary_iteration <= 0 and stage_started_at:
+        stage_started_at_dt = _parse_timestamp(stage_started_at)
+        if stage_started_at_dt is not None:
+            for entry in current_entries:
+                entry_ts = _parse_timestamp(entry.get("timestamp"))
+                entry_iteration = _entry_iteration(entry)
+                if entry_ts is not None and entry_iteration > 0 and entry_ts >= stage_started_at_dt:
+                    boundary_iteration = entry_iteration
+                    break
+            if boundary_iteration <= 0:
+                boundary_iteration = max((_entry_iteration(entry) for entry in current_entries), default=0) + 1
+
+    if boundary_iteration <= 0:
+        boundary_iteration = next((value for value in (_entry_iteration(entry) for entry in current_entries) if value > 0), 0)
+
+    past_stage_entries: list[dict[str, Any]] = []
+    current_stage_entries: list[dict[str, Any]] = []
+    for entry in current_entries:
+        entry_iteration = _entry_iteration(entry)
+        if boundary_iteration > 0 and entry_iteration > 0 and entry_iteration < boundary_iteration:
+            past_stage_entries.append(entry)
+        else:
+            current_stage_entries.append(entry)
+
+    return current_stage_entries, past_stage_entries, {
+        "stage_iteration": boundary_iteration,
+        "stage_started_at": stage_started_at,
+    }
+
+
+def _group_entries_into_stages(entries: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    stages: list[list[dict[str, Any]]] = []
+    current_stage: list[dict[str, Any]] = []
+    for entry in entries:
+        if current_stage and str(entry.get("outcome", "")) == "accepted":
+            stages.append(current_stage)
+            current_stage = [entry]
+            continue
+        current_stage.append(entry)
+    if current_stage:
+        stages.append(current_stage)
+    return stages
+
+
+def _format_optional_metric(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return f"{value:.2f}"
+
+
+def _summarize_stage_entries(stage_entries: list[dict[str, Any]], *, stage_id: int) -> dict[str, Any]:
+    if not stage_entries:
+        return {}
+
+    cluster_counter: Counter[str] = Counter()
+    tag_counter: Counter[str] = Counter()
+    target_counter: Counter[str] = Counter()
+    failure_reason_counter: Counter[str] = Counter()
+    best_promotion: float | None = None
+    best_delta = 0.0
+    accepted_count = 0
+    rejected_count = 0
+    behavioral_noop_count = 0
+    runtime_failed_count = 0
+    exploration_blocked_count = 0
+
+    for entry in stage_entries:
+        cluster_counter[cluster_key_for_entry(entry) or "unclassified"] += 1
+        for tag in entry.get("change_tags", []):
+            tag_counter[str(tag)] += 1
+        target_family = str(entry.get("target_family", "")).strip()
+        if target_family:
+            target_counter[target_family] += 1
+
+        outcome = str(entry.get("outcome", "")).strip()
+        if outcome == "accepted":
+            accepted_count += 1
+        if outcome == "behavioral_noop":
+            behavioral_noop_count += 1
+        if outcome == "runtime_failed":
+            runtime_failed_count += 1
+        if outcome == "exploration_blocked":
+            exploration_blocked_count += 1
+        if _outcome_bucket(outcome) == "rejected":
+            rejected_count += 1
+            reason = _entry_decision_reason(entry)
+            if reason and reason != "-":
+                failure_reason_counter[reason] += 1
+
+        promotion_score = entry.get("promotion_score")
+        if promotion_score is not None:
+            score = _score_value(promotion_score)
+            best_promotion = score if best_promotion is None else max(best_promotion, score)
+        best_delta = max(best_delta, _score_value(entry.get("promotion_delta")))
+
+    first_entry = stage_entries[0]
+    last_entry = stage_entries[-1]
+    activation_kind = "accepted" if str(first_entry.get("outcome", "")) == "accepted" else "bootstrap"
+    return {
+        "stage_id": stage_id,
+        "start_iteration": _entry_iteration(first_entry),
+        "end_iteration": _entry_iteration(last_entry),
+        "activation_kind": activation_kind,
+        "activation_timestamp": str(first_entry.get("timestamp", "")).strip(),
+        "entry_count": len(stage_entries),
+        "accepted_count": accepted_count,
+        "rejected_count": rejected_count,
+        "behavioral_noop_count": behavioral_noop_count,
+        "runtime_failed_count": runtime_failed_count,
+        "exploration_blocked_count": exploration_blocked_count,
+        "best_promotion": best_promotion,
+        "best_delta": best_delta,
+        "dominant_clusters": [name for name, _ in cluster_counter.most_common(2)],
+        "dominant_tags": [name for name, _ in tag_counter.most_common(3)],
+        "dominant_targets": [name for name, _ in target_counter.most_common(2)],
+        "top_failure_reasons": [name for name, _ in failure_reason_counter.most_common(2)],
+    }
+
+
+def _format_past_stage_summary_lines(stage_summaries: list[dict[str, Any]], limit: int) -> list[str]:
+    if not stage_summaries:
+        return []
+
+    display_count = min(max(1, limit), len(stage_summaries))
+    display_items = stage_summaries[-display_count:]
+    lines = ["历史 stage 摘要（压缩）:"]
+    if display_count < len(stage_summaries):
+        lines.append(f"- 已压缩 {len(stage_summaries)} 个旧 stage，以下仅展示最近 {display_count} 个。")
+    for stage in display_items:
+        range_text = f"{stage['start_iteration']}~{stage['end_iteration']}"
+        dominant_clusters = ", ".join(stage["dominant_clusters"]) or "-"
+        dominant_tags = ", ".join(stage["dominant_tags"]) or "-"
+        dominant_targets = ", ".join(stage["dominant_targets"]) or "-"
+        top_failures = ", ".join(stage["top_failure_reasons"]) or "-"
+        lines.append(
+            f"- stage {stage['stage_id']} | 轮次 {range_text} | 激活方式 {stage['activation_kind']} | "
+            f"总 {stage['entry_count']} / 保留 {stage['accepted_count']} / 未保留 {stage['rejected_count']} / "
+            f"noop {stage['behavioral_noop_count']} / runtime {stage['runtime_failed_count']} | "
+            f"best promotion {_format_optional_metric(stage['best_promotion'])} / best delta {stage['best_delta']:.2f} | "
+            f"主簇 {dominant_clusters} | 主标签 {dominant_tags} | 目标 {dominant_targets} | 高频失败 {top_failures}"
+        )
+    return lines
+
+
+def _all_time_tables_payload(entries: list[dict[str, Any]], limit: int) -> dict[str, Any]:
+    cluster_bucket: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {
+            "attempts": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "behavioral_noop": 0,
+            "runtime_errors": 0,
+            "zero_delta": 0,
+            "best_delta": 0.0,
+        }
+    )
+    failure_tags: Counter[str] = Counter()
+    factor_names: Counter[str] = Counter()
+
+    for entry in entries:
+        cluster = cluster_key_for_entry(entry) or "unclassified"
+        bucket = cluster_bucket[cluster]
+        bucket["attempts"] += 1
+        outcome = str(entry.get("outcome", "")).strip()
+        if _outcome_bucket(outcome) == "accepted":
+            bucket["accepted"] += 1
+        if _outcome_bucket(outcome) == "rejected":
+            bucket["rejected"] += 1
+            for tag in entry.get("change_tags", []):
+                failure_tags[str(tag)] += 1
+        if outcome == "behavioral_noop":
+            bucket["behavioral_noop"] += 1
+        if outcome == "runtime_failed":
+            bucket["runtime_errors"] += 1
+        promotion_delta = _score_value(entry.get("promotion_delta"))
+        if abs(promotion_delta) <= 1e-9:
+            bucket["zero_delta"] += 1
+        bucket["best_delta"] = max(bucket["best_delta"], promotion_delta)
+        for factor in entry.get("core_factors", []):
+            if not isinstance(factor, dict):
+                continue
+            name = str(factor.get("name", "")).strip()
+            if name:
+                factor_names[name] += 1
+
+    clusters = []
+    for cluster_name, stats in cluster_bucket.items():
+        label = _risk_label(
+            attempts=int(stats["attempts"]),
+            failures=int(stats["rejected"]),
+            zero_delta=int(stats["zero_delta"]),
+            runtime_errors=int(stats["runtime_errors"]),
+            best_delta=float(stats["best_delta"]),
+        )
+        clusters.append(
+            {
+                "cluster": cluster_name,
+                "attempts": int(stats["attempts"]),
+                "accepted": int(stats["accepted"]),
+                "rejected": int(stats["rejected"]),
+                "behavioral_noop": int(stats["behavioral_noop"]),
+                "best_delta": float(stats["best_delta"]),
+                "label": label,
+            }
+        )
+    clusters.sort(key=lambda item: (-item["attempts"], -item["rejected"], item["cluster"]))
+    return {
+        "clusters": clusters[: max(1, limit)],
+        "failure_tags": [name for name, _ in failure_tags.most_common(max(1, limit))],
+        "core_factors": [name for name, _ in factor_names.most_common(max(1, min(4, limit)))],
+    }
+
+
+def _format_all_time_tables(payload: dict[str, Any]) -> list[str]:
+    clusters = list(payload.get("clusters", []))
+    if not clusters:
+        return []
+
+    lines = [
+        "全局方向统计（当前评分口径）:",
+        "| 方向簇 | 尝试 | 保留 | 未保留 | noop | 最佳delta | 状态 |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for cluster in clusters:
+        lines.append(
+            f"| {cluster['cluster']} | {cluster['attempts']} | {cluster['accepted']} | "
+            f"{cluster['rejected']} | {cluster['behavioral_noop']} | {cluster['best_delta']:.2f} | {cluster['label']} |"
+        )
+    failure_tags = payload.get("failure_tags", [])
+    if failure_tags:
+        lines.append("")
+        lines.append(f"全局高频失败标签: {', '.join(failure_tags)}")
+    core_factors = payload.get("core_factors", [])
+    if core_factors:
+        lines.append(f"全局高频核心因子: {', '.join(core_factors)}")
+    return lines
+
+
+def _write_prompt_memory_snapshots(
+    memory_root: Path,
+    *,
+    current_stage_entries: list[dict[str, Any]],
+    current_stage_meta: dict[str, Any],
+    past_stage_summaries: list[dict[str, Any]],
+    all_time_tables: dict[str, Any],
+    summary_text: str,
+) -> None:
+    paths = _memory_archive_paths(memory_root)
+    for key in ("current_stage", "past_stages", "all_time_tables", "latest_prompt"):
+        paths[key].parent.mkdir(parents=True, exist_ok=True)
+    paths["current_stage"].write_text(
+        json.dumps(
+            {
+                "stage_meta": current_stage_meta,
+                "entries": current_stage_entries,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    paths["past_stages"].write_text(json.dumps(past_stage_summaries, ensure_ascii=False, indent=2))
+    paths["all_time_tables"].write_text(json.dumps(all_time_tables, ensure_ascii=False, indent=2))
+    paths["latest_prompt"].write_text(summary_text)
+
+
 def _uncompacted_recent_entries(
     entries: list[dict[str, Any]],
     journal_path: Path | None,
@@ -1675,7 +2012,7 @@ def _recent_round_meta_lines(entries: list[dict[str, Any]], start_index: int) ->
     return lines
 
 
-def _empty_prompt_tables() -> list[str]:
+def _empty_prompt_tables(stage_title: str = "当前 stage") -> list[str]:
     return [
         "方向风险表（必须先读）:",
         "| 方向簇 | 最近尝试 | 失败 | 零增益 | 运行报错 | 最佳delta | 标签 | 最近标签 |",
@@ -1692,13 +2029,13 @@ def _empty_prompt_tables() -> list[str]:
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         "| - | - | - | 低 | 0 | - | - | - | - | - | 暂无需要降权的高风险轮次 |",
         "",
-        "最近未压缩轮次共 0 条：保留 0，未保留 0，重复跳过 0，探索拦截 0，提前淘汰 0，运行失败 0。",
-        "最近核心指标表:",
+        f"{stage_title} 共 0 条：保留 0，未保留 0，重复跳过 0，探索拦截 0，提前淘汰 0，运行失败 0。",
+        f"{stage_title} 核心指标表:",
         "| 轮次 | 结果 | 阶段 | quality | promotion | val_hit | val_bull | val_bear | gap | gate |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         "| - | - | - | - | - | - | - | - | - | 新评分口径已重置，等待新历史。 |",
         "",
-        "最近轮次元信息:",
+        f"{stage_title} 元信息:",
         "- 新评分口径已重置，等待新历史。",
     ]
 
@@ -1825,6 +2162,10 @@ def build_journal_prompt_summary(
     journal_path: Path | None = None,
     current_score_regime: str = "",
     current_iteration: int = 0,
+    active_stage_started_at: str = "",
+    active_stage_iteration: int = 0,
+    reference_role: str = "",
+    memory_root: Path | None = None,
 ) -> str:
     all_entries = list(entries)
     active_score_regime = current_score_regime or _latest_score_regime(all_entries)
@@ -1834,18 +2175,36 @@ def build_journal_prompt_summary(
             default=0,
         ) + 1
     current_entries = _entries_for_score_regime(all_entries, active_score_regime)
+    current_stage_entries, past_stage_entries, stage_meta = _partition_entries_by_stage(
+        all_entries,
+        score_regime=active_score_regime,
+        active_stage_started_at=active_stage_started_at,
+        active_stage_iteration=active_stage_iteration,
+    )
+    stage_name = (
+        f"当前 {reference_role} stage"
+        if reference_role in {"baseline", "champion"}
+        else "当前 stage"
+    )
+    stage_anchor_parts: list[str] = []
+    if int(stage_meta.get("stage_iteration", 0) or 0) > 0:
+        stage_anchor_parts.append(f"round {int(stage_meta['stage_iteration'])}")
+    if str(stage_meta.get("stage_started_at", "")).strip():
+        stage_anchor_parts.append(str(stage_meta["stage_started_at"]))
+    stage_header = (
+        f"{stage_name}（自 {' / '.join(stage_anchor_parts)} 激活以来）:"
+        if stage_anchor_parts
+        else f"{stage_name}:"
+    )
+    stage_scope = stage_header.rstrip(":")
     parts: list[str] = []
     if not current_entries:
-        parts.extend(_empty_prompt_tables())
+        parts.extend(_empty_prompt_tables(stage_scope))
     else:
-        recent_entries, recent_start = _uncompacted_recent_entries(
-            all_entries,
-            journal_path,
-            score_regime=active_score_regime,
-        )
-        if recent_entries:
-            board_entries = recent_entries
-            display_entries = recent_entries[-max(1, limit):]
+        if current_stage_entries:
+            board_entries = current_stage_entries
+            display_entries = board_entries[-max(1, limit):]
+            stage_start_index = max(0, int(stage_meta.get("stage_iteration", 0) or 0) - 1)
             board_lines = _direction_risk_board(board_entries, limit=min(8, limit))
             if board_lines:
                 parts.extend(board_lines)
@@ -1885,7 +2244,7 @@ def build_journal_prompt_summary(
             early_rejected_count = sum(1 for entry in board_entries if entry.get("outcome") == "early_rejected")
             runtime_failed_count = sum(1 for entry in board_entries if entry.get("outcome") == "runtime_failed")
             parts.append(
-                f"最近未压缩轮次共 {len(board_entries)} 条："
+                f"{stage_scope} 共 {len(board_entries)} 条："
                 f"保留 {accepted_count}，未保留 {rejected_count}，"
                 f"重复跳过 {duplicate_skipped_count}，"
                 f"行为无变化 {behavioral_noop_count}，"
@@ -1894,33 +2253,47 @@ def build_journal_prompt_summary(
             )
             if len(display_entries) < len(board_entries):
                 parts.append(
-                    f"以下表格与元信息仅展示最近 {len(display_entries)} 条，避免长串重复轮次淹没当前硬约束。"
+                    f"以下表格与元信息仅展示最近 {len(display_entries)} 条；完整当前 stage 已写入 memory 归档。"
                 )
             failure_tag_lines = _recent_failure_tag_lines(board_entries, limit=min(8, limit))
             if failure_tag_lines:
-                parts.append("最近高频失败标签:")
+                parts.append("当前 stage 高频失败标签:")
                 parts.extend(failure_tag_lines)
             core_factor_columns = _recent_core_factor_columns(board_entries, limit=min(4, limit))
             core_factor_lines = _recent_core_factor_lines(board_entries, core_factor_columns)
             if core_factor_lines:
                 parts.extend(core_factor_lines)
-            parts.append("最近核心指标表:")
-            parts.extend(_format_recent_rounds_table(display_entries, recent_start))
+            parts.append(f"{stage_name} 核心指标表:")
+            parts.extend(_format_recent_rounds_table(display_entries, stage_start_index))
             parts.append("")
-            parts.extend(_recent_round_meta_lines(display_entries, recent_start))
+            parts.extend(_recent_round_meta_lines(display_entries, stage_start_index))
+        else:
+            parts.extend(_empty_prompt_tables(stage_scope))
 
-        # 压缩历史放在近期方向风险之后，避免长历史淹没最近连续失败。
-        if journal_path is not None:
-            compact_data = load_compact(journal_path)
-            compact_lines = _format_compact_for_prompt(
-                compact_data,
-                limit=min(8, limit),
-                score_regime=active_score_regime,
-            )
-            if compact_lines:
-                if parts:
-                    parts.append("")
-                parts.extend(compact_lines)
+        past_stage_groups = _group_entries_into_stages(past_stage_entries)
+        past_stage_summaries = [
+            _summarize_stage_entries(stage_entries, stage_id=index + 1)
+            for index, stage_entries in enumerate(past_stage_groups)
+            if stage_entries
+        ]
+        past_stage_lines = _format_past_stage_summary_lines(past_stage_summaries, limit=min(4, limit))
+        if past_stage_lines:
+            if parts:
+                parts.append("")
+            parts.extend(past_stage_lines)
+
+        all_time_payload = _all_time_tables_payload(current_entries, limit=min(8, limit))
+        all_time_lines = _format_all_time_tables(all_time_payload)
+        if all_time_lines:
+            if parts:
+                parts.append("")
+            parts.extend(all_time_lines)
+    if current_entries and not past_stage_entries:
+        past_stage_summaries = []
+        all_time_payload = _all_time_tables_payload(current_entries, limit=min(8, limit))
+    elif not current_entries:
+        past_stage_summaries = []
+        all_time_payload = {}
 
     legacy_lines = _legacy_regime_reference_lines(
         all_entries,
@@ -1932,7 +2305,23 @@ def build_journal_prompt_summary(
             parts.append("")
         parts.extend(legacy_lines)
 
-    return "\n".join(parts) if parts else "暂无研究历史。"
+    summary_text = "\n".join(parts) if parts else "暂无研究历史。"
+    if memory_root is not None:
+        snapshot_meta = {
+            **stage_meta,
+            "reference_role": reference_role,
+            "score_regime": active_score_regime,
+            "stage_name": stage_name,
+        }
+        _write_prompt_memory_snapshots(
+            memory_root,
+            current_stage_entries=current_stage_entries,
+            current_stage_meta=snapshot_meta,
+            past_stage_summaries=past_stage_summaries,
+            all_time_tables=all_time_payload,
+            summary_text=summary_text,
+        )
+    return summary_text
 
 
 def has_recent_code_hash(entries: list[dict[str, Any]], code_hash: str, lookback: int = 12) -> bool:

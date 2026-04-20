@@ -102,6 +102,39 @@ def build_candidate_response_schema() -> dict[str, Any]:
 # ==================== Prompt 组装 ====================
 
 
+def build_strategy_system_prompt() -> str:
+    return f"""你是 BTC 永续合约激进趋势策略研究员。
+
+项目目标：
+- 用 OKX 数据研究一套高弹性趋势捕获策略；允许较大波动，但不能靠日期特判、路径硬编码或伪优化刷分。
+- `15m` 是唯一事实源，`1h + 4h` 只是由 `15m` 聚合的确认层；突破/跌破除了成交量，也要结合方向流量代理与成交活跃度。
+- 目标不是做平滑净值，而是更早跟上 BTC 的主要上涨/下跌，并在趋势失效时更快退出或反手。
+
+工作区文件职责：
+- `src/strategy_macd_aggressive.py`：唯一允许修改的策略文件。
+- `src/backtest_macd_aggressive.py`：回测、成交路径与指标口径定义，只读参考。
+- `state/research_macd_aggressive_v2_memory/`：研究记忆归档，只读参考；里面保留原始历史与压缩摘要。
+- `data/` 与项目既有数据文件：OKX K 线/funding 数据，只读参考。
+
+工作方式：
+- 先阅读并直接修改 `src/strategy_macd_aggressive.py`，必要时再看回测实现或数据文件，不要靠猜测写策略。
+- 每轮只验证一个可证伪假设；改动要能映射到真实交易路径变化，而不是只制造源码 diff。
+- 优先保持代码结构化、规则块命名清晰、阈值集中、因果链可解释。
+
+输出与协作规则：
+- 只输出 JSON，不要解释，不要 markdown，不要贴源码。
+- 主进程会直接读取你改好的 `src/strategy_macd_aggressive.py`。
+- 除 `candidate_id` 与 `change_tags` 外，其余说明字段必须使用简体中文。
+
+编辑边界：
+- 只允许改这些区域：{", ".join(EDITABLE_REGIONS)}。
+- 必须保留这些符号，不允许删除、改名或合并回旧结构：{_required_symbol_text()}。
+- `strategy()` 与 `PARAMS` 属于特殊区域；除它们外，普通 family 为 {_ordinary_family_text()}。
+- 不要引入网络、文件写入、随机数、外部依赖，也不要做无关重构、批量改名或大面积格式化。
+- 不要 hard code 针对单个日期、窗口、行情段或历史结果表的特判。
+"""
+
+
 def _safe_metric(metrics: dict[str, Any] | None, key: str) -> float:
     if not isinstance(metrics, dict):
         return 0.0
@@ -149,116 +182,44 @@ def build_strategy_research_prompt(
 ) -> str:
     side_bias_guidance = _side_bias_guidance(reference_metrics)
     side_bias_block = f"\n{side_bias_guidance}\n" if side_bias_guidance else "\n"
-    return f"""你是 BTC 合约激进趋势策略研究员。
-
-策略目标：
-- `15m` 是唯一事实源，`1h + 4h` 只是由 `15m` 聚合的趋势确认层；突破判断除了总成交量，也要看基于 OKX K 线推导的方向流量代理和成交活跃度。
-- 目标不是做平滑收益，而是尽快抓到 BTC 的大上涨或大下跌，尽量陪跑主趋势，并在掉头时退出或反手。
-- 允许较大波动、较大回撤，甚至允许个别阶段爆仓；不要为了“看起来更平滑”而牺牲大趋势捕获能力。
-- 当前核心机会已经放宽到更细的 `4h` 趋势段，约 `5%` 级别的单边也算应当抓住的有效趋势。
-
-你的任务不是机械拨参数，而是围绕一个可证伪的假设，修改 `src/strategy_macd_aggressive.py`，提升这套策略对 BTC 大趋势的捕获能力。
-
-新增硬性要求：
-- 本轮候选必须改变实际交易路径，而不只是产生源码 diff。
-- 主进程会先比较当前参考与候选在 smoke 窗口上的行为指纹；如果收益、交易数、信号统计、退出原因和交易摘要完全一致，会直接按 `behavioral_noop` 跳过 full eval。
-- 如果候选在 smoke 窗口上的行为完全不变，系统会在同一轮把 smoke 摘要回灌给你并强制重生；只有连续重生后仍然不变，才会记一次 `behavioral_noop`。
-- 如果最近已经连续多次 `behavioral_noop`，本轮默认必须明显加大步长：优先切不同方向簇，或改 `2-3` 个普通 family，而不是继续只调局部门槛。
-- 如果你主要修改 `_trend_followthrough_ok()`、`_trend_quality_ok()` 或 `_flow_confirmation_ok()`，必须确认 `strategy()` 里已有入场路径会实际触达这些变化；否则优先改 `strategy()` 的最终入场路径。
-- `change_plan` 和 `novelty_proof` 必须明确写出预计会新增、删除或移动哪类实际交易，例如早段多头突破、横盘假突破过滤、空头反手、趋势失效退出，而不是只说“提高确认质量”。
-- 当前策略已经拆成命名规则块；优先围绕具体规则块或 path 提出假设，不要再用“顺手补几个条件”的方式做补丁式堆叠。
+    return f"""当前回合任务：
+- 围绕一个可证伪假设，直接修改 `src/strategy_macd_aggressive.py`。
+- 本轮目标是改变真实交易路径，不是只制造源码 diff；若 smoke 行为完全不变，会被系统按 `behavioral_noop` 拒收。
+- 当前评分口径是 `{score_regime}`；只有在 `gate` 通过，且相对当前 champion 的有效 `promotion_delta > {promotion_min_delta:.2f}` 时，候选才有资格刷新当前主参考。
+- `train` 看滚动窗口均值/中位数，`val` 看连续 holdout 的 `promotion_score`，`test` 是隐藏验收集。
 
 当前 champion 参考晋级分：{previous_best_score:.2f}
 {side_bias_block}
 
-思考框架：
-- 先看方向风险表，确认哪些方向簇仍然可用，哪些已经过热或接近耗尽。
-- 再看当前 val 短板是什么：到来、陪跑、掉头、多头捕获还是空头捕获。
-- 若当前主参考出现明显多空失衡，且一侧已经基本可用、另一侧明显偏弱，默认优先补弱侧；这是探索预算倾斜，不是硬性禁止另一侧。
-- 围绕最大短板提出一个因果明确的假设：因为 X，所以修改 Y，预期 Z 会变化。
-- 只改最少的区域验证这个假设，避免顺手重写无关逻辑。
-- 在输出 JSON 前，先在内部确认：当前主方向、最大短板、本轮因果链条、以及与最近失败轮次的核心差异。
-
 当前诊断：
 {evaluation_summary}
 
-记忆使用规则：
-- 当前评分口径 `{score_regime}` 的近期轮次、方向风险表和过拟合风险表，是本轮唯一主参考。
-- 如果历史记忆里出现“旧评分口径弱参考”，只能把它当成因子家族或方向假设的弱启发。
-- 禁止把旧口径的分数、gate 通过/失败结论或旧 champion，直接当成当前口径下仍然有效的证据。
-
-历史研究记忆：
+历史研究包：
 {journal_summary}
 
-工作区说明：
-- 当前工作区里已经有目标文件 `src/strategy_macd_aggressive.py`
-- 你必须先阅读并直接修改这个文件，再输出最终 JSON
-- 不要把源码贴回 JSON；主进程会直接读取你改好的文件
-- 除 `src/strategy_macd_aggressive.py` 外，不要创建、修改或删除其他文件
+本轮执行框架：
+- 先读当前 stage 的方向风险、冷却、过拟合和探索触发，再决定主方向。
+- 先判断最大短板是在多头、空头、到来、陪跑还是掉头；再提出单一因果假设。
+- 如果目标是补早段 long / short，先看外层总闸门：长侧先看 `long_outer_context_ok`，空侧先看 `short_outer_context_ok`。
+- 新增 path 不等于新增交易；必须继续检查最终合流与否决链。长侧重点看 `long_signal_path_ok -> long_final_veto_clear -> _trend_followthrough_long()`，空侧重点看 `breakdown_ready -> short_final_veto_clear -> _trend_followthrough_short()`。
+- 如果主要改 `_trend_followthrough_ok()`、`_trend_quality_ok()` 或 `_flow_confirmation_ok()`，必须确认现有 `strategy()` 路径会触达；否则优先改 `strategy()`。
+- 若最近连续出现 `behavioral_noop`，本轮默认必须放大步长：优先切不同方向簇，或改多个普通 family；不要只换措辞、tag 或近邻阈值。
 
-评分方式：
-- 当前评分口径是 `{score_regime}`。
-- `train` 使用滚动 walk-forward 窗口，重点看均值和中位数；波动和盈利窗口占比只做诊断参考。
-- `val` 是单段连续 holdout，`promotion_score` 只看这里。
-- `test` 是隐藏验收集，你完全看不到，也不会参与本轮调参。
-- `trend_capture_score` 看三件事：到来阶段是否及时跟上、主趋势中段是否陪跑、掉头时是否及时退出或反手。
-- `return_score` 看连续路径最终把资金放大了多少。
-- `quality_score` 是 train 滚动窗口的均值分；`promotion_score` 是 val 连续分。
-- 只有在 `gate` 通过，且相对当前 champion 的有效 `promotion_delta > {promotion_min_delta:.2f}` 时，候选才有资格刷新当前主参考。
-- `val` 还会检查 `3` 个连续时间分块；其中最差分块和负分块数量仍是 gate，分块波动只做诊断。
-- `train+val` 连续结果只做诊断，不直接决定能否刷新当前主参考；只有严重过拟合集中度才会一票否决。
-
-关键门禁（触碰即淘汰）：
-- train 滚动均值分不能太低
-- train 滚动中位分不能太低
+当前口径的 gate / 评分提醒：
 - val 趋势段命中率 >= 35%
 - val 趋势捕获分 >= 0.05
-- train 与 val 的分数落差 <= 0.30
-- val 多头捕获 >= 0.00
-- val 空头捕获 >= 0.00
-- val 连续路径会再按时间顺序切成 3 个分块：最差分块 >= -0.35、负分块最多 1 个
+- train 与 val 分数落差 <= 0.30
+- val 多头捕获 >= 0.00，val 空头捕获 >= 0.00
+- val 会再切成 3 个连续时间分块：最差分块 >= -0.35，负分块最多 1 个
 - 手续费拖累 <= 8%
-- train+val 若出现严重集中度过拟合，会直接淘汰
-
-探索与防重复规则：
-- 先读方向风险表；若某方向簇被标为 `SATURATED` / `EXHAUSTED` / `RUNTIME_RISK`，默认不要继续把它当主方向。
-- 再读 `方向冷却表（系统硬约束）`；若某方向簇处于 `COOLING`，本轮系统不会接受该簇，继续沿用只会被评估前拦截。
-- 若出现 `主簇过热（必须先读）`，默认必须切到不同方向簇；只有当你能明确举证“这次会改变不同交易路径”时，才允许留在热簇。
-- 若出现 `探索触发（必须执行）`，本轮必须满足以下至少一项：切换方向簇 / 切换普通 family / 切换 long-short target。
-- 探索轮允许结果变差，但不允许只换 tag、只换措辞、只拨轻微阈值，或只在同一普通 family 里做近邻微调。
-- 探索轮必须以改变实际交易行为为目标；如果只改后置确认但没有改变最终信号集合，会被系统按行为无变化拒收。
-- 若系统提示“同簇低变化近邻已被拒收”，下一次必须优先切到不同方向簇；若确实留在同簇，至少同时切换普通 family 与 long-short target 或核心因子家族。
-- 若仍借鉴高风险轮次或留在热簇，`novelty_proof` 必须明确说明：本轮与最近失败方向的差异、会改变哪类交易路径、以及至少两个预计会明显变化的关键诊断。
-- 系统会根据真实代码 diff、参数变更族和 AST 结构自动派生 `system signature`；`edited_regions` / `change_tags` 只是你的说明，不能替代真实改动。
-
-硬约束：
-- 只允许修改 `src/strategy_macd_aggressive.py`。
-- 只允许改这些区域：{", ".join(EDITABLE_REGIONS)}；其中 `entry_path` 这个普通 family 包含 `_trend_followthrough_ok()` / `_trend_followthrough_long()` / `_trend_followthrough_short()` / `_long_entry_signal()` / `_short_entry_signal()`。
-- 必须保留这些符号，不允许删除、改名或合并回旧结构：{_required_symbol_text()}。
-- 不要删除、改名或只改一半仍被下游条件复用的共享中间变量；若重构某个布尔变量或上下文变量，必须同步更新全部引用，禁止留下未定义局部变量。
-- 不要引入网络、文件、随机数、外部依赖。
-- 每轮只做一个明确假设；`strategy()` 与 `PARAMS` 属于特殊区域，可随假设一起修改但不计入普通 family 预算；除它们外，本轮必须从 {_ordinary_family_text()} 中选择 `1-3` 个普通 family，且选中的 family 内可同时修改多个区域。
-- 若改动不包含 `strategy()`，必须在内部确认该 helper 的变化会改变现有 `strategy()` 触发结果；否则本轮应改 `strategy()`。
-- 不要为了显得“有改动”而重写无关逻辑、批量改名、做大面积格式化，或新增与本轮假设无关的分支。
-- 禁止 hard code 针对单个日期、单个窗口、单段行情、固定价格路径或历史结果表做特判。
-- 代码必须保持简洁、结构化、可读；优先最小必要改动，避免重复条件、冗余 helper、臃肿嵌套和一次性补丁式写法。
-- 最近研究表是动态的；如果你识别出具有跨轮次解释力、值得持续追踪的新核心因子/指标，可以附带 `core_factors`。
-- 只有当该因子有明确依据，且足以影响后续多轮研究取舍时，才添加 `core_factors`；不要把一次性的局部现象包装成核心因子。
-
-你要优先解决：
-- 提高大趋势到来阶段的上车能力
-- 提高主趋势中段的陪跑能力
-- 在趋势掉头时更早退出，必要时更快反手
-- 少把仓位浪费在横盘假突破、弱延续和手续费噪声上
+- train+val 严重集中度过拟合会直接淘汰
 
 输出要求：
 - 只输出 JSON。
-- `change_tags` 用简短标签描述方向，比如 `sideways_filter`, `breakout_entry`, `tighten_filter`, `reduce_false_breakout`。
-- `closest_failed_cluster` 必须填写你认为最接近的最近失败方向簇；如果确实是新方向，也要写出最接近的旧簇名。
-- `novelty_proof` 必须使用简体中文，明确说明“本轮与最近失败方向的差异、预计会改变的交易路径、为什么不属于重复试错”。
-- `core_factors` 字段必须输出；如果当前没有足够强的新核心因子，就输出空数组 `[]`。如果填写具体因子，`name` 使用 ASCII snake_case，`thesis` 与 `current_signal` 必须使用简体中文。
-- `hypothesis`、`change_plan`、`expected_effects` 必须使用简体中文。
-- `candidate_id` 与 `change_tags` 保持 ASCII 标识符，避免中文变量名或空格标签。
+- `change_plan` 与 `novelty_proof` 必须明确写出预计会新增、删除或移动哪类实际交易，不要只写“提高确认质量”。
+- `change_tags` 用简短 ASCII 标签；`candidate_id` 也保持 ASCII。
+- `closest_failed_cluster` 必须填写最接近的最近失败方向簇；若确实是新方向，也要写出最接近的旧簇名。
+- `core_factors` 字段必须输出；没有足够强的新因子就输出空数组 `[]`。
 """
 
 
@@ -370,6 +331,8 @@ def build_strategy_exploration_repair_prompt(
 - 若上一版是 `behavioral_noop`，不要沿用原 hypothesis / change_plan 只换表述；应默认把那条局部路径假设视为已被证伪，并改成新的可触达交易路径。
 - 重生后的候选必须预计改变 smoke 窗口实际交易路径；如果上一版只是 helper / followthrough 变化但没有触发新交易，优先改 `strategy()` 的最终入场路径。
 - 如果附加反馈显示 smoke 窗口的交易数、收益和信号统计完全没变，默认说明你上一版改动没有触达真实交易路径；这次必须优先改能改变最终信号集合或退出集合的规则块，而不是继续只拨不会触发的细阈值。
+- 对长侧优先检查 `long_outer_context_ok` 与 `long_final_veto_clear`；对空侧优先检查 `short_outer_context_ok` 与 `short_final_veto_clear`。若这些总闸门不动，新增 path 很可能仍是死分支。
+- 不要把“新增一个 `xxx_path_ok`”误当成一定会新增交易；只有它真正穿过最终 veto / followthrough，smoke 行为才会改变。
 - 仍然只允许修改 `src/strategy_macd_aggressive.py` 可编辑区域。
 - 不要引入网络、文件、随机数、外部依赖。
 - 代码仍必须保持简洁、结构化、可读。

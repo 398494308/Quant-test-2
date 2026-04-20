@@ -47,6 +47,7 @@ from research_v2.evaluation import (
 )
 from research_v2.journal import (
     ORDINARY_REGION_FAMILIES,
+    append_journal_archive,
     append_journal_entry,
     build_journal_prompt_summary,
     evaluate_candidate_exploration_guard,
@@ -65,6 +66,7 @@ from research_v2.prompting import (
     build_strategy_exploration_repair_prompt,
     build_strategy_research_prompt,
     build_strategy_runtime_repair_prompt,
+    build_strategy_system_prompt,
 )
 from research_v2.strategy_code import (
     REQUIRED_FUNCTIONS,
@@ -99,6 +101,8 @@ best_source = ""
 best_report: EvaluationReport | None = None
 champion_report: EvaluationReport | None = None
 iteration_counter = 0
+reference_stage_started_at = ""
+reference_stage_iteration = 0
 
 logging.basicConfig(
     filename=RUNTIME.paths.log_file,
@@ -224,11 +228,75 @@ def _discord_data_range_text() -> str:
     )
 
 
+def _append_research_journal_entry(entry: dict[str, Any]) -> None:
+    append_journal_entry(RUNTIME.paths.journal_file, entry)
+    append_journal_archive(RUNTIME.paths.memory_dir, entry)
+
+
+def _parse_state_timestamp(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    normalized = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _recover_reference_stage_state(
+    saved_state: dict[str, Any],
+    journal_entries: list[dict[str, Any]],
+    *,
+    reference_code_hash: str,
+) -> tuple[str, int]:
+    saved_stage_started_at = str(saved_state.get("reference_stage_started_at", "")).strip()
+    try:
+        saved_stage_iteration = int(saved_state.get("reference_stage_iteration", 0) or 0)
+    except (TypeError, ValueError):
+        saved_stage_iteration = 0
+    if saved_stage_started_at or saved_stage_iteration > 0:
+        return saved_stage_started_at, saved_stage_iteration
+
+    current_regime_entries = [
+        entry for entry in journal_entries
+        if str(entry.get("score_regime", "")).strip() == SCORE_REGIME
+    ]
+    for entry in reversed(current_regime_entries):
+        if str(entry.get("outcome", "")).strip() != "accepted":
+            continue
+        if str(entry.get("code_hash", "")).strip() != reference_code_hash:
+            continue
+        return (
+            str(entry.get("timestamp", "")).strip(),
+            int(entry.get("iteration", 0) or 0),
+        )
+
+    saved_updated_at = str(saved_state.get("updated_at", "")).strip()
+    saved_updated_dt = _parse_state_timestamp(saved_updated_at)
+    if saved_updated_dt is not None:
+        for entry in current_regime_entries:
+            entry_dt = _parse_state_timestamp(entry.get("timestamp"))
+            entry_iteration = int(entry.get("iteration", 0) or 0)
+            if entry_dt is not None and entry_iteration > 0 and entry_dt >= saved_updated_dt:
+                return saved_updated_at, entry_iteration
+        max_iteration = max((int(entry.get("iteration", 0) or 0) for entry in current_regime_entries), default=0)
+        return saved_updated_at, max_iteration + 1
+
+    max_iteration = max((int(entry.get("iteration", 0) or 0) for entry in current_regime_entries), default=0)
+    return "", (max_iteration + 1) if max_iteration > 0 else 0
+
+
 def _reference_manifest_payload(
     source: str,
     report: EvaluationReport,
     *,
     shadow_test_metrics: dict[str, float] | None = None,
+    stage_started_at: str = "",
+    stage_iteration: int = 0,
 ) -> dict[str, Any]:
     reference_payload = {
         "code_hash": source_hash(source),
@@ -241,6 +309,8 @@ def _reference_manifest_payload(
         "updated_at": datetime.now(UTC).isoformat(),
         "score_regime": SCORE_REGIME,
         "reference_role": _reference_role(),
+        "reference_stage_started_at": stage_started_at,
+        "reference_stage_iteration": stage_iteration,
         "code_hash": reference_payload["code_hash"],
         "reference": reference_payload,
         "champion": reference_payload if champion_report is not None else None,
@@ -783,6 +853,7 @@ def _behavioral_noop_block_info(
     behavior_diff: dict[str, Any],
     *,
     journal_entries: list[dict[str, Any]],
+    base_source: str | None = None,
 ) -> dict[str, Any]:
     smoke_windows = ", ".join(window.label for window in _selected_smoke_windows()) or "-"
     noop_streak = _recent_behavioral_noop_streak(journal_entries)
@@ -790,6 +861,14 @@ def _behavioral_noop_block_info(
         candidate.closest_failed_cluster,
         candidate.change_tags,
     ) or str(candidate.closest_failed_cluster).strip() or "-"
+    candidate_signature = exploration_signature_for_candidate(
+        candidate,
+        base_source=base_source,
+        editable_regions=EDITABLE_REGIONS,
+    )
+    changed_regions = ", ".join(sorted(candidate_signature["changed_regions"])) or "-"
+    ordinary_families = ", ".join(sorted(candidate_signature["ordinary_region_families"])) or "-"
+    target_family = str(candidate_signature.get("target_family", "")).strip() or "-"
     current_locks: tuple[str, ...] = ()
     feedback_lines = [
         f"- smoke窗口: {smoke_windows}",
@@ -798,16 +877,41 @@ def _behavioral_noop_block_info(
             + (", ".join(str(item) for item in behavior_diff.get("changed_windows", ())) or "无")
         ),
         f"- 当前候选归属簇: {cluster_key}",
+        f"- 当前候选真实改动区域: {changed_regions}",
+        f"- 当前候选普通 family: {ordinary_families}",
+        f"- 当前候选目标侧: {target_family}",
         f"- 当前参考摘要: {_format_behavior_summary(behavior_diff.get('base', {}) or {})}",
         f"- 候选摘要: {_format_behavior_summary(behavior_diff.get('candidate', {}) or {})}",
         f"- 最近连续 behavioral_noop: {noop_streak}",
     ]
+    if "strategy" not in candidate_signature["region_families"]:
+        feedback_lines.append(
+            "- 本轮没有改 `strategy()` 最终放行层；只改 helper 时，若现有 `strategy()` 本身进不到那条路径，真实成交集合大概率不会变。"
+        )
+    if not candidate_signature["ordinary_region_families"]:
+        feedback_lines.append(
+            "- 本轮真实 diff 只动了 `strategy()` / `PARAMS` 特殊区域，没有碰到普通 family；这类近邻阈值微调最容易继续落成 behavioral_noop。"
+        )
+    if target_family in {"long", "mixed"}:
+        feedback_lines.append(
+            "- 长侧先看 `long_outer_context_ok`；若你要补的是 turn / reclaim / early relay，但这里仍要求 `intraday_bull + hourly_bull + fourh_bull_base`，内层新增 long path 很可能仍是死分支。"
+        )
+        feedback_lines.append(
+            "- 即使新增 long path 成立，也还要穿过 `long_final_veto_clear` 和 `_trend_followthrough_long()`；若只补 path，不处理最终 veto/followthrough，行为仍可能完全不变。"
+        )
+    if target_family in {"short", "mixed"}:
+        feedback_lines.append(
+            "- 空侧先看 `short_outer_context_ok`；若外层趋势准入不变，很多 short path / followthrough 微调也不会真正落到出单层。"
+        )
+        feedback_lines.append(
+            "- 空侧最终还要穿过 `breakdown_ready + short_final_veto_clear + _trend_followthrough_short()`；只补局部 confirmation，未必会改变真实 short 集合。"
+        )
     if noop_streak >= 2:
         if cluster_key != "-":
             current_locks = (f"{cluster_key}(本轮 behavioral_noop 后禁止沿用原叙事)",)
         feedback_lines.append(
             "- 最近已连续多次 behavior 无变化；这次必须明显加大步长：优先切不同方向簇，"
-            "若留在同簇，至少改 2-3 个普通 family，不要只改 strategy/PARAMS 或单个细阈值。"
+            "若留在同簇，允许直接覆盖 2-4 个普通 family，但仍必须围绕一个单一假设，不要只改 strategy/PARAMS 或单个细阈值。"
         )
         feedback_lines.append(
             "- 默认把上一版局部 hypothesis / change_plan 视为已被证伪，不要只换候选名、tag 或措辞。"
@@ -890,12 +994,8 @@ def _candidate_from_payload(
     ordinary_region_families = sorted(candidate_signature["ordinary_region_families"])
     if not ordinary_region_families:
         raise StrategySourceError(
-            "candidate must change 1-3 ordinary region families from "
+            "candidate must change at least 1 ordinary region family from "
             f"{', '.join(ORDINARY_REGION_FAMILIES)}; strategy/PARAMS alone are not enough"
-        )
-    if len(ordinary_region_families) > 3:
-        raise StrategySourceError(
-            f"candidate ordinary region families exceed 3: {', '.join(ordinary_region_families)}"
         )
     return candidate
 
@@ -921,6 +1021,10 @@ def _build_model_candidate(
             journal_path=RUNTIME.paths.journal_file,
             current_score_regime=SCORE_REGIME,
             current_iteration=iteration_counter,
+            active_stage_started_at=reference_stage_started_at,
+            active_stage_iteration=reference_stage_iteration,
+            reference_role=_reference_role(),
+            memory_root=RUNTIME.paths.memory_dir,
         ),
         previous_best_score=benchmark_report.metrics["promotion_score"],
         reference_metrics=benchmark_report.metrics,
@@ -930,13 +1034,7 @@ def _build_model_candidate(
     with _temporary_cwd(workspace_root):
         payload = generate_json_object(
             prompt=prompt,
-            system_prompt=(
-                "你是严谨的量化研究员。"
-                "只输出 JSON，不要解释，不要 markdown。"
-                "你必须先阅读并直接修改工作区中的 src/strategy_macd_aggressive.py，再输出 JSON。"
-                "不要在 JSON 中返回源码。"
-                "除 candidate_id 与 change_tags 外，其余说明字段必须使用简体中文。"
-            ),
+            system_prompt=build_strategy_system_prompt(),
             max_output_tokens=RUNTIME.prompt_max_output_tokens,
             config=_model_client_config(),
             text_format=build_json_text_format(
@@ -976,14 +1074,7 @@ def _repair_model_candidate(
     with _temporary_cwd(workspace_root):
         payload = generate_json_object(
             prompt=prompt,
-            system_prompt=(
-                "你是严谨的量化研究员。"
-                "只输出 JSON，不要解释，不要 markdown。"
-                "你正在修复同一轮候选代码，不要切换研究方向。"
-                "你必须直接修改工作区中的 src/strategy_macd_aggressive.py。"
-                "不要在 JSON 中返回源码。"
-                "除 candidate_id 与 change_tags 外，其余说明字段必须使用简体中文。"
-            ),
+            system_prompt=build_strategy_system_prompt(),
             max_output_tokens=RUNTIME.prompt_max_output_tokens,
             config=_model_client_config(),
             text_format=build_json_text_format(
@@ -1044,14 +1135,7 @@ def _regenerate_model_candidate(
     with _temporary_cwd(workspace_root):
         payload = generate_json_object(
             prompt=prompt,
-            system_prompt=(
-                "你是严谨的量化研究员。"
-                "只输出 JSON，不要解释，不要 markdown。"
-                "你正在同一轮里重生候选方向，不要把它当成新一轮研究。"
-                "你必须直接修改工作区中的 src/strategy_macd_aggressive.py。"
-                "不要在 JSON 中返回源码。"
-                "除 candidate_id 与 change_tags 外，其余说明字段必须使用简体中文。"
-            ),
+            system_prompt=build_strategy_system_prompt(),
             max_output_tokens=RUNTIME.prompt_max_output_tokens,
             config=_model_client_config(),
             text_format=build_json_text_format(
@@ -1089,20 +1173,25 @@ def _persist_best_state(
     report: EvaluationReport,
     *,
     shadow_test_metrics: dict[str, float] | None = None,
+    stage_started_at: str = "",
+    stage_iteration: int = 0,
 ) -> None:
     RUNTIME.paths.best_state_file.parent.mkdir(parents=True, exist_ok=True)
     payload = _reference_manifest_payload(
         source,
         report,
         shadow_test_metrics=shadow_test_metrics,
+        stage_started_at=stage_started_at,
+        stage_iteration=stage_iteration,
     )
     RUNTIME.paths.best_state_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
     write_strategy_source(RUNTIME.paths.best_strategy_file, source)
 
 
 def initialize_best_state(force_rebuild: bool = False) -> None:
-    global best_source, best_report, champion_report
+    global best_source, best_report, champion_report, reference_stage_started_at, reference_stage_iteration
 
+    journal_entries = load_journal_entries(RUNTIME.paths.journal_file)
     saved_state = _load_saved_reference_state()
     saved_regime = str(saved_state.get("score_regime", "")).strip()
     saved_reference = saved_state.get("reference")
@@ -1129,7 +1218,17 @@ def initialize_best_state(force_rebuild: bool = False) -> None:
                 if best_report.gate_passed and str(saved_state.get("reference_role", "")).strip() == "champion"
                 else None
             )
-            _persist_best_state(best_source, best_report)
+            reference_stage_started_at, reference_stage_iteration = _recover_reference_stage_state(
+                saved_state,
+                journal_entries,
+                reference_code_hash=source_hash(best_source),
+            )
+            _persist_best_state(
+                best_source,
+                best_report,
+                stage_started_at=reference_stage_started_at,
+                stage_iteration=reference_stage_iteration,
+            )
             log_info(
                 "已加载已保存主参考: "
                 f"role={_reference_role()}, "
@@ -1162,7 +1261,16 @@ def initialize_best_state(force_rebuild: bool = False) -> None:
     reload_strategy_module()
     best_report = evaluate_current_strategy()
     champion_report = best_report if best_report.gate_passed else None
-    _persist_best_state(best_source, best_report)
+    reference_stage_started_at = datetime.now(UTC).isoformat()
+    reference_stage_iteration = (
+        max((int(entry.get("iteration", 0) or 0) for entry in journal_entries), default=0) + 1
+    )
+    _persist_best_state(
+        best_source,
+        best_report,
+        stage_started_at=reference_stage_started_at,
+        stage_iteration=reference_stage_iteration,
+    )
     log_info(
         "研究基线初始化完成: "
         f"role={_reference_role()}, "
@@ -1317,8 +1425,7 @@ def _record_duplicate_skip(
     gate_reason: str,
     note: str,
 ) -> None:
-    append_journal_entry(
-        RUNTIME.paths.journal_file,
+    _append_research_journal_entry(
         _build_journal_entry(
             iteration_id=iteration_id,
             candidate=candidate,
@@ -1328,7 +1435,7 @@ def _record_duplicate_skip(
             stop_stage=stop_stage,
             gate_reason=gate_reason,
             note=note,
-        ),
+        )
     )
     if maybe_compact(RUNTIME.paths.journal_file):
         log_info("研究日志已压缩")
@@ -1341,8 +1448,7 @@ def _record_exploration_block(
     base_source: str,
     block_info: dict[str, Any],
 ) -> None:
-    append_journal_entry(
-        RUNTIME.paths.journal_file,
+    _append_research_journal_entry(
         _build_journal_entry(
             iteration_id=iteration_id,
             candidate=candidate,
@@ -1368,7 +1474,7 @@ def _record_exploration_block(
                 "low_change_param_families": list(block_info.get("low_change_param_families", ()) or ()),
                 "low_change_structural_tokens": list(block_info.get("low_change_structural_tokens", ()) or ()),
             },
-        ),
+        )
     )
     if maybe_compact(RUNTIME.paths.journal_file):
         log_info("研究日志已压缩")
@@ -1381,8 +1487,7 @@ def _record_behavioral_noop(
     base_source: str,
     behavior_diff: dict[str, Any],
 ) -> None:
-    append_journal_entry(
-        RUNTIME.paths.journal_file,
+    _append_research_journal_entry(
         _build_journal_entry(
             iteration_id=iteration_id,
             candidate=candidate,
@@ -1395,7 +1500,7 @@ def _record_behavioral_noop(
             extra_fields={
                 "behavior_diff": behavior_diff,
             },
-        ),
+        )
     )
     if maybe_compact(RUNTIME.paths.journal_file):
         log_info("研究日志已压缩")
@@ -1476,7 +1581,7 @@ def _candidate_with_repair(
 
 
 def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str:
-    global best_source, best_report, champion_report
+    global best_source, best_report, champion_report, reference_stage_started_at, reference_stage_iteration
 
     if best_report is None:
         raise RuntimeError("reference state is not initialized")
@@ -1636,6 +1741,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
                             exc.candidate,
                             exc.behavior_diff,
                             journal_entries=journal_entries,
+                            base_source=best_source,
                         )
                         behavioral_noop_regeneration_attempt += 1
                         write_heartbeat(
@@ -1661,8 +1767,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
             except EarlyRejection as exc:
                 write_strategy_source(RUNTIME.paths.strategy_file, best_source)
                 reload_strategy_module()
-                append_journal_entry(
-                    RUNTIME.paths.journal_file,
+                _append_research_journal_entry(
                     _build_journal_entry(
                         iteration_id=iteration_id,
                         candidate=candidate,
@@ -1672,7 +1777,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
                         stop_stage="early_reject",
                         gate_reason="前段趋势捕获过差",
                         note=str(exc),
-                    ),
+                    )
                 )
                 if maybe_compact(RUNTIME.paths.journal_file):
                     log_info("研究日志已压缩")
@@ -1686,8 +1791,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
             except CandidateRepairExhausted as exc:
                 write_strategy_source(RUNTIME.paths.strategy_file, best_source)
                 reload_strategy_module()
-                append_journal_entry(
-                    RUNTIME.paths.journal_file,
+                _append_research_journal_entry(
                     _build_journal_entry(
                         iteration_id=iteration_id,
                         candidate=exc.candidate,
@@ -1697,7 +1801,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
                         stop_stage="runtime_error",
                         gate_reason="运行失败",
                         note="；".join(exc.errors),
-                    ),
+                    )
                 )
                 if maybe_compact(RUNTIME.paths.journal_file):
                     log_info("研究日志已压缩")
@@ -1739,6 +1843,8 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
         best_source = candidate.strategy_code
         best_report = candidate_report
         champion_report = candidate_report
+        reference_stage_started_at = datetime.now(UTC).isoformat()
+        reference_stage_iteration = iteration_id
         hidden_test_result: dict[str, Any] | None = None
         shadow_test_metrics: dict[str, float] | None = None
         try:
@@ -1755,8 +1861,14 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
             log_info(f"test评估失败，但本轮 champion 已按 val 保留: {exc}")
             logging.exception("test评估失败(iteration=%s)", iteration_id)
 
-        _persist_best_state(best_source, best_report, shadow_test_metrics=shadow_test_metrics)
-        append_journal_entry(RUNTIME.paths.journal_file, entry_base)
+        _persist_best_state(
+            best_source,
+            best_report,
+            shadow_test_metrics=shadow_test_metrics,
+            stage_started_at=reference_stage_started_at,
+            stage_iteration=reference_stage_iteration,
+        )
+        _append_research_journal_entry(entry_base)
         if maybe_compact(RUNTIME.paths.journal_file):
             log_info("研究日志已压缩")
         log_info(
@@ -1806,7 +1918,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
         )
         return "accepted"
 
-    append_journal_entry(RUNTIME.paths.journal_file, entry_base)
+    _append_research_journal_entry(entry_base)
     if maybe_compact(RUNTIME.paths.journal_file):
         log_info("研究日志已压缩")
     write_strategy_source(RUNTIME.paths.strategy_file, best_source)
@@ -1863,6 +1975,7 @@ def main() -> int:
 
     RUNTIME.paths.log_file.parent.mkdir(parents=True, exist_ok=True)
     RUNTIME.paths.journal_file.parent.mkdir(parents=True, exist_ok=True)
+    RUNTIME.paths.memory_dir.mkdir(parents=True, exist_ok=True)
     RUNTIME.paths.best_strategy_file.parent.mkdir(parents=True, exist_ok=True)
     _remove_runtime_state()
 

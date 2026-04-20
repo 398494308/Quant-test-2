@@ -102,29 +102,32 @@ test 验收：
 
 ## 当前 prompt 结构
 
-当前 prompt 顺序：
+当前 prompt 已改成 `3` 层：
 
-1. 策略目标
-2. 思考框架
-3. 当前诊断
-4. 记忆使用规则
-5. 历史研究记忆
-6. 探索与防重复规则
-7. 硬约束
-8. 输出要求
+1. `system prompt`
+   - 只放稳定项目上下文：项目目标、文件职责、允许修改边界、输出规则
+2. `runtime prompt`
+   - 只放本轮动态信息：当前诊断、当前口径 gate、行为无变化约束、本轮执行框架
+3. `history package`
+   - 当前 `stage`
+   - 历史 `stage` 压缩摘要
+   - 当前评分口径全局统计表
+   - 旧评分口径弱参考
 
 当前 prompt 的关键点：
 
 - 不再内嵌完整策略源码
-- memory rule 与 journal 相邻
-- val 聚合诊断可见
+- `system prompt` 里明确写了项目目的和各核心文件是干什么的
+- `runtime prompt` 不再重复塞大量稳定约束，注意力更集中在本轮诊断和真实 choke point
+- `history package` 不再按“最近 N 轮”裁切，而是按“自当前 `baseline/champion` 激活以来”的 `current stage`
 - 当多空捕获明显失衡时，prompt 会追加“软偏置”提示，优先把探索预算投向更弱的一侧，而不是硬性锁死只看单边
 - `test` 完全不可见
-- 最近轮次拆成“核心指标表 + 元信息摘要”
+- 当前 `stage` 只在 prompt 中展示最近有限条表格和元信息，但完整 `stage` 已另存到 memory 目录
 - journal 里新增 `方向冷却表（系统硬约束）`
 - 防重复规则只保留一份，不再多处复写
 - 如果候选在 smoke 窗口上的行为完全不变，系统会在同一轮回灌 smoke 摘要并强制重生
-- `edited_regions` 最多 `1-3` 个，系统会用真实 diff / AST 派生的 `system signature` 复核
+- ordinary family 不再有 `>3` 的硬报错；系统改成保留“至少 `1` 个 ordinary family”的下限，`1-3` 只是默认软引导，连续 `behavioral_noop` 时允许更大步长
+- `behavioral_noop` 回灌现在会明确指出候选真实改动区域、普通 family、目标侧，以及当前该优先看的外层 choke point：`long_outer_context_ok / long_final_veto_clear / short_outer_context_ok / short_final_veto_clear`
 - prompt 里的可编辑区域已切到真实存在的命名规则块，能直接改 `sideways / flow / trend_quality / followthrough / long_entry / short_entry / strategy`
 
 ## 当前 Discord 口径
@@ -148,6 +151,16 @@ Discord 现在只保留：
 - `smoke` 通过后，还会比对候选和当前参考在 smoke 窗口里的行为指纹
 - 如果收益、交易数、信号统计、退出原因和交易摘要完全一致，不会立刻结束本轮，而是把 smoke 摘要回灌给模型，在同一轮强制重生候选
 - 只有连续重生后仍然无法改变 smoke 行为，才会正式记一次 `behavioral_noop`
+- 每条 journal 现在都会同步写入 `state/research_macd_aggressive_v2_memory/raw/`
+- memory 目录里会额外维护：
+  - `raw/full_history.jsonl`
+  - `raw/rounds/*.json`
+  - `summaries/current_stage_rounds.json`
+  - `summaries/past_stage_summaries.json`
+  - `summaries/all_time_tables.json`
+  - `prompt/latest_history_package.md`
+- `best_state` 现在会持久化 `reference_stage_started_at/reference_stage_iteration`，重启后不会把当前 stage 切乱
+- 当前基底策略里，研究器被显式引导优先检查外层总闸门和最终 veto 链，而不是继续把注意力浪费在未触达真实出单层的局部 helper 上
 - 候选报错时会在同一轮 repair
 - 同簇低变化近邻会在评估前被系统拦截，不再白跑 `smoke/full eval`
 - 连续 `behavioral_noop` 现在也会进入同簇低变化上下文，后续若继续沿同簇近邻试错，会被评估前拦截
@@ -190,4 +203,5 @@ PY
 - 本轮已在 `2026-04-19` 做过一次彻底历史清理：
   - `state/research_macd_aggressive_v2_journal.jsonl` 已清空
   - `state/research_macd_aggressive_v2_journal.compact.json` 已清空
+  - `scripts/reset_research_macd_aggressive_v2_state.sh` 现在也会把 `state/research_macd_aggressive_v2_memory/` 一并归档
   - 原文件已按时间戳归档

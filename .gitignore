@@ -7,6 +7,7 @@ backups/*.py
 backups/research_macd_aggressive_v2_resets/
 state/*.json
 state/*.jsonl
+state/research_macd_aggressive_v2_memory/
 state/*.pid
 state/*.lock
 state/*.stop
