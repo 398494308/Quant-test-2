@@ -1333,14 +1333,12 @@ def backtest_macd_aggressive(
         hourly_context = hourly_state[hourly_idx] if hourly_idx >= 0 else None
         prev_hourly_context = hourly_state[hourly_idx - 1] if hourly_idx > 0 else hourly_context
         four_hour_context = four_hour_state[four_hour_idx] if four_hour_idx >= 0 else None
-        sentiment_context = sentiment_state[sentiment_idx] if sentiment_idx >= 0 else None
         intraday_context = intraday_state[idx]
         prev_intraday_context = intraday_state[idx - 1] if idx > 0 else intraday_context
         market_state = {
             "hourly": hourly_context,
             "prev_hourly": prev_hourly_context,
             "four_hour": four_hour_context,
-            "sentiment": sentiment_context,
             "trade_count": intraday_context["trade_count"],
             "trade_count_ratio": intraday_context["trade_count_ratio"],
             "taker_buy_volume": intraday_context["taker_buy_volume"],

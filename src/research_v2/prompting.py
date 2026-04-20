@@ -5,7 +5,11 @@ from __future__ import annotations
 from typing import Any
 
 from research_v2.journal import ORDINARY_REGION_FAMILIES
-from research_v2.strategy_code import REQUIRED_FUNCTIONS
+from research_v2.strategy_code import (
+    REQUIRED_FUNCTIONS,
+    factor_change_mode_label,
+    factor_change_mode_prompt_hint,
+)
 
 # ==================== 编辑边界 ====================
 
@@ -25,6 +29,18 @@ EDITABLE_REGIONS = (
     "_trend_followthrough_ok",
     "_long_entry_signal",
     "_short_entry_signal",
+    "long_outer_context_ok",
+    "long_breakout_ok",
+    "long_pullback_ok",
+    "long_trend_reaccel_ok",
+    "long_signal_path_ok",
+    "long_final_veto_clear",
+    "short_outer_context_ok",
+    "breakdown_ready",
+    "short_breakdown_ok",
+    "short_bounce_fail_ok",
+    "short_trend_reaccel_ok",
+    "short_final_veto_clear",
     "strategy",
 )
 
@@ -102,7 +118,7 @@ def build_candidate_response_schema() -> dict[str, Any]:
 # ==================== Prompt 组装 ====================
 
 
-def build_strategy_system_prompt() -> str:
+def build_strategy_system_prompt(*, factor_change_mode: str = "default") -> str:
     return f"""你是 BTC 永续合约激进趋势策略研究员。
 
 项目目标：
@@ -120,6 +136,9 @@ def build_strategy_system_prompt() -> str:
 - 先阅读并直接修改 `src/strategy_macd_aggressive.py`，必要时再看回测实现或数据文件，不要靠猜测写策略。
 - 每轮只验证一个可证伪假设；改动要能映射到真实交易路径变化，而不是只制造源码 diff。
 - 优先保持代码结构化、规则块命名清晰、阈值集中、因果链可解释。
+- 默认先做删减、合并、替换，再考虑新增条件；如果一个新条件只覆盖很窄的历史片段，优先删旧条件或改旧阈值，不要继续叠分叉。
+- 不要把同一侧 path 拆成多个近似微变体；一个 path 没有明显新增交易路径时，应视为失败假设，而不是继续微调同一区间。
+- {factor_change_mode_prompt_hint(factor_change_mode)}
 
 输出与协作规则：
 - 只输出 JSON，不要解释，不要 markdown，不要贴源码。
@@ -179,6 +198,7 @@ def build_strategy_research_prompt(
     reference_metrics: dict[str, Any] | None = None,
     score_regime: str = "trend_capture_v6",
     promotion_min_delta: float = 0.02,
+    factor_change_mode: str = "default",
 ) -> str:
     side_bias_guidance = _side_bias_guidance(reference_metrics)
     side_bias_block = f"\n{side_bias_guidance}\n" if side_bias_guidance else "\n"
@@ -190,6 +210,8 @@ def build_strategy_research_prompt(
 
 当前 champion 参考晋级分：{previous_best_score:.2f}
 {side_bias_block}
+
+当前因子模式：{factor_change_mode_label(factor_change_mode)}
 
 当前诊断：
 {evaluation_summary}
@@ -204,6 +226,7 @@ def build_strategy_research_prompt(
 - 新增 path 不等于新增交易；必须继续检查最终合流与否决链。长侧重点看 `long_signal_path_ok -> long_final_veto_clear -> _trend_followthrough_long()`，空侧重点看 `breakdown_ready -> short_final_veto_clear -> _trend_followthrough_short()`。
 - 如果主要改 `_trend_followthrough_ok()`、`_trend_quality_ok()` 或 `_flow_confirmation_ok()`，必须确认现有 `strategy()` 路径会触达；否则优先改 `strategy()`。
 - 若最近连续出现 `behavioral_noop`，本轮默认必须放大步长：优先切不同方向簇，或改多个普通 family；不要只换措辞、tag 或近邻阈值。
+- 默认模式下有复杂度预算：如果你想加一条新条件，必须同步删掉或合并旧条件，避免 `strategy()` 和关键 helper 再次膨胀。
 
 当前口径的 gate / 评分提醒：
 - val 趋势段命中率 >= 35%
@@ -219,7 +242,7 @@ def build_strategy_research_prompt(
 - `change_plan` 与 `novelty_proof` 必须明确写出预计会新增、删除或移动哪类实际交易，不要只写“提高确认质量”。
 - `change_tags` 用简短 ASCII 标签；`candidate_id` 也保持 ASCII。
 - `closest_failed_cluster` 必须填写最接近的最近失败方向簇；若确实是新方向，也要写出最接近的旧簇名。
-- `core_factors` 字段必须输出；没有足够强的新因子就输出空数组 `[]`。
+- `core_factors` 字段必须输出；它只用于描述本轮复用或删减的现有决策因子，不是新增因子的申请通道。没有就输出空数组 `[]`。
 """
 
 

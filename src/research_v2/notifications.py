@@ -10,7 +10,7 @@ from pathlib import Path
 import requests
 
 from research_v2.evaluation import EvaluationReport
-from research_v2.strategy_code import StrategyCandidate
+from research_v2.strategy_code import StrategyCandidate, factor_change_mode_label
 
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
@@ -241,6 +241,7 @@ def build_discord_summary_message(
     data_range_text: str | None = None,
     shadow_test_metrics: dict[str, float] | None = None,
     candidate: StrategyCandidate | None = None,
+    factor_change_mode: str = "default",
 ) -> str:
     metrics = report.metrics
     selection_return_pct = float(metrics.get("selection_total_return_pct", metrics.get("full_period_return_pct", 0.0)))
@@ -254,6 +255,7 @@ def build_discord_summary_message(
     rows = [
         ("数据范围", data_range_text or "-"),
         ("本轮窗口", window_text),
+        ("因子模式", factor_change_mode_label(factor_change_mode)),
         ("train+val期间收益", f"{selection_return_pct:.2f}%"),
         ("val期间收益", f"{validation_return_pct:.2f}%" if validation_window_count > 0 else "-"),
         (

@@ -74,6 +74,7 @@ from research_v2.strategy_code import (
     StrategyCoreFactor,
     StrategySourceError,
     build_diff_summary,
+    build_strategy_complexity_delta,
     load_strategy_source,
     normalize_strategy_source,
     repair_missing_required_functions,
@@ -960,7 +961,11 @@ def _candidate_from_payload(
     )
     if restored_functions:
         write_strategy_source(workspace_strategy_file, strategy_code)
-    validate_strategy_source(strategy_code)
+    validate_strategy_source(
+        strategy_code,
+        base_source=base_source,
+        factor_change_mode=RUNTIME.factor_change_mode,
+    )
     validate_editable_region_boundaries(base_source, strategy_code, EDITABLE_REGIONS)
     candidate = StrategyCandidate(
         candidate_id=str(payload["candidate_id"]).strip() or f"candidate-{int(time.time())}",
@@ -1030,11 +1035,14 @@ def _build_model_candidate(
         reference_metrics=benchmark_report.metrics,
         score_regime=SCORE_REGIME,
         promotion_min_delta=RUNTIME.promotion_min_delta,
+        factor_change_mode=RUNTIME.factor_change_mode,
     )
     with _temporary_cwd(workspace_root):
         payload = generate_json_object(
             prompt=prompt,
-            system_prompt=build_strategy_system_prompt(),
+            system_prompt=build_strategy_system_prompt(
+                factor_change_mode=RUNTIME.factor_change_mode,
+            ),
             max_output_tokens=RUNTIME.prompt_max_output_tokens,
             config=_model_client_config(),
             text_format=build_json_text_format(
@@ -1074,7 +1082,9 @@ def _repair_model_candidate(
     with _temporary_cwd(workspace_root):
         payload = generate_json_object(
             prompt=prompt,
-            system_prompt=build_strategy_system_prompt(),
+            system_prompt=build_strategy_system_prompt(
+                factor_change_mode=RUNTIME.factor_change_mode,
+            ),
             max_output_tokens=RUNTIME.prompt_max_output_tokens,
             config=_model_client_config(),
             text_format=build_json_text_format(
@@ -1135,7 +1145,9 @@ def _regenerate_model_candidate(
     with _temporary_cwd(workspace_root):
         payload = generate_json_object(
             prompt=prompt,
-            system_prompt=build_strategy_system_prompt(),
+            system_prompt=build_strategy_system_prompt(
+                factor_change_mode=RUNTIME.factor_change_mode,
+            ),
             max_output_tokens=RUNTIME.prompt_max_output_tokens,
             config=_model_client_config(),
             text_format=build_json_text_format(
@@ -1251,6 +1263,7 @@ def initialize_best_state(force_rebuild: bool = False) -> None:
                     validation_window_count=VALIDATION_WINDOW_COUNT,
                     test_window_count=TEST_WINDOW_COUNT,
                     data_range_text=_discord_data_range_text(),
+                    factor_change_mode=RUNTIME.factor_change_mode,
                 ),
                 context="initialize_saved_reference",
             )
@@ -1293,6 +1306,7 @@ def initialize_best_state(force_rebuild: bool = False) -> None:
             validation_window_count=VALIDATION_WINDOW_COUNT,
             test_window_count=TEST_WINDOW_COUNT,
             data_range_text=_discord_data_range_text(),
+            factor_change_mode=RUNTIME.factor_change_mode,
         ),
         context="initialize_baseline",
     )
@@ -1334,6 +1348,7 @@ def _build_journal_entry(
     actual_ordinary_changed_regions = sorted(candidate_signature["ordinary_changed_regions"])
     actual_param_families = sorted(candidate_signature["param_families"])
     actual_structural_tokens = sorted(candidate_signature["structural_tokens"])
+    complexity_delta = build_strategy_complexity_delta(base_source, candidate.strategy_code)
     entry = {
         "iteration": iteration_id,
         "timestamp": datetime.now(UTC).isoformat(),
@@ -1378,6 +1393,10 @@ def _build_journal_entry(
         "system_param_families": actual_param_families,
         "system_structural_tokens": actual_structural_tokens,
         "system_signature_hash": candidate_signature["signature_hash"],
+        "system_complexity_functions": complexity_delta["functions"],
+        "system_complexity_summary": complexity_delta["summary"],
+        "system_complexity_flags": list(complexity_delta["flags"]),
+        "system_bloat_flag": bool(complexity_delta["bloat_flag"]),
         "declared_regions_match_system": sorted(candidate.edited_regions) == actual_changed_regions,
         "target_family": target_family_from_text(
             candidate.change_tags,
@@ -1907,6 +1926,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
             data_range_text=_discord_data_range_text(),
             shadow_test_metrics=shadow_test_metrics,
             candidate=candidate,
+            factor_change_mode=RUNTIME.factor_change_mode,
         )
         attachments = [chart_paths.validation_chart] if chart_paths.validation_chart is not None else None
         if attachments:

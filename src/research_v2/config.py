@@ -35,6 +35,10 @@ def _env_float(name: str, default: float) -> float:
     return float(os.getenv(name, str(default)))
 
 
+def _env_text(name: str, default: str) -> str:
+    return str(os.getenv(name, default)).strip()
+
+
 # ==================== 路径配置 ====================
 
 
@@ -85,6 +89,7 @@ class ResearchRuntimeConfig:
     paths: ResearchPaths
     windows: WindowConfig
     gates: GateConfig
+    factor_change_mode: str
     loop_interval_seconds: int
     provider_recovery_wait_seconds: int
     failure_cooldown_seconds: int
@@ -152,9 +157,10 @@ def load_research_runtime_config(repo_root: Path) -> ResearchRuntimeConfig:
         paths=paths,
         windows=windows,
         gates=gates,
+        factor_change_mode=_env_text("MACD_V2_FACTOR_CHANGE_MODE", "default"),
         loop_interval_seconds=_env_int("MACD_V2_LOOP_INTERVAL_SECONDS", 120),
         provider_recovery_wait_seconds=_env_int("MACD_V2_PROVIDER_RECOVERY_WAIT_SECONDS", 90),
-        failure_cooldown_seconds=_env_int("MACD_V2_FAILURE_COOLDOWN_SECONDS", 60),
+        failure_cooldown_seconds=_env_int("MACD_V2_FAILURE_COOLDOWN_SECONDS", 10),
         prompt_max_output_tokens=_env_int("MACD_V2_PROMPT_MAX_OUTPUT_TOKENS", 12000),
         max_recent_journal_entries=_env_int("MACD_V2_MAX_RECENT_JOURNAL_ENTRIES", 12),
         early_reject_after_windows=_env_int("MACD_V2_EARLY_REJECT_WINDOWS", 15),

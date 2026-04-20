@@ -278,6 +278,18 @@ def region_families_for_regions(regions: list[str] | tuple[str, ...]) -> tuple[s
         "_trend_followthrough_short": "entry_path",
         "_long_entry_signal": "entry_path",
         "_short_entry_signal": "entry_path",
+        "long_outer_context_ok": "trend_quality",
+        "long_breakout_ok": "entry_path",
+        "long_pullback_ok": "entry_path",
+        "long_trend_reaccel_ok": "entry_path",
+        "long_signal_path_ok": "entry_path",
+        "long_final_veto_clear": "entry_path",
+        "short_outer_context_ok": "trend_quality",
+        "breakdown_ready": "entry_path",
+        "short_breakdown_ok": "entry_path",
+        "short_bounce_fail_ok": "entry_path",
+        "short_trend_reaccel_ok": "entry_path",
+        "short_final_veto_clear": "entry_path",
         "strategy": "strategy",
     }
     normalized = []
@@ -536,6 +548,7 @@ def _compact_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
     exploration_blocked_count = sum(1 for e in entries if e.get("outcome") == "exploration_blocked")
     early_rejected_count = sum(1 for e in entries if e.get("outcome") == "early_rejected")
     runtime_failed_count = sum(1 for e in entries if e.get("outcome") == "runtime_failed")
+    bloat_flag_count = sum(1 for e in entries if bool(e.get("system_bloat_flag")))
 
     # 标签统计：哪些方向有效 / 无效
     tag_stats: dict[str, dict[str, Any]] = defaultdict(
@@ -653,6 +666,7 @@ def _compact_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
         "exploration_blocked_count": exploration_blocked_count,
         "early_rejected_count": early_rejected_count,
         "runtime_failed_count": runtime_failed_count,
+        "bloat_flag_count": bloat_flag_count,
         "accept_rate": len(accepted) / len(entries) if entries else 0.0,
         "tag_summary": tag_summary,
         "cluster_summary": cluster_summary,
@@ -1458,19 +1472,12 @@ def _exploration_trigger_lines(entries: list[dict[str, Any]], limit: int) -> lis
         return []
 
     clusters: list[str] = []
-    factors: list[str] = []
     tags: list[str] = []
     regions: list[str] = []
     for entry in tail:
         cluster = cluster_key_for_entry(entry)
         if cluster and cluster not in clusters:
             clusters.append(cluster)
-        for factor in entry.get("core_factors", []):
-            if not isinstance(factor, dict):
-                continue
-            name = str(factor.get("name", "")).strip()
-            if name and name not in factors:
-                factors.append(name)
         for tag in entry.get("change_tags", []):
             tag_text = str(tag).strip()
             if tag_text and tag_text not in tags:
@@ -1483,8 +1490,8 @@ def _exploration_trigger_lines(entries: list[dict[str, Any]], limit: int) -> lis
     lines = [
         "探索触发（必须执行）:",
         f"最近 {LOW_CHANGE_STREAK} 轮都属于低变化轮次：晋级分没有实质提升，且 trend_score / hit_rate / bull_bear_capture / fee_drag 基本不变。",
-        f"- 近期近邻方向簇：{', '.join(clusters[:limit]) or '-'}；标签：{', '.join(tags[:limit]) or '-'}；核心因子：{', '.join(factors[:limit]) or '-'}；高频区域：{', '.join(regions[:limit]) or '-'}",
-        "- 下一轮必须把它当作探索轮：优先切簇；若无法切簇，至少切换普通 family、long-short target 或核心因子家族中的一项。",
+        f"- 近期近邻方向簇：{', '.join(clusters[:limit]) or '-'}；标签：{', '.join(tags[:limit]) or '-'}；高频区域：{', '.join(regions[:limit]) or '-'}",
+        "- 下一轮必须把它当作探索轮：优先切簇；若无法切簇，至少切换普通 family、long-short target 或真实交易路径层级中的一项。",
         "- 目标是让 segment_hit_rate、bull_capture_score、bear_capture_score、avg_fee_drag、total_trades 中至少两项明显变化。",
     ]
     return lines
@@ -1518,19 +1525,12 @@ def _cluster_overheat_lines(entries: list[dict[str, Any]], limit: int) -> list[s
         return []
 
     tags: list[str] = []
-    factors: list[str] = []
     regions: list[str] = []
     for entry in hot_entries:
         for tag in entry.get("change_tags", []):
             tag_text = str(tag).strip()
             if tag_text and tag_text not in tags:
                 tags.append(tag_text)
-        for factor in entry.get("core_factors", []):
-            if not isinstance(factor, dict):
-                continue
-            factor_name = str(factor.get("name", "")).strip()
-            if factor_name and factor_name not in factors:
-                factors.append(factor_name)
         for region in entry.get("edited_regions", []):
             region_text = str(region).strip()
             if region_text and region_text not in regions:
@@ -1540,7 +1540,7 @@ def _cluster_overheat_lines(entries: list[dict[str, Any]], limit: int) -> list[s
         "主簇过热（必须先读）:",
         f"最近 {len(recent)} 轮里，`{hot_cluster}` 占比 {hot_share:.0%}（{hot_count}/{len(recent)}），且最佳 promotion_delta 仅 {best_delta:.2f}，继续留在该簇大概率仍是近邻试错。",
         f"- 过热方向簇：{hot_cluster}",
-        f"- 近期近邻标签：{', '.join(tags[:limit]) or '-'}；核心因子：{', '.join(factors[:limit]) or '-'}；高频区域：{', '.join(regions[:limit]) or '-'}",
+        f"- 近期近邻标签：{', '.join(tags[:limit]) or '-'}；高频区域：{', '.join(regions[:limit]) or '-'}",
         "- 下一轮默认应切到不同方向簇；若仍留在该簇，必须证明这次会改变不同交易路径。",
     ]
 
@@ -1739,7 +1739,6 @@ def _all_time_tables_payload(entries: list[dict[str, Any]], limit: int) -> dict[
         }
     )
     failure_tags: Counter[str] = Counter()
-    factor_names: Counter[str] = Counter()
 
     for entry in entries:
         cluster = cluster_key_for_entry(entry) or "unclassified"
@@ -1760,13 +1759,6 @@ def _all_time_tables_payload(entries: list[dict[str, Any]], limit: int) -> dict[
         if abs(promotion_delta) <= 1e-9:
             bucket["zero_delta"] += 1
         bucket["best_delta"] = max(bucket["best_delta"], promotion_delta)
-        for factor in entry.get("core_factors", []):
-            if not isinstance(factor, dict):
-                continue
-            name = str(factor.get("name", "")).strip()
-            if name:
-                factor_names[name] += 1
-
     clusters = []
     for cluster_name, stats in cluster_bucket.items():
         label = _risk_label(
@@ -1791,7 +1783,6 @@ def _all_time_tables_payload(entries: list[dict[str, Any]], limit: int) -> dict[
     return {
         "clusters": clusters[: max(1, limit)],
         "failure_tags": [name for name, _ in failure_tags.most_common(max(1, limit))],
-        "core_factors": [name for name, _ in factor_names.most_common(max(1, min(4, limit)))],
     }
 
 
@@ -1814,9 +1805,6 @@ def _format_all_time_tables(payload: dict[str, Any]) -> list[str]:
     if failure_tags:
         lines.append("")
         lines.append(f"全局高频失败标签: {', '.join(failure_tags)}")
-    core_factors = payload.get("core_factors", [])
-    if core_factors:
-        lines.append(f"全局高频核心因子: {', '.join(core_factors)}")
     return lines
 
 
@@ -2006,8 +1994,10 @@ def _recent_round_meta_lines(entries: list[dict[str, Any]], start_index: int) ->
         tags = _truncate(",".join(entry.get("change_tags", [])) or "-", 40)
         regions = _truncate(",".join(entry.get("edited_regions", [])) or "-", 20)
         summary = _truncate(entry.get("note") or entry.get("hypothesis") or "-", 64)
+        complexity = _truncate(entry.get("system_complexity_summary") or "-", 48)
+        bloat_suffix = "; bloat=YES" if bool(entry.get("system_bloat_flag")) else ""
         lines.append(
-            f"- {round_label} {candidate_id}: cluster={cluster}; tags={tags}; regions={regions}; 摘要={summary}"
+            f"- {round_label} {candidate_id}: cluster={cluster}; tags={tags}; regions={regions}; complexity={complexity}{bloat_suffix}; 摘要={summary}"
         )
     return lines
 
@@ -2243,13 +2233,15 @@ def build_journal_prompt_summary(
             exploration_blocked_count = sum(1 for entry in board_entries if entry.get("outcome") == "exploration_blocked")
             early_rejected_count = sum(1 for entry in board_entries if entry.get("outcome") == "early_rejected")
             runtime_failed_count = sum(1 for entry in board_entries if entry.get("outcome") == "runtime_failed")
+            bloat_flag_count = sum(1 for entry in board_entries if bool(entry.get("system_bloat_flag")))
             parts.append(
                 f"{stage_scope} 共 {len(board_entries)} 条："
                 f"保留 {accepted_count}，未保留 {rejected_count}，"
                 f"重复跳过 {duplicate_skipped_count}，"
                 f"行为无变化 {behavioral_noop_count}，"
                 f"探索拦截 {exploration_blocked_count}，"
-                f"提前淘汰 {early_rejected_count}，运行失败 {runtime_failed_count}。"
+                f"提前淘汰 {early_rejected_count}，运行失败 {runtime_failed_count}，"
+                f"复杂度超标 {bloat_flag_count}。"
             )
             if len(display_entries) < len(board_entries):
                 parts.append(
@@ -2259,10 +2251,6 @@ def build_journal_prompt_summary(
             if failure_tag_lines:
                 parts.append("当前 stage 高频失败标签:")
                 parts.extend(failure_tag_lines)
-            core_factor_columns = _recent_core_factor_columns(board_entries, limit=min(4, limit))
-            core_factor_lines = _recent_core_factor_lines(board_entries, core_factor_columns)
-            if core_factor_lines:
-                parts.extend(core_factor_lines)
             parts.append(f"{stage_name} 核心指标表:")
             parts.extend(_format_recent_rounds_table(display_entries, stage_start_index))
             parts.append("")

@@ -11,31 +11,32 @@
 - `1h` / `4h` 只是由 `15m` 聚合出来的确认层
 - 默认交易所数据源：`OKX`
 - 成交量维度除了总量，还会从 OKX K 线推导方向流量代理和成交活跃度
+- 当前因子模式：`default`
 
 ## 最新手工基底
 
-- 更新时间：`2026-04-19`
+- 更新时间：`2026-04-20`
 - 当前已持久化到：
   - `src/strategy_macd_aggressive.py`
   - `backups/strategy_macd_aggressive_v2_best.py`
   - `state/research_macd_aggressive_v2_best.json`
-- `2026-04-20` 已在 `OKX` 数据上重新评估，当前有效结果：
-  - `gate=通过`
-  - `quality_score=0.32`
-  - `promotion_score=0.25`
-  - `train+val期间收益=139.48%`
-  - `val期间收益=10.06%`
-  - `val多/空捕获=0.17 / 0.41`
-  - `最大回撤/手续费拖累=34.47% / 2.80%`
-  - `train+val交易数=280`
+- `2026-04-20` 已完成一轮真正的“重新拆基底”：
+  - `PARAMS` 收到一版核心阈值集合，删除了 `launch_*` 和一组只服务于局部微路径的 `long_*` 专用参数
+  - `strategy()` 从超长条件链改成命名规则块编排
+  - long 侧现在拆成 `long_outer_context_ok / long_breakout_ok / long_pullback_ok / long_trend_reaccel_ok / long_final_veto_clear`
+  - short 侧现在拆成 `short_outer_context_ok / breakdown_ready / short_breakdown_ok / short_bounce_fail_ok / short_trend_reaccel_ok / short_final_veto_clear`
+  - `_trend_quality_ok()` 和 `_trend_followthrough_ok()` 现在只保留分发职责，具体逻辑下沉到 long/short 侧 helper
+  - `src/strategy_macd_aggressive.py` 和 `backups/strategy_macd_aggressive_v2_best.py` 当前已同步，且都能通过源码校验
+- 当前这版 clean 基底还没有重新跑完整 `train/val/test` 评估；旧基底的历史分数不能再直接视为这版新结构的当前结果。
+- 研究器已先手动停掉，避免后台进程把旧 champion 再次覆盖到 `src/strategy_macd_aggressive.py`。
 - 当前 `train/val` funding 覆盖率是 `0%`。原因不是研究器没开 funding，而是 OKX 公共 funding 历史拿不到这段旧窗口；缺失区间当前按 `0 funding` 回测，并在评估摘要里直接显示覆盖率。
 
 这版新基底的手工方向不是“继续堆更多 long”，而是：
 
-- 保留原主吸收型 long 路径
-- 给 long 加入更强的 flow / chop 环境过滤
-- 保留 short 主框架不大动
-- 用更干净的历史重新起跑，让研究器围绕这个基底继续找 gate 内解
+- 先把策略从“堆条件”拉回到“少数清晰路径”
+- 保留 volume / trade_count / taker buy-sell / flow imbalance 这些真实在用的数据
+- 把无用的策略接口噪音拿掉；`sentiment` 不再传进策略 `market_state`
+- 用更干净的基底重新起跑，让研究器围绕可解释的规则块继续找解
 
 ## 当前时间切分
 
@@ -119,7 +120,9 @@ test 验收：
 - 不再内嵌完整策略源码
 - `system prompt` 里明确写了项目目的和各核心文件是干什么的
 - `runtime prompt` 不再重复塞大量稳定约束，注意力更集中在本轮诊断和真实 choke point
+- 默认因子模式下，prompt 明确禁止新增 `PARAMS` 键、顶层常量名和顶层 helper 名；只有切到 `factor_admission` 才允许做小规模因子准入
 - `history package` 不再按“最近 N 轮”裁切，而是按“自当前 `baseline/champion` 激活以来”的 `current stage`
+- prompt/history 不再展示“最近动态核心因子 / 全局高频核心因子”，只保留方向簇、失败标签、改动区域和真实结果；原始 `core_factors` 仍保留在 raw archive
 - 当多空捕获明显失衡时，prompt 会追加“软偏置”提示，优先把探索预算投向更弱的一侧，而不是硬性锁死只看单边
 - `test` 完全不可见
 - 当前 `stage` 只在 prompt 中展示最近有限条表格和元信息，但完整 `stage` 已另存到 memory 目录
@@ -136,6 +139,7 @@ Discord 现在只保留：
 
 - `数据范围`
 - `本轮窗口`
+- `因子模式`
 - `train+val期间收益`
 - `val期间收益`
 - 新 `champion` 时额外播报 `test期间收益`

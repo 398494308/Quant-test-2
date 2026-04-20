@@ -57,6 +57,7 @@ from research_v2.strategy_code import (
     StrategyCandidate,
     StrategyCoreFactor,
     StrategySourceError,
+    build_strategy_complexity_delta,
     build_system_edit_signature,
     repair_missing_required_functions,
     validate_editable_region_boundaries,
@@ -574,6 +575,47 @@ class EvaluationFixesTest(unittest.TestCase):
 
 
 class StrategyValidationFixesTest(unittest.TestCase):
+    def _minimal_validation_source(self, overrides=None):
+        body_by_function = {
+            "_sideways_release_flags": "return {}",
+            "_is_sideways_regime": "return False",
+            "_flow_signal_metrics": "return {}",
+            "_flow_confirmation_ok": "return True",
+            "_flow_entry_ok": "return True",
+            "_trend_quality_long": "return True",
+            "_trend_quality_short": "return True",
+            "_trend_quality_ok": "return True",
+            "_trend_followthrough_long": "return True",
+            "_trend_followthrough_short": "return True",
+            "_trend_followthrough_ok": "return True",
+            "_long_entry_signal": "return False",
+            "_short_entry_signal": "return False",
+            "strategy": "return None",
+        }
+        if overrides:
+            body_by_function.update(overrides)
+
+        blocks = [
+            "# PARAMS_START",
+            "PARAMS = {'intraday_adx_min': 10}",
+            "# PARAMS_END",
+            "",
+        ]
+        for function_name in REQUIRED_FUNCTIONS:
+            signature = "(*args, **kwargs)"
+            if function_name == "_flow_confirmation_ok":
+                signature = "(market_state, hourly, fourh, params, side)"
+            elif function_name == "_trend_quality_ok":
+                signature = "(market_state, side)"
+            elif function_name == "_trend_followthrough_ok":
+                signature = "(market_state, side, trigger_price, current_close)"
+            elif function_name == "strategy":
+                signature = "(data, idx, positions, market_state)"
+            blocks.append(f"def {function_name}{signature}:")
+            blocks.append(f"    {body_by_function[function_name]}")
+            blocks.append("")
+        return "\n".join(blocks)
+
     def test_live_strategy_source_validates(self):
         source = (REPO_ROOT / "src/strategy_macd_aggressive.py").read_text()
 
@@ -782,6 +824,100 @@ def strategy(*args, **kwargs):
         with self.assertRaises(StrategySourceError):
             validate_strategy_source(source)
 
+    def test_validate_strategy_source_rejects_helper_p_without_binding(self):
+        source = self._minimal_validation_source(
+            {"_trend_quality_ok": "return p['intraday_adx_min'] > 0"}
+        )
+
+        with self.assertRaisesRegex(StrategySourceError, r"references undefined name 'p'"):
+            validate_strategy_source(source)
+
+    def test_validate_strategy_source_rejects_helper_params_without_binding(self):
+        source = self._minimal_validation_source(
+            {"_trend_quality_ok": "return params['intraday_adx_min'] > 0"}
+        )
+
+        with self.assertRaisesRegex(StrategySourceError, r"references undefined name 'params'"):
+            validate_strategy_source(source)
+
+    def test_validate_strategy_source_rejects_helper_intraday_without_binding(self):
+        source = self._minimal_validation_source(
+            {"_trend_followthrough_ok": "return intraday['spread_pct'] > 0"}
+        )
+
+        with self.assertRaisesRegex(StrategySourceError, r"references undefined name 'intraday'"):
+            validate_strategy_source(source)
+
+    def test_validate_strategy_source_accepts_helper_params_argument(self):
+        source = self._minimal_validation_source(
+            {"_flow_confirmation_ok": "return params['intraday_adx_min'] > 0"}
+        )
+
+        validate_strategy_source(source)
+
+    def test_validate_strategy_source_accepts_helper_local_p_binding(self):
+        source = self._minimal_validation_source(
+            {
+                "_trend_quality_ok": "p = PARAMS\n    return p['intraday_adx_min'] > 0",
+            }
+        )
+
+        validate_strategy_source(source)
+
+    def test_validate_strategy_source_rejects_new_param_key_in_default_mode(self):
+        base_source = self._minimal_validation_source()
+        source = base_source.replace(
+            "PARAMS = {'intraday_adx_min': 10}",
+            "PARAMS = {'intraday_adx_min': 10, 'new_factor_gate': 1.0}",
+            1,
+        )
+
+        with self.assertRaisesRegex(StrategySourceError, r"forbids new PARAMS keys"):
+            validate_strategy_source(
+                source,
+                base_source=base_source,
+                factor_change_mode="default",
+            )
+
+    def test_validate_strategy_source_allows_new_param_key_in_factor_admission_mode(self):
+        base_source = self._minimal_validation_source()
+        source = base_source.replace(
+            "PARAMS = {'intraday_adx_min': 10}",
+            "PARAMS = {'intraday_adx_min': 10, 'new_factor_gate': 1.0}",
+            1,
+        )
+
+        validate_strategy_source(
+            source,
+            base_source=base_source,
+            factor_change_mode="factor_admission",
+        )
+
+    def test_validate_strategy_source_rejects_default_mode_complexity_growth(self):
+        base_source = self._minimal_validation_source()
+        expanded_body = "\n    ".join(
+            [*(f"x_{index} = {index}" for index in range(48)), "return None"]
+        )
+        source = self._minimal_validation_source({"strategy": expanded_body})
+
+        with self.assertRaisesRegex(StrategySourceError, r"complexity growth too large"):
+            validate_strategy_source(
+                source,
+                base_source=base_source,
+                factor_change_mode="default",
+            )
+
+    def test_build_strategy_complexity_delta_tracks_growth(self):
+        base_source = self._minimal_validation_source()
+        source = self._minimal_validation_source(
+            {"strategy": "value = 1\n    other = 2\n    return value + other"}
+        )
+
+        complexity_delta = build_strategy_complexity_delta(base_source, source)
+
+        self.assertIn("strategy", complexity_delta["functions"])
+        self.assertIn("strategy:", complexity_delta["summary"])
+
     def test_validate_editable_boundaries_rejects_non_editable_changes(self):
         base_source = """
 # PARAMS_START
@@ -962,6 +1098,8 @@ class JournalPromptFixesTest(unittest.TestCase):
         self.assertIn("15m` 是唯一事实源", prompt)
         self.assertIn("方向流量代理", prompt)
         self.assertIn("state/research_macd_aggressive_v2_memory", prompt)
+        self.assertIn("默认模式", prompt)
+        self.assertIn("禁止新增 `PARAMS` 键", prompt)
 
     def test_build_strategy_runtime_prompt_mentions_promotion_gate(self):
         prompt = build_strategy_research_prompt(
@@ -972,6 +1110,8 @@ class JournalPromptFixesTest(unittest.TestCase):
 
         self.assertIn("promotion_delta > 0.02", prompt)
         self.assertIn("当前回合任务", prompt)
+        self.assertIn("当前因子模式：默认模式", prompt)
+        self.assertIn("不是新增因子的申请通道", prompt)
 
     def test_build_strategy_system_prompt_mentions_all_required_symbols(self):
         prompt = build_strategy_system_prompt()
@@ -986,6 +1126,12 @@ class JournalPromptFixesTest(unittest.TestCase):
         for family_name in ORDINARY_REGION_FAMILIES:
             self.assertIn(f"`{family_name}`", prompt)
         self.assertIn("普通 family", prompt)
+
+    def test_build_strategy_system_prompt_mentions_delete_first_rule(self):
+        prompt = build_strategy_system_prompt()
+
+        self.assertIn("默认先做删减、合并、替换", prompt)
+        self.assertIn("不要继续叠分叉", prompt)
 
     def test_build_strategy_exploration_repair_prompt_mentions_blocked_cluster(self):
         prompt = build_strategy_exploration_repair_prompt(
@@ -1703,7 +1849,7 @@ class FreqtradeAdapterFixesTest(unittest.TestCase):
 
         self.assertIn("探索触发（必须执行）", summary)
         self.assertIn("impulse_persistence", summary)
-        self.assertIn("continuation_energy_decay", summary)
+        self.assertNotIn("continuation_energy_decay", summary)
 
     def test_journal_summary_emits_exploration_trigger_after_three_same_gate_rejections(self):
         entries = []
@@ -1745,7 +1891,7 @@ class FreqtradeAdapterFixesTest(unittest.TestCase):
 
         self.assertIn("探索触发（必须执行）", summary)
         self.assertIn("participation_cluster", summary)
-        self.assertIn("fourh_relay_ratio", summary)
+        self.assertNotIn("fourh_relay_ratio", summary)
 
     def test_journal_summary_prefers_final_decision_reason_over_gate_pass_marker(self):
         entries = [
@@ -2565,6 +2711,8 @@ class DiscordSummaryFormattingTest(unittest.TestCase):
 
         self.assertIn("数据范围", message)
         self.assertIn("本轮窗口", message)
+        self.assertIn("因子模式", message)
+        self.assertIn("默认模式", message)
         self.assertIn("train+val期间收益", message)
         self.assertIn("val期间收益", message)
         self.assertIn("Sharpe(train / val / test)", message)
@@ -2605,6 +2753,7 @@ class DiscordSummaryFormattingTest(unittest.TestCase):
             validation_window_count=1,
             test_window_count=1,
             data_range_text="train 2023-07-01~2024-12-31 / val 2025-01-01~2025-12-31 / test 2026-01-01~2026-03-31",
+            factor_change_mode="factor_admission",
             shadow_test_metrics={
                 "shadow_test_total_return_pct": 3.21,
                 "shadow_test_closed_trades": 9.0,
@@ -2620,6 +2769,7 @@ class DiscordSummaryFormattingTest(unittest.TestCase):
         self.assertIn("Sharpe(train / val / test)", message)
         self.assertIn("0.88 / 0.42 / 0.35", message)
         self.assertIn("7.40% / 0.60%", message)
+        self.assertIn("因子准入模式", message)
 
 
 class ChartRenderingTest(unittest.TestCase):

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import hashlib
 import json
 import re
+import symtable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -42,6 +44,7 @@ class StrategyCandidate:
 
 
 PARAM_BLOCK_PATTERN = re.compile(r"# PARAMS_START\s*\nPARAMS = (.*?)\n# PARAMS_END", re.DOTALL)
+FACTOR_CHANGE_MODES = frozenset({"default", "factor_admission"})
 
 # 参数硬性范围：防止参数漂移到无意义的区域
 # 格式: key -> (最小值, 最大值)
@@ -119,6 +122,52 @@ REQUIRED_FUNCTIONS: tuple[str, ...] = (
     "strategy",
 )
 REQUIRED_FUNCTION_SET = frozenset(REQUIRED_FUNCTIONS)
+COMPLEXITY_MONITORED_FUNCTIONS: tuple[str, ...] = (
+    "_is_sideways_regime",
+    "_trend_quality_ok",
+    "_trend_followthrough_ok",
+    "strategy",
+)
+COMPLEXITY_ABSOLUTE_BUDGETS: dict[str, dict[str, int]] = {
+    "_is_sideways_regime": {"lines": 90, "bool_ops": 32, "ifs": 14},
+    "_trend_quality_ok": {"lines": 90, "bool_ops": 32, "ifs": 14},
+    "_trend_followthrough_ok": {"lines": 90, "bool_ops": 36, "ifs": 12},
+    "strategy": {"lines": 360, "bool_ops": 180, "ifs": 12},
+}
+COMPLEXITY_DEFAULT_GROWTH_LIMITS: dict[str, int] = {
+    "lines": 40,
+    "bool_ops": 20,
+    "ifs": 4,
+}
+
+
+def normalize_factor_change_mode(mode: str | None) -> str:
+    normalized = str(mode or "default").strip().lower().replace("-", "_")
+    if normalized not in FACTOR_CHANGE_MODES:
+        raise StrategySourceError(
+            f"unsupported factor change mode: {mode}; expected one of {sorted(FACTOR_CHANGE_MODES)}"
+        )
+    return normalized
+
+
+def factor_change_mode_label(mode: str | None) -> str:
+    normalized = normalize_factor_change_mode(mode)
+    if normalized == "factor_admission":
+        return "因子准入模式"
+    return "默认模式"
+
+
+def factor_change_mode_prompt_hint(mode: str | None) -> str:
+    normalized = normalize_factor_change_mode(mode)
+    if normalized == "factor_admission":
+        return (
+            "当前因子模式：因子准入模式。仅当现有规则无法表达你的假设时，才允许新增少量参数或局部规则；"
+            "新增后必须同时删减旧复杂度，避免净复杂度继续膨胀。"
+        )
+    return (
+        "当前因子模式：默认模式。禁止新增 `PARAMS` 键、顶层常量名或顶层 helper 名；"
+        "只能在现有规则和现有因子上做删减、合并、收紧或放宽。"
+    )
 
 def load_strategy_source(path: Path) -> str:
     return path.read_text()
@@ -357,6 +406,255 @@ def _called_helper_names(node: ast.AST) -> set[str]:
     return names
 
 
+def _iter_target_names(target: ast.AST) -> list[str]:
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names: list[str] = []
+        for child in target.elts:
+            names.extend(_iter_target_names(child))
+        return names
+    if isinstance(target, ast.Starred):
+        return _iter_target_names(target.value)
+    return []
+
+
+def _module_defined_names(tree: ast.Module) -> set[str]:
+    names = set(dir(builtins))
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+            continue
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.asname or alias.name.split(".", 1)[0])
+            continue
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                names.add(alias.asname or alias.name)
+            continue
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                names.update(_iter_target_names(target))
+            continue
+        if isinstance(node, ast.AnnAssign):
+            names.update(_iter_target_names(node.target))
+            continue
+    return names
+
+
+def _top_level_function_names(tree: ast.Module) -> set[str]:
+    return {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+
+def _top_level_constant_names(tree: ast.Module) -> set[str]:
+    constants: set[str] = set()
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            for name in _iter_target_names(target):
+                if name.isupper() and name != "PARAMS":
+                    constants.add(name)
+    return constants
+
+
+def _function_complexity_metrics(node: ast.FunctionDef) -> dict[str, int]:
+    bool_ops = 0
+    ifs = 0
+    compares = 0
+    for child in ast.walk(node):
+        if isinstance(child, ast.BoolOp):
+            bool_ops += max(len(child.values) - 1, 1)
+        elif isinstance(child, ast.If):
+            ifs += 1
+        elif isinstance(child, ast.Compare):
+            compares += len(child.ops)
+    end_lineno = getattr(node, "end_lineno", node.lineno)
+    return {
+        "lines": end_lineno - node.lineno + 1,
+        "bool_ops": bool_ops,
+        "ifs": ifs,
+        "compares": compares,
+    }
+
+
+def build_strategy_complexity_snapshot(source: str) -> dict[str, dict[str, int]]:
+    tree = ast.parse(normalize_strategy_source(source))
+    snapshot: dict[str, dict[str, int]] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        if node.name not in COMPLEXITY_MONITORED_FUNCTIONS:
+            continue
+        snapshot[node.name] = _function_complexity_metrics(node)
+    return snapshot
+
+
+def build_strategy_complexity_delta(base_source: str, candidate_source: str) -> dict[str, object]:
+    base_snapshot = build_strategy_complexity_snapshot(base_source)
+    candidate_snapshot = build_strategy_complexity_snapshot(candidate_source)
+    functions: dict[str, dict[str, int]] = {}
+    flags: list[str] = []
+    summary_parts: list[str] = []
+
+    for function_name in COMPLEXITY_MONITORED_FUNCTIONS:
+        base_metrics = base_snapshot.get(function_name, {})
+        candidate_metrics = candidate_snapshot.get(function_name, {})
+        if not candidate_metrics:
+            continue
+        delta_metrics = {
+            "base_lines": int(base_metrics.get("lines", 0)),
+            "candidate_lines": int(candidate_metrics.get("lines", 0)),
+            "delta_lines": int(candidate_metrics.get("lines", 0) - base_metrics.get("lines", 0)),
+            "base_bool_ops": int(base_metrics.get("bool_ops", 0)),
+            "candidate_bool_ops": int(candidate_metrics.get("bool_ops", 0)),
+            "delta_bool_ops": int(candidate_metrics.get("bool_ops", 0) - base_metrics.get("bool_ops", 0)),
+            "base_ifs": int(base_metrics.get("ifs", 0)),
+            "candidate_ifs": int(candidate_metrics.get("ifs", 0)),
+            "delta_ifs": int(candidate_metrics.get("ifs", 0) - base_metrics.get("ifs", 0)),
+        }
+        functions[function_name] = delta_metrics
+        if (
+            delta_metrics["delta_lines"] > 0
+            or delta_metrics["delta_bool_ops"] > 0
+            or delta_metrics["delta_ifs"] > 0
+        ):
+            summary_parts.append(
+                f"{function_name}:L{delta_metrics['delta_lines']:+d}/B{delta_metrics['delta_bool_ops']:+d}/I{delta_metrics['delta_ifs']:+d}"
+            )
+        absolute_budget = COMPLEXITY_ABSOLUTE_BUDGETS.get(function_name, {})
+        for metric_name, limit in absolute_budget.items():
+            candidate_value = int(candidate_metrics.get(metric_name, 0))
+            if candidate_value > int(limit):
+                flags.append(f"{function_name}.{metric_name}>{limit}")
+
+    return {
+        "functions": functions,
+        "summary": " | ".join(summary_parts) if summary_parts else "complexity_flat",
+        "flags": tuple(flags),
+        "bloat_flag": bool(flags),
+    }
+
+
+def _validate_complexity_budget(
+    source: str,
+    *,
+    tree: ast.Module,
+    base_source: str | None,
+    factor_change_mode: str,
+) -> None:
+    node_map = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+    }
+
+    for function_name, limits in COMPLEXITY_ABSOLUTE_BUDGETS.items():
+        node = node_map.get(function_name)
+        if node is None:
+            continue
+        metrics = _function_complexity_metrics(node)
+        for metric_name, limit in limits.items():
+            value = int(metrics.get(metric_name, 0))
+            if value > int(limit):
+                raise StrategySourceError(
+                    f"complexity budget exceeded: {function_name}.{metric_name}={value} > {limit}"
+                )
+
+    if base_source is None or normalize_factor_change_mode(factor_change_mode) != "default":
+        return
+
+    complexity_delta = build_strategy_complexity_delta(base_source, source)
+    for function_name, metrics in complexity_delta["functions"].items():
+        if int(metrics["delta_lines"]) > COMPLEXITY_DEFAULT_GROWTH_LIMITS["lines"]:
+            raise StrategySourceError(
+                f"default mode complexity growth too large: {function_name}.lines +{metrics['delta_lines']}"
+            )
+        if int(metrics["delta_bool_ops"]) > COMPLEXITY_DEFAULT_GROWTH_LIMITS["bool_ops"]:
+            raise StrategySourceError(
+                f"default mode complexity growth too large: {function_name}.bool_ops +{metrics['delta_bool_ops']}"
+            )
+        if int(metrics["delta_ifs"]) > COMPLEXITY_DEFAULT_GROWTH_LIMITS["ifs"]:
+            raise StrategySourceError(
+                f"default mode complexity growth too large: {function_name}.ifs +{metrics['delta_ifs']}"
+            )
+
+
+def _undefined_function_reference_errors(source: str, tree: ast.Module) -> list[str]:
+    module_names = _module_defined_names(tree)
+    root_table = symtable.symtable(source, "strategy_candidate", "exec")
+    errors: list[str] = []
+
+    def _walk(table: symtable.SymbolTable, parents: tuple[str, ...]) -> None:
+        current_path = parents
+        if table.get_type() == "function":
+            current_path = parents + (table.get_name(),)
+            for symbol in table.get_symbols():
+                if not symbol.is_referenced():
+                    continue
+                if symbol.is_parameter() or symbol.is_local() or symbol.is_imported():
+                    continue
+                if symbol.is_free() or symbol.is_nonlocal():
+                    continue
+                name = symbol.get_name()
+                if name in module_names:
+                    continue
+                function_path = ".".join(current_path)
+                errors.append(
+                    f"function {function_path} references undefined name '{name}'"
+                )
+        for child in table.get_children():
+            _walk(child, current_path)
+
+    _walk(root_table, ())
+    return errors
+
+
+def _validate_factor_change_policy(
+    source: str,
+    *,
+    tree: ast.Module,
+    base_source: str | None,
+    factor_change_mode: str,
+) -> None:
+    if base_source is None:
+        return
+    normalized_mode = normalize_factor_change_mode(factor_change_mode)
+    if normalized_mode != "default":
+        return
+
+    base_tree = ast.parse(normalize_strategy_source(base_source))
+    base_params = extract_params(base_source)
+    candidate_params = extract_params(source)
+
+    new_param_keys = sorted(set(candidate_params) - set(base_params))
+    if new_param_keys:
+        raise StrategySourceError(
+            "factor mode default forbids new PARAMS keys: "
+            + ", ".join(new_param_keys[:8])
+        )
+
+    new_constant_names = sorted(_top_level_constant_names(tree) - _top_level_constant_names(base_tree))
+    if new_constant_names:
+        raise StrategySourceError(
+            "factor mode default forbids new top-level constants: "
+            + ", ".join(new_constant_names[:8])
+        )
+
+    new_function_names = sorted(_top_level_function_names(tree) - _top_level_function_names(base_tree))
+    if new_function_names:
+        raise StrategySourceError(
+            "factor mode default forbids new top-level helpers: "
+            + ", ".join(new_function_names[:8])
+        )
+
+
 def build_system_edit_signature(
     base_source: str,
     candidate_source: str,
@@ -427,13 +725,33 @@ def validate_editable_region_boundaries(
         )
 
 
-def validate_strategy_source(source: str) -> None:
+def validate_strategy_source(
+    source: str,
+    *,
+    base_source: str | None = None,
+    factor_change_mode: str = "default",
+) -> None:
     normalized = normalize_strategy_source(source)
     missing_functions = missing_required_functions(normalized)
     if missing_functions:
         raise StrategySourceError(f"missing required functions: {sorted(missing_functions)}")
 
     tree = ast.parse(normalized)
+    undefined_reference_errors = _undefined_function_reference_errors(normalized, tree)
+    if undefined_reference_errors:
+        raise StrategySourceError(undefined_reference_errors[0])
+    _validate_factor_change_policy(
+        normalized,
+        tree=tree,
+        base_source=base_source,
+        factor_change_mode=factor_change_mode,
+    )
+    _validate_complexity_budget(
+        normalized,
+        tree=tree,
+        base_source=base_source,
+        factor_change_mode=factor_change_mode,
+    )
 
     if not any(isinstance(node, ast.Assign) and any(getattr(target, "id", "") == "PARAMS" for target in node.targets) for node in tree.body):
         raise StrategySourceError("missing top-level PARAMS assignment")
