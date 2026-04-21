@@ -3183,6 +3183,11 @@ class CodexExecClientTest(unittest.TestCase):
 
 
 class ReferenceStateFixesTest(unittest.TestCase):
+    def test_model_client_config_disables_ephemeral_for_persistent_session(self):
+        config = research_script._model_client_config()
+
+        self.assertFalse(config.use_ephemeral)
+
     def test_reference_manifest_uses_baseline_role_when_no_champion(self):
         report = EvaluationReport(
             metrics={"promotion_score": 0.31, "quality_score": 0.22},

@@ -380,7 +380,12 @@ def reload_strategy_module() -> None:
 
 
 def _model_client_config():
-    return replace(load_strategy_client_config(), approval_policy="never", sandbox="danger-full-access")
+    return replace(
+        load_strategy_client_config(),
+        approval_policy="never",
+        sandbox="danger-full-access",
+        use_ephemeral=False,
+    )
 
 
 def _cluster_lock_schedule() -> tuple[int, int, int]:
