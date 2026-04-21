@@ -2424,6 +2424,38 @@ class FreqtradeAdapterFixesTest(unittest.TestCase):
         self.assertEqual(block["block_kind"], "invalid_generation")
         self.assertIn("真实代码改动", block["blocked_reason"])
         self.assertIn("完全相同", "；".join(block["invalid_reasons"]))
+        self.assertIn("先确定一个单一策略方向", block["feedback_note"])
+        self.assertIn("把这个方向直接落到 `src/strategy_macd_aggressive.py`", block["feedback_note"])
+        self.assertIn("JSON 只描述你已经实际落到代码里的改动", block["feedback_note"])
+
+    def test_store_research_session_metadata_no_longer_persists_invalid_generation_streak(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            temp_paths = replace(
+                research_script.RUNTIME.paths,
+                session_state_file=temp_root / "state/session.json",
+            )
+            temp_runtime = replace(research_script.RUNTIME, paths=temp_paths)
+
+            with mock.patch.object(research_script, "RUNTIME", temp_runtime), mock.patch.object(
+                research_script, "best_source", "def strategy(*args, **kwargs):\n    return None\n"
+            ), mock.patch.object(
+                research_script, "best_report", object()
+            ), mock.patch.object(
+                research_script, "champion_report", None
+            ), mock.patch.object(
+                research_script, "reference_stage_started_at", "2026-04-21T00:00:00+00:00"
+            ), mock.patch.object(
+                research_script, "reference_stage_iteration", 7
+            ):
+                research_script._store_research_session_metadata(
+                    session_id="session-123",
+                    workspace_root=temp_root / "workspace",
+                )
+
+            payload = json.loads(temp_paths.session_state_file.read_text())
+            self.assertEqual(payload["session_id"], "session-123")
+            self.assertNotIn("invalid_generation_streak", payload)
 
     def test_journal_summary_limits_recent_rows_and_meta_lines_to_requested_limit(self):
         entries = []

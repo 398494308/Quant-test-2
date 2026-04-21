@@ -105,7 +105,6 @@ SCORE_REGIME = "trend_capture_v6"
 MODEL_WORKSPACE_STRATEGY_PATH = Path("src/strategy_macd_aggressive.py")
 FACTOR_ADMISSION_TRIGGER_STALLS = 3
 FACTOR_ADMISSION_MAX_BURST = 2
-INVALID_GENERATION_SESSION_RESET_STREAK = 2
 
 best_source = ""
 best_report: EvaluationReport | None = None
@@ -278,40 +277,7 @@ def _store_research_session_metadata(
         "workspace_root": str(workspace_root),
         "created_at": str(previous.get("created_at", "")).strip() or now,
         "updated_at": now,
-        "invalid_generation_streak": int(previous.get("invalid_generation_streak", 0) or 0),
     }
-    _persist_research_session_state(payload)
-
-
-def _session_invalid_generation_streak() -> int:
-    state = _load_research_session_state()
-    if not _session_state_matches_current_stage(state):
-        return 0
-    try:
-        return max(0, int(state.get("invalid_generation_streak", 0) or 0))
-    except (TypeError, ValueError):
-        return 0
-
-
-def _set_session_invalid_generation_streak(value: int) -> None:
-    normalized = max(0, int(value))
-    previous = _load_research_session_state()
-    if not _session_state_matches_current_stage(previous):
-        previous = {}
-    if not previous and normalized <= 0:
-        return
-
-    now = datetime.now(UTC).isoformat()
-    payload = {
-        **_session_scope_payload(),
-        "session_id": str(previous.get("session_id", "")).strip(),
-        "workspace_root": str(previous.get("workspace_root", "")).strip(),
-        "created_at": str(previous.get("created_at", "")).strip() or now,
-        "updated_at": now,
-        "invalid_generation_streak": normalized,
-    }
-    if not payload["session_id"] and not payload["workspace_root"] and normalized <= 0:
-        return
     _persist_research_session_state(payload)
 
 
@@ -1361,6 +1327,8 @@ def _candidate_invalid_generation_block_info(
     )
     feedback_lines = [
         "候选无效：本轮没有形成真实代码改动。",
+        "- 你的任务只有两步：先确定一个单一策略方向，再把这个方向直接落到 `src/strategy_macd_aggressive.py`。",
+        "- 先做策略判断，再落代码；不要把“解释为什么没改”当成提交结果。",
         f"- 系统检测改动区域: {', '.join(actual_changed_regions) or '-'}",
         f"- 候选声明改动区域: {', '.join(declared_regions) or '-'}",
         f"- diff 摘要条数: {len(diff_summary)}",
@@ -1368,7 +1336,7 @@ def _candidate_invalid_generation_block_info(
         "- `wiki/failure_wiki.md` / `wiki/latest_history_package.md` 是高优先级参考，但读不到它们不是合法 no-edit 理由。",
         "- 即使辅助记忆文件暂不可用，也必须继续以 `src/strategy_macd_aggressive.py` 为事实源直接改代码。",
         "- 禁止继续提交 `blocked` / `no_edit` / `no_change` / “未执行代码改动” 这类占位答案。",
-        "- 下一版必须先形成真实 diff，并让系统检测到至少一个可编辑区域发生变化。",
+        "- 下一版提交前自检：至少一个可编辑区域真的发生变化，且 JSON 只描述你已经实际落到代码里的改动。",
     ]
     if blocked_tags:
         feedback_lines.append(f"- 当前候选使用了占位标签: {', '.join(blocked_tags)}")
@@ -2428,30 +2396,6 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
             base_source=best_source,
         )
         if invalid_generation_block is not None:
-            invalid_generation_streak = _session_invalid_generation_streak() + 1
-            _set_session_invalid_generation_streak(invalid_generation_streak)
-
-            session_reset_applied = False
-            if (
-                invalid_generation_streak >= INVALID_GENERATION_SESSION_RESET_STREAK
-                and _active_research_session_id()
-            ):
-                _clear_research_session_state(
-                    remove_workspace=True,
-                    reason="consecutive invalid no-edit candidates",
-                )
-                _set_session_invalid_generation_streak(0)
-                session_reset_applied = True
-                workspace_root = _prepare_agent_workspace(
-                    base_source=best_source,
-                    factor_change_mode=current_factor_change_mode,
-                    reset_strategy=True,
-                )
-                invalid_generation_block["feedback_note"] = (
-                    f"{invalid_generation_block['feedback_note']}\n"
-                    "- 系统已重置被污染的持久 session；请不要继续沿用上一版“读不到所以不改”的叙事。"
-                )
-
             if exploration_regeneration_attempt >= RUNTIME.max_exploration_regen_attempts:
                 _record_generation_invalid(
                     iteration_id=iteration_id,
@@ -2473,7 +2417,6 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
                     message=f"iteration {iteration_id} generation invalid",
                     block_kind=invalid_generation_block["block_kind"],
                     blocked_cluster=invalid_generation_block["blocked_cluster"],
-                    session_reset_applied=session_reset_applied,
                 )
                 return "generation_invalid"
 
@@ -2484,7 +2427,6 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
                 max_regeneration_attempts=RUNTIME.max_exploration_regen_attempts,
                 block_kind=invalid_generation_block["block_kind"],
                 blocked_cluster=invalid_generation_block["blocked_cluster"],
-                session_reset_applied=session_reset_applied,
             )
             exploration_regeneration_attempt += 1
             candidate = _regenerate_model_candidate(
@@ -2497,7 +2439,6 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
             )
             continue
 
-        _set_session_invalid_generation_streak(0)
         candidate_hash = source_hash(candidate.strategy_code)
 
         if candidate_hash == source_hash(best_source):

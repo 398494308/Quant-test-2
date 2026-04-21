@@ -143,7 +143,7 @@ test 验收：
 - 如果候选在 smoke 窗口上的行为完全不变，系统会在同一轮回灌 smoke 摘要并强制重生
 - 如果候选在源码校验阶段就因为复杂度预算或复杂度增量超限被拒，系统也会先做同轮 repair；仍修不动才把这轮记进 journal 和记忆包
 - 如果候选根本没有真实 diff，系统会先记为 `generation_invalid` 技术退回，并在同轮强制重生
-- 同一个持久 session 若连续两次交回这类“无真实改动”候选，会自动清掉旧 session 和 workspace，再重建一套干净上下文
+- 遇到这类 `generation_invalid` 时，系统会留在同一个 session 里继续重生，并把下一版任务压成“先确定单一策略方向，再把这个方向直接落到代码里”
 - ordinary family 不再有硬数量下限；`strategy-only / PARAMS-only` 现在允许进入后续流程，是否算有效探索改由真实 diff、smoke/noop、结果盆地重复和复杂度预算共同决定
 - `behavioral_noop` 回灌现在会明确指出候选真实改动区域、普通 family、目标侧，以及当前该优先看的外层 choke point：`long_outer_context_ok / long_final_veto_clear / short_outer_context_ok / short_final_veto_clear`
 - prompt 里的可编辑区域已切到真实存在的命名规则块，能直接改 `sideways / flow / trend_quality / followthrough / long_entry / short_entry / strategy`

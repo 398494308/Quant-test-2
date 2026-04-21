@@ -54,7 +54,7 @@
 15. 刷新 `champion` 之后，研究器会清掉旧 session / workspace 上下文，并为下一个 stage 准备新 session。
 16. 刷新 `champion` 之后，才会额外跑一次隐藏 `test`；它只做验收，不参与 `champion` 选择，也不会喂给模型。
 17. 每轮结果都会写进 journal，包含 `accepted / rejected / duplicate_skipped / behavioral_noop / exploration_blocked / early_rejected / runtime_failed / generation_invalid`。
-18. 如果同一个持久 session 连续两次交回“无真实改动”的技术空转候选，研究器会自动清掉该 session 和 workspace，再重建一套干净上下文继续跑。
+18. 如果候选交回了完整 JSON 但没有真实代码改动，研究器不会刷新 session；它会留在同一个 session 里继续重生，并把下一版任务压缩成“先确定单一策略方向，再把这个方向落到代码里”。
 
 ## 当前评分口径
 
