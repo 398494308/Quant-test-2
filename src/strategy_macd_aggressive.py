@@ -801,17 +801,17 @@ def _trend_followthrough_long(market_state, trigger_price, current_close):
         confirms += 1
 
     stale_chase = (
-        breakout_distance_pct >= atr_ratio * 0.18
-        and hourly_fast_extension >= max(atr_ratio * 0.88, SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 2.00)
-        and hourly_anchor_extension >= max(atr_ratio * 1.34, SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 3.12)
+        breakout_distance_pct >= atr_ratio * 0.14
+        and hourly_fast_extension >= max(atr_ratio * 0.82, SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 1.90)
+        and hourly_anchor_extension >= max(atr_ratio * 1.24, SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 2.98)
         and (
-            metrics["fourh_spread"] < max(metrics["hourly_spread"] * 0.86, atr_ratio * 1.00)
-            or metrics["fourh_slope"] < atr_ratio * 0.040
+            metrics["fourh_spread"] < max(metrics["hourly_spread"] * 0.90, atr_ratio * 0.92)
+            or metrics["fourh_slope"] < atr_ratio * 0.036
         )
     )
     if stale_chase:
         return False
-    return confirms >= (5 if breakout_distance_pct >= atr_ratio * 0.16 else 4)
+    return confirms >= (5 if breakout_distance_pct >= atr_ratio * 0.12 else 4)
 
 
 def _trend_followthrough_short(market_state, trigger_price, current_close):

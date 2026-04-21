@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""研究器 v2 的 prompt 与 schema。"""
+"""研究器 v2 的 prompt 与返回格式。"""
 from __future__ import annotations
 
 from typing import Any
@@ -102,7 +102,31 @@ def _bootstrap_journal_excerpt(journal_summary: str, *, max_lines: int = 28, max
     return "\n".join(lines).strip()
 
 
-# ==================== 结构化输出 ====================
+# ==================== 返回格式 ====================
+
+
+def build_candidate_response_format_instructions() -> str:
+    return """- 只返回一个纯文本候选摘要，不要 JSON，不要 markdown，不要贴源码。
+- 按以下字段顺序逐行输出，字段名保持英文小写并使用英文冒号：
+  candidate_id:
+  hypothesis:
+  change_plan:
+  change_tags:
+  expected_effects:
+  closest_failed_cluster:
+  novelty_proof:
+  core_factors:
+- `change_tags` 用逗号分隔短 ASCII 标签。
+- `expected_effects` 用 `||` 分隔 1-5 条预期影响。
+- `core_factors` 没有就写 `none`；有则写成 `name | thesis | current_signal || ...`。
+- 不要输出 `edited_regions`；系统会按真实 diff、可编辑区域边界和源码签名自动判定改动区域。"""
+
+
+def build_edit_completion_instructions() -> str:
+    return """- 本阶段唯一完成条件：直接修改 `src/strategy_macd_aggressive.py`。
+- 调用结束时该文件必须与当前基底不同；若文件 hash 未变化，本次回复会被主进程直接丢弃。
+- 完成编辑后只回复 `EDIT_DONE`。
+- 不要输出 hypothesis、change_plan、JSON、markdown 或源码；这些会在落码成功后由下一阶段单独收集。"""
 
 
 def build_candidate_response_schema() -> dict[str, Any]:
@@ -177,16 +201,20 @@ def build_strategy_agents_instructions(*, factor_change_mode: str = "default") -
 
 持久 session 规则：
 - 这是一个跨多轮复用的研究 session。不要假设主进程会每轮重复灌完整历史；你需要主动利用本地只读记忆文件。
-- 每轮开始优先读 `wiki/failure_wiki.md` 的概览；新 session 首轮优先再读 `wiki/latest_history_package.md` 的摘要段。
-- 形成单一因果假设后，必须回看一次 `wiki/failure_wiki.md`；若命中相同或高度相似的失败 cut，应在本轮内改写假设，不要硬提交旧方向。
+- 每轮开始优先快速扫一遍 `wiki/duplicate_watchlist.md`；它只列最近最容易重复提交的少量源码指纹。
+- 再读 `wiki/failure_wiki.md` 的概览；新 session 首轮优先再读 `wiki/latest_history_package.md` 的摘要段。
+- 形成单一因果假设后，必须回看一次 `wiki/failure_wiki.md`；若命中相同或高度相似的失败 cut，优先在本轮内改写假设，不要无意义重走旧方向。
 - `memory/raw/rounds/` 与 `memory/raw/full_history.jsonl` 保留未压缩原始历史；需要深挖时去看，但优先先读 wiki 摘要与失败聚合。
 - 若 `wiki/` 或 `memory/` 里的辅助记忆暂时不可用，这不是本轮 `no_edit` 的合法理由；此时应退化为直接读取并修改 `src/strategy_macd_aggressive.py`。
 
 工作区文件职责：
 - `src/strategy_macd_aggressive.py`：唯一允许修改的策略文件。
 - `src/backtest_macd_aggressive.py`：回测、成交路径与指标口径定义，只读参考。
+- `wiki/duplicate_watchlist.md`：最近高频重复源码黑名单摘要；先扫它，避免把同一份补丁再交一次。
 - `wiki/failure_wiki.md`：当前评分口径下的失败 wiki；先看它，避免重走已知坏 cut。
 - `wiki/latest_history_package.md`：当前 stage 历史摘要包；先看前部执行摘要与失败核，再决定是否下钻表格。
+- `wiki/last_rejected_snapshot.md`：最近一次被系统判错的候选摘要、失败原因与 diff 提示；重生轮优先看它。
+- `wiki/last_rejected_candidate.py`：最近一次被系统判错的完整候选代码，只读反例参考；不要把它当成本轮改动基底。
 - `memory/`：研究记忆归档，只读参考；其中 `raw/` 保留原始历史，`summaries/` 保留压缩摘要。
 - `data/`：OKX K 线 / funding / 成交流量代理等数据，只读参考。
 
@@ -204,13 +232,15 @@ def build_strategy_agents_instructions(*, factor_change_mode: str = "default") -
 {complexity_budget_text}
 
 输出与协作规则：
-- 只输出 JSON，不要解释，不要 markdown，不要贴源码。
+- 返回格式使用纯文本字段摘要，不要 JSON，不要解释，不要 markdown，不要贴源码。
 - 主进程会直接读取你改好的 `src/strategy_macd_aggressive.py`。
 - 除 `candidate_id` 与 `change_tags` 外，其余说明字段必须使用简体中文。
 - 不允许把 `blocked` / `no_edit` / `no_change` / `sandbox_blocked` / “未执行代码改动” 这类占位说明当成合法提交结果。
 
 编辑边界：
 - 只允许改这些区域：{", ".join(EDITABLE_REGIONS)}。
+- 你不需要再自报 `edited_regions`；系统会根据真实 diff 自动归类 region / family，并据此做重复探索与边界校验。
+- 边界判定只看两件事：是否真的改到了 `src/strategy_macd_aggressive.py` 的可编辑区域，以及是否越界；说明文本只用于帮助主进程理解你的意图。
 - 必须保留这些符号，不允许删除、改名或合并回旧结构：{_required_symbol_text()}。
 - `strategy()` 与 `PARAMS` 属于特殊区域；除它们外，普通 family 为 {_ordinary_family_text()}。
 - 不要引入网络、文件写入、随机数、外部依赖，也不要做无关重构、批量改名或大面积格式化。
@@ -225,7 +255,7 @@ def build_strategy_system_prompt(*, factor_change_mode: str = "default") -> str:
 - {factor_change_mode_prompt_hint(factor_change_mode)}
 
 你在一个持久研究 session 中工作；当前用户提示只补充本轮目标、诊断和失败反馈。
-只返回符合 schema 的 JSON，不要输出 markdown、解释或源码。
+只返回约定字段的纯文本候选摘要，不要输出 JSON、markdown、解释或源码。
 除非当前提示明确允许，否则不要创建、修改或删除 `src/strategy_macd_aggressive.py` 之外的文件。
 若辅助记忆文件暂时不可用，也必须继续基于当前 `src/strategy_macd_aggressive.py` 做真实改动；禁止把“未读到文件”当成合法终止条件。
 """
@@ -280,6 +310,7 @@ def build_strategy_research_prompt(
     session_mode: str = "resume",
     history_package_path: str = "wiki/latest_history_package.md",
     failure_wiki_path: str = "wiki/failure_wiki.md",
+    duplicate_watchlist_path: str = "wiki/duplicate_watchlist.md",
 ) -> str:
     side_bias_guidance = _side_bias_guidance(reference_metrics)
     side_bias_block = f"\n{side_bias_guidance}\n" if side_bias_guidance else ""
@@ -307,6 +338,7 @@ def build_strategy_research_prompt(
 当前 champion 参考晋级分：{previous_best_score:.2f}
 {side_bias_block}
 本轮本地只读记忆文件：
+- 重复黑名单：`{duplicate_watchlist_path}`
 - 失败 wiki：`{failure_wiki_path}`
 - 历史摘要包：`{history_package_path}`
 - 完整原始历史：`memory/raw/rounds/` 与 `memory/raw/full_history.jsonl`
@@ -315,10 +347,11 @@ def build_strategy_research_prompt(
 本轮阅读顺序（必须执行）：
 1. 先看“刷新条件与本轮目标”，确认本轮不是为了造 diff，而是为了改变真实交易路径。
 2. 再看“当前诊断”，先定位当前 gate 主失败项、弱侧和 val 漏斗堵点。
-3. 再看 `{failure_wiki_path}` 与 `{history_package_path}` 的前部摘要；相同失败核或 exact cut 只算一个已知坏盆地，不要逐条重读。若这些辅助文件暂不可用，直接改为核对当前源码继续改，不要停在 no-edit。
-4. 基于上面三步只提出一个单一因果假设，并明确它预计会新增、删除或迁移哪类真实交易。
-5. 形成假设后，必须回看一次 `{failure_wiki_path}` 做自检；若命中相同或高度相似的失败 cut，先在本轮内改写假设再提交。
-6. 若仍落在同方向簇或同 ordinary family，必须证明这次改的是不同 choke point、不同最终放行链，或不同的真实交易路径层级；`strategy-only` 也可以，但必须说清它改变了哪一层最终路由。
+3. 快速扫一遍 `{duplicate_watchlist_path}`；如果你的假设与其中某条在 cluster / changed_regions / target 上高度相似，先改写，不要再交同一份补丁。
+4. 再看 `{failure_wiki_path}` 与 `{history_package_path}` 的前部摘要；相同失败核或 exact cut 只算一个已知坏盆地，不要逐条重读。若这些辅助文件暂不可用，直接改为核对当前源码继续改，不要停在 no-edit。
+5. 基于上面四步只提出一个单一因果假设，并明确它预计会新增、删除或迁移哪类真实交易。
+6. 形成假设后，必须回看一次 `{duplicate_watchlist_path}` 与 `{failure_wiki_path}` 做自检；若命中相同或高度相似的重复补丁/失败 cut，优先在本轮内改写假设再提交。
+7. 若仍落在同方向簇或同 ordinary family，必须证明这次改的是不同 choke point、不同最终放行链，或不同的真实交易路径层级；`strategy-only` 也可以，但必须说清它改变了哪一层最终路由。
 
 当前因子模式：{factor_change_mode_label(factor_change_mode)}
 
@@ -334,7 +367,7 @@ def build_strategy_research_prompt(
 - 默认模式下有复杂度预算：如果你想加一条新条件，必须同步删掉或合并旧条件，避免 `strategy()` 和关键 helper 再次膨胀。
 - 若 headroom 显示某 family 的 `bool_ops` 已经剩余 `0`，或 `lines` 剩余不超过 `8`，默认把它视为饱和区；除非本轮 `change_plan` 明确先删旧条件，否则不要再把主改动落到该 family。
 - 若你的主要假设是最终路由或最终 veto 错配，允许只改 `strategy()` 或少量结构化 helper；但必须在 `change_plan` 里写清楚它会新增、删除或迁移哪类真实交易。
-- 读不到 `{failure_wiki_path}` 或 `{history_package_path}` 不是合法 no-edit 理由；当前源码仍是硬事实源，必须继续改代码。
+- 读不到 `{duplicate_watchlist_path}`、`{failure_wiki_path}` 或 `{history_package_path}` 不是合法 no-edit 理由；当前源码仍是硬事实源，必须继续改代码。
 {complexity_headroom_block}
 
 当前口径的 gate / 评分提醒：
@@ -346,13 +379,75 @@ def build_strategy_research_prompt(
 - 手续费拖累 <= 8%
 - train+val 严重集中度过拟合会直接淘汰
 
+本轮硬完成条件：
+{build_edit_completion_instructions()}
+- 不允许把“未执行代码改动”“blocked”“no_edit”“no_change”这类占位回复当成完成。
+- 如果辅助记忆缺失，就直接基于当前源码做单假设改动，不要停在解释阶段。
+"""
+
+
+def build_strategy_no_edit_repair_prompt(
+    *,
+    no_edit_attempt: int,
+    error_message: str,
+    last_response_text: str = "",
+) -> str:
+    last_response_excerpt = " ".join(str(last_response_text or "").split())
+    if len(last_response_excerpt) > 280:
+        last_response_excerpt = last_response_excerpt[:280] + "..."
+    last_response_block = (
+        f"\n你上一条回复摘录（已被丢弃，仅供你自查）:\n{last_response_excerpt}\n"
+        if last_response_excerpt
+        else "\n"
+    )
+    return f"""你上一条回复已被主进程直接丢弃。
+
+这是第 {no_edit_attempt} 次 no-edit 修复，不是新一轮研究。
+
+硬失败原因：
+- `src/strategy_macd_aggressive.py` 的文件 hash 与调用前完全相同。
+- 这说明你刚才没有把改动真正落到源码。
+- 解释、计划、标签、JSON 或摘要都不能算完成；只有文件本身发生真实变化才算完成。
+{last_response_block}
+当前要求：
+- 继续在同一个持久 session 内工作。
+- 现在只做一件事：直接修改 `src/strategy_macd_aggressive.py`。
+- 调用结束时该文件必须与当前基底不同。
+- 完成后只回复 `EDIT_DONE`。
+- 不要输出 JSON、markdown、解释、计划或源码。
+- 如果这次仍然没有真实源码改动，本轮会直接失败；连续多轮失败会自动停掉研究器。
+
+当前 no-edit 错误：
+{error_message}
+"""
+
+
+def build_strategy_candidate_summary_prompt(
+    *,
+    diff_summary: list[str],
+    changed_regions: tuple[str, ...],
+) -> str:
+    diff_text = "\n".join(f"- {line}" for line in diff_summary[:12]) or "- 无摘要"
+    changed_regions_text = ", ".join(changed_regions) if changed_regions else "-"
+    return f"""代码修改已完成。现在进入摘要阶段。
+
+注意：
+- 不要再修改任何文件。
+- 不要继续编辑 `src/strategy_macd_aggressive.py`；主进程现在只需要你总结已经落地的改动。
+- 如果你发现代码与原计划不一致，也不要继续改代码，直接按当前实际代码总结。
+
+系统检测到的真实改动区域：
+- {changed_regions_text}
+
+当前 diff 摘要：
+{diff_text}
+
 输出要求：
-- 只输出 JSON。
-- `change_plan` 与 `novelty_proof` 必须明确写出预计会新增、删除或移动哪类实际交易，不要只写“提高确认质量”。
-- `change_tags` 用简短 ASCII 标签；`candidate_id` 也保持 ASCII。
-- `closest_failed_cluster` 必须填写最接近的最近失败方向簇；若确实是新方向，也要写出最接近的旧簇名。
-- `core_factors` 字段必须输出；它只用于描述本轮复用或删减的现有决策因子，不是新增因子的申请通道。没有就输出空数组 `[]`。
-- 禁止输出“未执行代码改动”“blocked”“no_edit”“no_change”这类占位提交；如果辅助记忆缺失，就直接基于当前源码做单假设改动。
+{build_candidate_response_format_instructions()}
+- 只描述当前已经落到代码里的改动，不要描述“本来想改但没改成”的内容。
+- `change_plan` 与 `novelty_proof` 必须明确写出已经新增、删除或迁移了哪类实际交易。
+- `closest_failed_cluster` 必须写最接近的旧失败方向簇。
+- `core_factors` 没有就输出 `none`。
 """
 
 
@@ -387,7 +482,7 @@ def build_strategy_runtime_repair_prompt(
 - 这是同一个持久 session；若先前上下文丢失，以本提示、`AGENTS.md`、`wiki/failure_wiki.md` 和当前源码为准
 - 当前工作区里的 `src/strategy_macd_aggressive.py` 已经是刚才失败的候选版本
 - 你必须直接在该文件上原地修复
-- 不要把源码贴回 JSON；主进程会直接读取你改好的文件
+- 不要把源码贴回回复文本；主进程会直接读取你改好的文件
 - 除 `src/strategy_macd_aggressive.py` 外，不要创建、修改或删除其他文件
 - 即使辅助记忆文件暂不可用，也必须继续基于当前源码修复，不允许返回 no-edit 占位结果
 
@@ -409,7 +504,7 @@ def build_strategy_runtime_repair_prompt(
 - 修复后的代码仍必须保持简洁、结构化、可读，避免补丁式堆条件。
 
 输出要求：
-- 仍然只输出 JSON。
+- 返回格式仍然使用同一组纯文本字段，不要 JSON。
 - `novelty_proof` 可以在原说明基础上补一句“本次修复仅修正运行错误，不改变主假设”。
 """
 
@@ -456,9 +551,12 @@ def build_strategy_exploration_repair_prompt(
 
 工作区说明：
 - 这是同一个持久 session；若先前上下文丢失，以本提示、`AGENTS.md`、`wiki/failure_wiki.md` 和当前源码为准
-- 当前工作区里的 `src/strategy_macd_aggressive.py` 仍然是刚才被系统拒收的候选版本
-- 你必须直接在该文件上继续修改，产出一个新的候选方向
-- 不要把源码贴回 JSON；主进程会直接读取你改好的文件
+- 主进程已把工作区里的 `src/strategy_macd_aggressive.py` 重置为当前正确基底（当前主参考），避免你在已知坏版本上继续叠改
+- 刚才被系统拒收的候选版本只作为反例参考，不再是这次改动的基底
+- `wiki/duplicate_watchlist.md` 只列最近最容易重复提交的少量源码指纹；提交前先快速核对，避免把同一份补丁再交一次
+- `wiki/last_rejected_snapshot.md` 记录了上一版为什么被判错；`wiki/last_rejected_candidate.py` 保留了上一版完整代码，都是只读参考
+- 你必须从当前正确基底重新修改该文件，产出一个新的候选方向
+- 不要把源码贴回回复文本；主进程会直接读取你改好的文件
 - 除 `src/strategy_macd_aggressive.py` 外，不要创建、修改或删除其他文件
 - 不允许把“未读到 wiki/history”“环境阻塞”“no_edit”“未执行代码改动”当成合法重生结果；必须继续改出真实 diff
 
@@ -471,7 +569,9 @@ def build_strategy_exploration_repair_prompt(
 - 若上一版是 `behavioral_noop`，不要沿用原 hypothesis / change_plan 只换表述；应默认把那条局部路径假设视为已被证伪，并改成新的可触达交易路径。
 - 重生后的候选必须预计改变 smoke 窗口实际交易路径；如果上一版只是 helper / followthrough 变化但没有触发新交易，优先改 `strategy()` 的最终入场路径。
 - 如果附加反馈显示 smoke 窗口的交易数、收益和信号统计完全没变，默认说明你上一版改动没有触达真实交易路径；这次必须优先改能改变最终信号集合或退出集合的规则块，而不是继续只拨不会触发的细阈值。
-- 在提交重生版之前，回看一次 `wiki/failure_wiki.md`；如果你这次仍命中相同或高度相似的失败 cut，必须继续改写，不要原样交回。
+- 若你认为上一版里某个局部思路仍有价值，必须在当前正确基底上重新实现；不要默认沿用上一版残留代码。
+- 在动手前先快速核对 `wiki/last_rejected_snapshot.md`，必要时再看 `wiki/last_rejected_candidate.py`；目标是理解“上一版为什么错”，不是继续在错题代码上补丁。
+- 在提交重生版之前，先快速核对 `wiki/duplicate_watchlist.md`，再回看一次 `wiki/failure_wiki.md`；如果你这次仍命中相同或高度相似的重复补丁/失败 cut，优先继续改写，不要无意义原样交回。
 - 对长侧优先检查 `long_outer_context_ok` 与 `long_final_veto_clear`；对空侧优先检查 `short_outer_context_ok` 与 `short_final_veto_clear`。若这些总闸门不动，新增 path 很可能仍是死分支。
 - 不要把“新增一个 `xxx_path_ok`”误当成一定会新增交易；只有它真正穿过最终 veto / followthrough，smoke 行为才会改变。
 - 若附加反馈显示 `outer_context` 或 `final_veto` 是主要堵点，允许直接做结构性删减轮：`remove_dead_gate`、`merge_veto`、`widen_outer_context`。
@@ -481,6 +581,6 @@ def build_strategy_exploration_repair_prompt(
 - 代码仍必须保持简洁、结构化、可读。
 
 输出要求：
-- 仍然只输出 JSON。
+- 返回格式仍然使用同一组纯文本字段，不要 JSON。
 - `novelty_proof` 必须明确说明这次相对刚才被拒方向，具体换了哪一个方向簇/普通 family/long-short target/核心因子家族。
 """

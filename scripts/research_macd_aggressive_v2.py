@@ -14,6 +14,7 @@ import importlib
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import time
@@ -33,8 +34,7 @@ import strategy_macd_aggressive as strategy_module
 from codex_exec_client import (
     StrategyGenerationSessionError,
     StrategyGenerationTransientError,
-    build_json_text_format,
-    generate_json_object,
+    generate_text_response,
     load_strategy_client_config,
 )
 from research_v2.config import ResearchRuntimeConfig, load_research_runtime_config
@@ -65,9 +65,10 @@ from research_v2.journal import (
 from research_v2.notifications import build_discord_summary_message, load_discord_config, send_discord_message
 from research_v2.prompting import (
     EDITABLE_REGIONS,
-    build_candidate_response_schema,
     build_strategy_agents_instructions,
+    build_strategy_candidate_summary_prompt,
     build_strategy_exploration_repair_prompt,
+    build_strategy_no_edit_repair_prompt,
     build_strategy_research_prompt,
     build_strategy_runtime_repair_prompt,
     build_strategy_system_prompt,
@@ -78,6 +79,7 @@ from research_v2.strategy_code import (
     StrategyCoreFactor,
     StrategySourceError,
     build_diff_summary,
+    build_system_edit_signature,
     build_strategy_complexity_delta,
     format_strategy_complexity_headroom,
     load_strategy_source,
@@ -356,18 +358,87 @@ def _prepare_agent_workspace(
     _ensure_workspace_link(workspace_root / "memory", RUNTIME.paths.memory_dir)
     memory_paths = {
         "history_package": RUNTIME.paths.memory_dir / "prompt/latest_history_package.md",
+        "duplicate_watchlist": RUNTIME.paths.memory_dir / "wiki/duplicate_watchlist.md",
         "failure_wiki_md": RUNTIME.paths.memory_dir / "wiki/failure_wiki.md",
         "failure_wiki_json": RUNTIME.paths.memory_dir / "wiki/failure_wiki_index.json",
+        "last_rejected_candidate": RUNTIME.paths.memory_dir / "wiki/last_rejected_candidate.py",
+        "last_rejected_snapshot": RUNTIME.paths.memory_dir / "wiki/last_rejected_snapshot.md",
     }
     for key, target_path in memory_paths.items():
         if target_path.exists():
             link_name = {
                 "history_package": workspace_root / "wiki/latest_history_package.md",
+                "duplicate_watchlist": workspace_root / "wiki/duplicate_watchlist.md",
                 "failure_wiki_md": workspace_root / "wiki/failure_wiki.md",
                 "failure_wiki_json": workspace_root / "wiki/failure_wiki_index.json",
+                "last_rejected_candidate": workspace_root / "wiki/last_rejected_candidate.py",
+                "last_rejected_snapshot": workspace_root / "wiki/last_rejected_snapshot.md",
             }[key]
             _ensure_workspace_link(link_name, target_path)
     return workspace_root
+
+
+def _workspace_strategy_path(workspace_root: Path) -> Path:
+    return workspace_root / MODEL_WORKSPACE_STRATEGY_PATH
+
+
+def _rebase_workspace_strategy_to_base(*, workspace_root: Path, base_source: str) -> None:
+    # 同轮重生必须回到当前正确基底，避免在已知坏版本上继续叠改。
+    write_strategy_source(_workspace_strategy_path(workspace_root), base_source)
+
+
+def _persist_last_rejected_candidate_snapshot(
+    *,
+    memory_root: Path,
+    base_source: str,
+    failed_candidate: StrategyCandidate,
+    block_info: dict[str, Any],
+) -> None:
+    wiki_root = memory_root / "wiki"
+    wiki_root.mkdir(parents=True, exist_ok=True)
+
+    candidate_path = wiki_root / "last_rejected_candidate.py"
+    snapshot_path = wiki_root / "last_rejected_snapshot.md"
+    candidate_path.write_text(normalize_strategy_source(failed_candidate.strategy_code))
+
+    diff_summary = build_diff_summary(base_source, failed_candidate.strategy_code, limit=20)
+    diff_lines = "\n".join(f"- {line}" for line in diff_summary) if diff_summary else "- 无有效 diff 摘要"
+    expected_effects = (
+        "\n".join(f"- {item}" for item in failed_candidate.expected_effects)
+        if failed_candidate.expected_effects
+        else "- 无"
+    )
+    snapshot_path.write_text(
+        "\n".join(
+            [
+                "# Last Rejected Candidate Snapshot",
+                "",
+                "说明：",
+                "- 这个快照只用于参考刚被系统拒收的代码与失败原因。",
+                "- 新一轮同轮重生必须以当前正确基底为起点，不要直接在这版错误代码上继续叠改。",
+                "- 如果上一版里有局部思路仍然值得保留，必须在正确基底上重新实现。",
+                "",
+                f"- candidate_id: {failed_candidate.candidate_id or '-'}",
+                f"- blocked_kind: {str(block_info.get('block_kind', '')).strip() or '-'}",
+                f"- blocked_cluster: {str(block_info.get('blocked_cluster', '')).strip() or '-'}",
+                f"- blocked_reason: {str(block_info.get('blocked_reason', '')).strip() or '-'}",
+                f"- hypothesis: {failed_candidate.hypothesis or '-'}",
+                f"- change_plan: {failed_candidate.change_plan or '-'}",
+                f"- change_tags: {', '.join(failed_candidate.change_tags) or '-'}",
+                f"- edited_regions: {', '.join(failed_candidate.edited_regions) or '-'}",
+                "",
+                "expected_effects:",
+                expected_effects,
+                "",
+                "diff_summary:",
+                diff_lines,
+                "",
+                f"- failed_candidate_code: `{candidate_path.name}`",
+                "- editable_base: `src/strategy_macd_aggressive.py`",
+            ]
+        )
+        + "\n"
+    )
 
 
 # ==================== 模块热加载 ====================
@@ -385,6 +456,7 @@ def _model_client_config():
         approval_policy="never",
         sandbox="danger-full-access",
         use_ephemeral=False,
+        dangerously_bypass_approvals_and_sandbox=True,
     )
 
 
@@ -1304,8 +1376,6 @@ def _candidate_invalid_generation_block_info(
     base_hash = source_hash(base_source)
     actual_changed_regions = sorted(candidate_signature["changed_regions"])
     diff_summary = build_diff_summary(base_source, candidate.strategy_code, limit=12)
-    declared_regions = sorted(str(item).strip() for item in candidate.edited_regions if str(item).strip())
-    declared_regions_match_system = declared_regions == actual_changed_regions
 
     invalid_reasons: list[str] = []
     if candidate_hash == base_hash:
@@ -1314,8 +1384,6 @@ def _candidate_invalid_generation_block_info(
         invalid_reasons.append("系统未检测到任何真实可编辑区域改动")
     if not diff_summary:
         invalid_reasons.append("候选没有形成可验证的有效 diff")
-    if declared_regions and not declared_regions_match_system:
-        invalid_reasons.append("声明改动区域与系统实际改动区域不一致")
 
     if not invalid_reasons:
         return None
@@ -1330,13 +1398,12 @@ def _candidate_invalid_generation_block_info(
         "- 你的任务只有两步：先确定一个单一策略方向，再把这个方向直接落到 `src/strategy_macd_aggressive.py`。",
         "- 先做策略判断，再落代码；不要把“解释为什么没改”当成提交结果。",
         f"- 系统检测改动区域: {', '.join(actual_changed_regions) or '-'}",
-        f"- 候选声明改动区域: {', '.join(declared_regions) or '-'}",
         f"- diff 摘要条数: {len(diff_summary)}",
         f"- 无效原因: {'；'.join(invalid_reasons)}",
-        "- `wiki/failure_wiki.md` / `wiki/latest_history_package.md` 是高优先级参考，但读不到它们不是合法 no-edit 理由。",
+        "- `wiki/duplicate_watchlist.md` / `wiki/failure_wiki.md` / `wiki/latest_history_package.md` 是高优先级参考，但读不到它们不是合法 no-edit 理由。",
         "- 即使辅助记忆文件暂不可用，也必须继续以 `src/strategy_macd_aggressive.py` 为事实源直接改代码。",
         "- 禁止继续提交 `blocked` / `no_edit` / `no_change` / “未执行代码改动” 这类占位答案。",
-        "- 下一版提交前自检：至少一个可编辑区域真的发生变化，且 JSON 只描述你已经实际落到代码里的改动。",
+        "- 下一版提交前自检：至少一个可编辑区域真的发生变化，且文本摘要只描述你已经实际落到代码里的改动。",
     ]
     if blocked_tags:
         feedback_lines.append(f"- 当前候选使用了占位标签: {', '.join(blocked_tags)}")
@@ -1349,7 +1416,7 @@ def _candidate_invalid_generation_block_info(
         "current_locks": tuple(),
         "invalid_reasons": tuple(invalid_reasons),
         "actual_changed_regions": tuple(actual_changed_regions),
-        "declared_regions_match_system": declared_regions_match_system,
+        "declared_regions_match_system": True,
         "feedback_note": "\n".join(feedback_lines),
     }
 
@@ -1357,9 +1424,265 @@ def _candidate_invalid_generation_block_info(
 # ==================== 候选策略生成 ====================
 
 
+MODEL_RESPONSE_FIELDS = (
+    "candidate_id",
+    "hypothesis",
+    "change_plan",
+    "change_tags",
+    "expected_effects",
+    "closest_failed_cluster",
+    "novelty_proof",
+    "core_factors",
+)
+MODEL_RESPONSE_FIELD_PATTERN = re.compile(
+    r"^(candidate_id|hypothesis|change_plan|change_tags|expected_effects|closest_failed_cluster|novelty_proof|core_factors)\s*:\s*(.*)$",
+    re.IGNORECASE,
+)
+EDIT_COMPLETION_TOKEN = "EDIT_DONE"
+NO_EDIT_ERROR_MESSAGE = "candidate missing actual changed regions"
+
+
 def _is_complexity_error_message(message: str) -> bool:
     normalized = str(message).strip().lower()
     return "complexity budget exceeded" in normalized or "complexity growth too large" in normalized
+
+
+def _is_no_edit_error_message(message: str) -> bool:
+    return NO_EDIT_ERROR_MESSAGE in str(message or "").strip().lower()
+
+
+def _response_field_lines(raw_text: str) -> dict[str, list[str]]:
+    field_lines: dict[str, list[str]] = {}
+    current_field = ""
+    for raw_line in str(raw_text or "").splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        match = MODEL_RESPONSE_FIELD_PATTERN.match(stripped)
+        if match:
+            current_field = match.group(1).lower()
+            value = match.group(2).strip()
+            field_lines.setdefault(current_field, [])
+            if value:
+                field_lines[current_field].append(value)
+            continue
+        if not current_field:
+            continue
+        continuation = re.sub(r"^\s*[-*]\s*", "", stripped).strip()
+        if continuation:
+            field_lines.setdefault(current_field, []).append(continuation)
+    return field_lines
+
+
+def _split_inline_items(value: str) -> list[str]:
+    cleaned = str(value or "").strip()
+    if not cleaned:
+        return []
+    if cleaned.lower() in {"none", "null", "[]", "无"}:
+        return []
+    normalized = cleaned.replace("；", "||").replace(";", "||")
+    if "||" in normalized:
+        chunks = normalized.split("||")
+    elif any(token in normalized for token in [",", "，"]):
+        chunks = re.split(r"[,，]+", normalized)
+    else:
+        chunks = [normalized]
+    return [chunk.strip() for chunk in chunks if chunk.strip()]
+
+
+def _collapse_field_text(lines: list[str]) -> str:
+    return " ".join(str(line).strip() for line in lines if str(line).strip()).strip()
+
+
+def _parse_change_tags(lines: list[str]) -> tuple[str, ...]:
+    tags: list[str] = []
+    for line in lines:
+        for item in re.split(r"[,\s，]+", str(line).strip()):
+            normalized = item.strip()
+            if normalized:
+                tags.append(normalized)
+    deduped: list[str] = []
+    for tag in tags:
+        if tag not in deduped:
+            deduped.append(tag)
+    return tuple(deduped[:6])
+
+
+def _parse_expected_effects(lines: list[str]) -> tuple[str, ...]:
+    effects: list[str] = []
+    for line in lines:
+        effects.extend(_split_inline_items(line))
+    deduped: list[str] = []
+    for effect in effects:
+        if effect not in deduped:
+            deduped.append(effect)
+    return tuple(deduped[:5])
+
+
+def _parse_core_factors_field(lines: list[str]) -> tuple[StrategyCoreFactor, ...]:
+    factors: list[StrategyCoreFactor] = []
+    for line in lines:
+        for item in _split_inline_items(line):
+            parts = [part.strip() for part in item.split("|")]
+            if len(parts) != 3:
+                continue
+            name, thesis, current_signal = parts
+            if not name or not thesis or not current_signal:
+                continue
+            factors.append(
+                StrategyCoreFactor(
+                    name=name,
+                    thesis=thesis,
+                    current_signal=current_signal,
+                )
+            )
+    return tuple(factors[:4])
+
+
+def _parse_model_candidate_payload(raw_text: str) -> dict[str, Any]:
+    text = str(raw_text or "").strip()
+    if not text:
+        raise StrategySourceError("candidate response is empty")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        return payload
+
+    field_lines = _response_field_lines(text)
+    if not field_lines:
+        compact = " ".join(line.strip() for line in text.splitlines() if line.strip())
+        return {
+            "candidate_id": "",
+            "hypothesis": compact,
+            "change_plan": compact,
+            "change_tags": [],
+            "expected_effects": [],
+            "closest_failed_cluster": "",
+            "novelty_proof": "",
+            "core_factors": [],
+        }
+
+    return {
+        "candidate_id": _collapse_field_text(field_lines.get("candidate_id", [])),
+        "hypothesis": _collapse_field_text(field_lines.get("hypothesis", [])),
+        "change_plan": _collapse_field_text(field_lines.get("change_plan", [])),
+        "change_tags": list(_parse_change_tags(field_lines.get("change_tags", []))),
+        "expected_effects": list(_parse_expected_effects(field_lines.get("expected_effects", []))),
+        "closest_failed_cluster": _collapse_field_text(field_lines.get("closest_failed_cluster", [])),
+        "novelty_proof": _collapse_field_text(field_lines.get("novelty_proof", [])),
+        "core_factors": [
+            {
+                "name": factor.name,
+                "thesis": factor.thesis,
+                "current_signal": factor.current_signal,
+            }
+            for factor in _parse_core_factors_field(field_lines.get("core_factors", []))
+        ],
+    }
+
+
+def _auto_change_tags(edited_regions: tuple[str, ...]) -> tuple[str, ...]:
+    tags = [
+        tag
+        for tag in region_families_for_regions(edited_regions)
+        if str(tag).strip()
+    ]
+    if not tags and edited_regions:
+        tags = [str(edited_regions[0]).strip()]
+    deduped: list[str] = []
+    for tag in tags:
+        if tag not in deduped:
+            deduped.append(tag)
+    return tuple(deduped[:6])
+
+
+def _slug_text(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower())
+    return slug.strip("_")
+
+
+def _auto_candidate_id(
+    *,
+    change_tags: tuple[str, ...],
+    edited_regions: tuple[str, ...],
+) -> str:
+    parts = [_slug_text(item) for item in (*change_tags, *edited_regions) if _slug_text(item)]
+    prefix = "_".join(parts[:3]) or "candidate"
+    return f"auto_{prefix}_{int(time.time())}"
+
+
+def _actual_changed_regions(
+    *,
+    base_source: str,
+    strategy_code: str,
+) -> tuple[str, ...]:
+    system_signature = build_system_edit_signature(
+        base_source,
+        strategy_code,
+        EDITABLE_REGIONS,
+    )
+    return tuple(sorted(str(item).strip() for item in system_signature["changed_regions"] if str(item).strip()))
+
+
+def _workspace_strategy_source_or_raise(
+    *,
+    workspace_strategy_file: Path,
+) -> str:
+    if not workspace_strategy_file.exists():
+        raise StrategySourceError(f"workspace strategy file missing: {workspace_strategy_file}")
+    try:
+        return normalize_strategy_source(load_strategy_source(workspace_strategy_file))
+    except OSError as exc:
+        raise StrategySourceError(f"failed to read workspace strategy file: {exc}") from exc
+
+
+def _workspace_strategy_changed_source_or_raise(
+    *,
+    workspace_strategy_file: Path,
+    base_source: str,
+) -> str:
+    strategy_code = _workspace_strategy_source_or_raise(
+        workspace_strategy_file=workspace_strategy_file,
+    )
+    if source_hash(strategy_code) == source_hash(base_source):
+        raise StrategySourceError(NO_EDIT_ERROR_MESSAGE)
+    return strategy_code
+
+
+def _no_edit_failure_candidate(
+    *,
+    workspace_strategy_file: Path,
+    base_source: str,
+    context_label: str,
+    last_response_text: str = "",
+) -> StrategyCandidate:
+    strategy_code = (
+        normalize_strategy_source(load_strategy_source(workspace_strategy_file))
+        if workspace_strategy_file.exists()
+        else normalize_strategy_source(base_source)
+    )
+    response_excerpt = " ".join(str(last_response_text or "").split())
+    if len(response_excerpt) > 160:
+        response_excerpt = response_excerpt[:160] + "..."
+    expected_effect = (
+        f"上一条回复摘录: {response_excerpt}"
+        if response_excerpt
+        else "目标文件 hash 未变化，上一条回复已被丢弃。"
+    )
+    return StrategyCandidate(
+        candidate_id=f"no_edit_{_slug_text(context_label)}_{int(time.time())}",
+        hypothesis="本轮失败不是策略假设本身，而是模型没有把改动真正落到策略源码。",
+        change_plan="先直接修改 src/strategy_macd_aggressive.py；若文件 hash 不变，本轮不再承认任何说明文本。",
+        closest_failed_cluster="no_edit",
+        novelty_proof="系统只接受真实源码 diff；当前失败原因是目标文件未变化，而不是策略方向未定义。",
+        change_tags=("no_edit", "edit_required"),
+        edited_regions=tuple(),
+        expected_effects=(expected_effect,),
+        core_factors=tuple(),
+        strategy_code=strategy_code,
+    )
 
 
 def _core_factors_from_payload(payload: dict[str, Any]) -> tuple[StrategyCoreFactor, ...]:
@@ -1393,14 +1716,17 @@ def _candidate_stub_from_payload(
         if workspace_strategy_file.exists()
         else normalize_strategy_source(fallback_source)
     )
+    declared_regions = tuple(str(item).strip() for item in payload.get("edited_regions", []) if str(item).strip())
+    change_tags = tuple(str(item).strip() for item in payload.get("change_tags", []) if str(item).strip())
     return StrategyCandidate(
-        candidate_id=str(payload.get("candidate_id", "")).strip() or f"candidate-{int(time.time())}",
-        hypothesis=str(payload.get("hypothesis", "")).strip(),
-        change_plan=str(payload.get("change_plan", "")).strip(),
+        candidate_id=str(payload.get("candidate_id", "")).strip()
+        or _auto_candidate_id(change_tags=change_tags, edited_regions=declared_regions),
+        hypothesis=str(payload.get("hypothesis", "")).strip() or "未提供 hypothesis，等待同轮修复。",
+        change_plan=str(payload.get("change_plan", "")).strip() or "未提供 change_plan，等待同轮修复。",
         closest_failed_cluster=str(payload.get("closest_failed_cluster", "")).strip() or "unknown_cluster",
         novelty_proof=str(payload.get("novelty_proof", "")).strip() or "源码校验失败，等待同轮修复。",
-        change_tags=tuple(str(item).strip() for item in payload.get("change_tags", []) if str(item).strip()),
-        edited_regions=tuple(str(item).strip() for item in payload.get("edited_regions", []) if str(item).strip()),
+        change_tags=change_tags,
+        edited_regions=declared_regions,
         expected_effects=tuple(str(item).strip() for item in payload.get("expected_effects", []) if str(item).strip()),
         core_factors=_core_factors_from_payload(payload),
         strategy_code=strategy_code,
@@ -1430,56 +1756,58 @@ def _candidate_from_payload(
         factor_change_mode=factor_change_mode,
     )
     validate_editable_region_boundaries(base_source, strategy_code, EDITABLE_REGIONS)
+    actual_changed_regions = _actual_changed_regions(
+        base_source=base_source,
+        strategy_code=strategy_code,
+    )
+    change_tags = tuple(str(item).strip() for item in payload.get("change_tags", []) if str(item).strip())
+    if not change_tags:
+        change_tags = _auto_change_tags(actual_changed_regions)
+    candidate_id = str(payload.get("candidate_id", "")).strip() or _auto_candidate_id(
+        change_tags=change_tags,
+        edited_regions=actual_changed_regions,
+    )
+    hypothesis = str(payload.get("hypothesis", "")).strip()
+    change_plan = str(payload.get("change_plan", "")).strip()
+    novelty_proof = str(payload.get("novelty_proof", "")).strip()
     candidate = StrategyCandidate(
-        candidate_id=str(payload["candidate_id"]).strip() or f"candidate-{int(time.time())}",
-        hypothesis=str(payload["hypothesis"]).strip(),
-        change_plan=str(payload["change_plan"]).strip(),
-        closest_failed_cluster=str(payload.get("closest_failed_cluster", "")).strip(),
-        novelty_proof=str(payload.get("novelty_proof", "")).strip(),
-        change_tags=tuple(str(item).strip() for item in payload["change_tags"] if str(item).strip()),
-        edited_regions=tuple(str(item).strip() for item in payload["edited_regions"] if str(item).strip()),
-        expected_effects=tuple(str(item).strip() for item in payload["expected_effects"] if str(item).strip()),
+        candidate_id=candidate_id,
+        hypothesis=hypothesis or "未提供 hypothesis；本轮以真实源码 diff 为准。",
+        change_plan=change_plan or "未提供 change_plan；本轮以真实源码 diff 为准。",
+        closest_failed_cluster=str(payload.get("closest_failed_cluster", "")).strip() or "unknown_cluster",
+        novelty_proof=novelty_proof or "未提供 novelty_proof；系统将以真实源码 diff 判定本轮改动。",
+        change_tags=change_tags,
+        edited_regions=actual_changed_regions,
+        expected_effects=tuple(str(item).strip() for item in payload.get("expected_effects", []) if str(item).strip()),
         core_factors=_core_factors_from_payload(payload),
         strategy_code=strategy_code,
     )
-    if not candidate.change_tags:
-        raise StrategySourceError("candidate missing change_tags")
     if not candidate.edited_regions:
-        raise StrategySourceError("candidate missing edited_regions")
+        raise StrategySourceError("candidate missing actual changed regions")
     if len(candidate.edited_regions) > len(EDITABLE_REGIONS):
         raise StrategySourceError("candidate edited_regions exceeds editable region count")
     if len(set(candidate.edited_regions)) != len(candidate.edited_regions):
         raise StrategySourceError("candidate edited_regions contains duplicates")
-    if not candidate.closest_failed_cluster:
-        raise StrategySourceError("candidate missing closest_failed_cluster")
-    if not candidate.novelty_proof:
-        raise StrategySourceError("candidate missing novelty_proof")
     return candidate
 
 
-def _run_model_json_request(
+def _run_model_text_request(
     *,
     prompt: str,
     system_prompt: str,
-    schema_name: str,
     phase: str,
     workspace_root: Path,
     repair_attempt: int | None = None,
-) -> dict[str, Any]:
+) -> str:
     session_id = _active_research_session_id()
 
-    def _invoke(active_session_id: str | None, metadata: dict[str, Any]) -> dict[str, Any]:
+    def _invoke(active_session_id: str | None, metadata: dict[str, Any]) -> str:
         with _temporary_cwd(workspace_root):
-            return generate_json_object(
+            return generate_text_response(
                 prompt=prompt,
                 system_prompt=system_prompt,
                 max_output_tokens=RUNTIME.prompt_max_output_tokens,
                 config=_model_client_config(),
-                text_format=build_json_text_format(
-                    schema=build_candidate_response_schema(),
-                    schema_name=schema_name,
-                    strict=True,
-                ),
                 progress_callback=_build_model_progress_callback(
                     phase,
                     repair_attempt=repair_attempt,
@@ -1490,14 +1818,14 @@ def _run_model_json_request(
 
     response_metadata: dict[str, Any] = {}
     try:
-        payload = _invoke(session_id or None, response_metadata)
+        raw_text = _invoke(session_id or None, response_metadata)
     except StrategyGenerationSessionError as exc:
         if not session_id:
             raise
         log_info(f"Codex session 无法恢复，改为新 session 重试: {exc}")
         _clear_research_session_state(remove_workspace=False, reason="invalid provider session")
         response_metadata = {}
-        payload = _invoke(None, response_metadata)
+        raw_text = _invoke(None, response_metadata)
 
     resolved_session_id = (
         str(response_metadata.get("session_id", "")).strip()
@@ -1509,16 +1837,34 @@ def _run_model_json_request(
             session_id=resolved_session_id,
             workspace_root=workspace_root,
         )
-    return payload
+    return raw_text
 
 
-def _build_model_candidate_payload(
+def _run_model_candidate_request(
+    *,
+    prompt: str,
+    system_prompt: str,
+    phase: str,
+    workspace_root: Path,
+    repair_attempt: int | None = None,
+) -> dict[str, Any]:
+    raw_text = _run_model_text_request(
+        prompt=prompt,
+        system_prompt=system_prompt,
+        phase=phase,
+        workspace_root=workspace_root,
+        repair_attempt=repair_attempt,
+    )
+    return _parse_model_candidate_payload(raw_text)
+
+
+def _build_model_edit_response(
     base_source: str,
     journal_entries: list[dict[str, Any]],
     *,
     workspace_root: Path,
     factor_change_mode: str,
-) -> dict[str, Any]:
+) -> str:
     report = best_report
     if report is None:
         raise StrategySourceError("reference report is not initialized")
@@ -1549,14 +1895,65 @@ def _build_model_candidate_payload(
         current_complexity_headroom_text=format_strategy_complexity_headroom(base_source),
         session_mode=session_mode,
     )
-    return _run_model_json_request(
+    return _run_model_text_request(
         prompt=prompt,
         system_prompt=build_strategy_system_prompt(
             factor_change_mode=factor_change_mode,
         ),
-        schema_name="macd_aggressive_strategy_candidate_v2",
-        phase="model_generate",
+        phase="model_edit",
         workspace_root=workspace_root,
+    )
+
+
+def _build_model_candidate_summary_payload(
+    *,
+    base_source: str,
+    edited_source: str,
+    workspace_root: Path,
+    factor_change_mode: str,
+) -> dict[str, Any]:
+    try:
+        changed_regions = _actual_changed_regions(
+            base_source=base_source,
+            strategy_code=edited_source,
+        )
+    except StrategySourceError:
+        changed_regions = tuple()
+    summary_prompt = build_strategy_candidate_summary_prompt(
+        diff_summary=build_diff_summary(base_source, edited_source, limit=12),
+        changed_regions=changed_regions,
+    )
+    return _run_model_candidate_request(
+        prompt=summary_prompt,
+        system_prompt=build_strategy_system_prompt(
+            factor_change_mode=factor_change_mode,
+        ),
+        phase="model_summarize",
+        workspace_root=workspace_root,
+    )
+
+
+def _repair_no_edit_model_response(
+    *,
+    error_message: str,
+    no_edit_attempt: int,
+    workspace_root: Path,
+    factor_change_mode: str,
+    last_response_text: str,
+) -> str:
+    prompt = build_strategy_no_edit_repair_prompt(
+        no_edit_attempt=no_edit_attempt,
+        error_message=error_message,
+        last_response_text=last_response_text,
+    )
+    return _run_model_text_request(
+        prompt=prompt,
+        system_prompt=build_strategy_system_prompt(
+            factor_change_mode=factor_change_mode,
+        ),
+        phase="model_no_edit_repair",
+        workspace_root=workspace_root,
+        repair_attempt=no_edit_attempt,
     )
 
 
@@ -1581,12 +1978,11 @@ def _repair_model_candidate_payload(
         error_message=error_message,
         repair_attempt=repair_attempt,
     )
-    return _run_model_json_request(
+    return _run_model_candidate_request(
         prompt=prompt,
         system_prompt=build_strategy_system_prompt(
             factor_change_mode=factor_change_mode,
         ),
-        schema_name="macd_aggressive_strategy_candidate_repair_v2",
         phase="model_repair",
         workspace_root=workspace_root,
         repair_attempt=repair_attempt,
@@ -1618,12 +2014,11 @@ def _regenerate_model_candidate_payload(
         regeneration_attempt=regeneration_attempt,
         feedback_note=str(block_info.get("feedback_note", "")).strip(),
     )
-    return _run_model_json_request(
+    return _run_model_candidate_request(
         prompt=prompt,
         system_prompt=build_strategy_system_prompt(
             factor_change_mode=factor_change_mode,
         ),
-        schema_name="macd_aggressive_strategy_candidate_regeneration_v2",
         phase="model_regenerate",
         workspace_root=workspace_root,
         repair_attempt=regeneration_attempt,
@@ -1716,9 +2111,76 @@ def _build_model_candidate(
     workspace_root: Path,
     factor_change_mode: str,
 ) -> StrategyCandidate:
-    payload = _build_model_candidate_payload(
+    workspace_strategy_file = workspace_root / MODEL_WORKSPACE_STRATEGY_PATH
+    last_response_text = _build_model_edit_response(
         base_source,
         journal_entries,
+        workspace_root=workspace_root,
+        factor_change_mode=factor_change_mode,
+    )
+    no_edit_errors: list[str] = []
+    edited_source = ""
+    try:
+        edited_source = _workspace_strategy_changed_source_or_raise(
+            workspace_strategy_file=workspace_strategy_file,
+            base_source=base_source,
+        )
+    except StrategySourceError as exc:
+        if not _is_no_edit_error_message(str(exc)):
+            raise
+        no_edit_errors.append(str(exc))
+        failed_candidate = _no_edit_failure_candidate(
+            workspace_strategy_file=workspace_strategy_file,
+            base_source=base_source,
+            context_label="initial_candidate",
+            last_response_text=last_response_text,
+        )
+        for attempt in range(1, max(0, RUNTIME.max_no_edit_repair_attempts) + 1):
+            write_heartbeat(
+                "candidate_repairing",
+                message=f"iteration {iteration_counter} repairing no-edit candidate",
+                repair_attempt=attempt,
+                max_repair_attempts=RUNTIME.max_no_edit_repair_attempts,
+                error=no_edit_errors[-1],
+                repair_context="no_edit",
+            )
+            log_info(
+                f"第 {iteration_counter} 轮初始候选未落码，尝试 no-edit 修复 "
+                f"{attempt}/{RUNTIME.max_no_edit_repair_attempts}: {no_edit_errors[-1]}"
+            )
+            last_response_text = _repair_no_edit_model_response(
+                error_message="\n".join(no_edit_errors[-3:]),
+                no_edit_attempt=attempt,
+                workspace_root=workspace_root,
+                factor_change_mode=factor_change_mode,
+                last_response_text=last_response_text,
+            )
+            try:
+                edited_source = _workspace_strategy_changed_source_or_raise(
+                    workspace_strategy_file=workspace_strategy_file,
+                    base_source=base_source,
+                )
+                break
+            except StrategySourceError as repair_exc:
+                if not _is_no_edit_error_message(str(repair_exc)):
+                    raise
+                no_edit_errors.append(str(repair_exc))
+                failed_candidate = _no_edit_failure_candidate(
+                    workspace_strategy_file=workspace_strategy_file,
+                    base_source=base_source,
+                    context_label=f"no_edit_repair_{attempt}",
+                    last_response_text=last_response_text,
+                )
+        else:
+            raise CandidateRepairExhausted(
+                failed_candidate,
+                no_edit_errors,
+                failure_stage="candidate_no_edit",
+            ) from exc
+
+    payload = _build_model_candidate_summary_payload(
+        base_source=base_source,
+        edited_source=edited_source,
         workspace_root=workspace_root,
         factor_change_mode=factor_change_mode,
     )
@@ -1740,6 +2202,16 @@ def _regenerate_model_candidate(
     workspace_root: Path,
     factor_change_mode: str,
 ) -> StrategyCandidate:
+    _persist_last_rejected_candidate_snapshot(
+        memory_root=RUNTIME.paths.memory_dir,
+        base_source=base_source,
+        failed_candidate=failed_candidate,
+        block_info=block_info,
+    )
+    _rebase_workspace_strategy_to_base(
+        workspace_root=workspace_root,
+        base_source=base_source,
+    )
     payload = _regenerate_model_candidate_payload(
         base_source=base_source,
         failed_candidate=failed_candidate,
@@ -2246,6 +2718,46 @@ def _record_runtime_failure(
         log_info("研究日志已压缩")
 
 
+def _consecutive_no_edit_runtime_failures(entries: list[dict[str, Any]]) -> int:
+    count = 0
+    for entry in reversed(entries):
+        if str(entry.get("outcome", "")).strip() != "runtime_failed":
+            break
+        failure_stage = str(entry.get("runtime_failure_stage", "")).strip()
+        decision_reason = str(entry.get("decision_reason", "")).strip()
+        if failure_stage not in {"candidate_no_edit", "candidate_validation"}:
+            break
+        if not _is_no_edit_error_message(decision_reason):
+            break
+        count += 1
+    return count
+
+
+def _maybe_stop_for_no_edit_stall(*, iteration_id: int) -> bool:
+    entries = load_journal_entries(RUNTIME.paths.journal_file)
+    consecutive_failures = _consecutive_no_edit_runtime_failures(entries)
+    if consecutive_failures < int(RUNTIME.max_consecutive_no_edit_failures_before_stop):
+        return False
+    stop_reason = (
+        f"连续 {consecutive_failures} 轮未把改动落到 src/strategy_macd_aggressive.py，"
+        "研究器已自动停止。"
+    )
+    RUNTIME.paths.stop_file.parent.mkdir(parents=True, exist_ok=True)
+    RUNTIME.paths.stop_file.write_text(stop_reason + "\n")
+    log_info(f"第 {iteration_id} 轮触发自动停机: {stop_reason}")
+    write_heartbeat(
+        "stopped",
+        message=stop_reason,
+        stop_reason="consecutive_no_edit_failures",
+        consecutive_no_edit_failures=consecutive_failures,
+    )
+    maybe_send_discord(
+        stop_reason,
+        context=f"no_edit_stop_iteration_{iteration_id}",
+    )
+    return True
+
+
 def _activate_candidate(candidate: StrategyCandidate) -> None:
     write_strategy_source(RUNTIME.paths.strategy_backup_file, candidate.strategy_code)
     write_strategy_source(RUNTIME.paths.strategy_file, candidate.strategy_code)
@@ -2368,6 +2880,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
     except CandidateRepairExhausted as exc:
         write_strategy_source(RUNTIME.paths.strategy_file, best_source)
         reload_strategy_module()
+        last_error = exc.errors[-1] if exc.errors else str(exc)
         _record_runtime_failure(
             iteration_id=iteration_id,
             candidate=exc.candidate,
@@ -2383,6 +2896,8 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
             message=f"iteration {iteration_id} candidate validation failed",
             error=str(exc),
         )
+        if _is_no_edit_error_message(last_error) and _maybe_stop_for_no_edit_stall(iteration_id=iteration_id):
+            return "stopped"
         return "runtime_failed"
     candidate_report: EvaluationReport | None = None
     exploration_regeneration_attempt = 0
@@ -2908,7 +3423,11 @@ def main() -> int:
                 "behavioral_noop",
                 "runtime_failed",
                 "exploration_blocked",
+                "stopped",
             } else 1
+
+        if outcome == "stopped":
+            return 0
 
         write_heartbeat(
             "sleeping",

@@ -20,6 +20,7 @@ from codex_exec_client import (
     StrategyGenerationSessionError,
     StrategyGenerationTransientError,
     generate_json_object,
+    generate_text_response,
 )
 import freqtrade_macd_aggressive as ft_adapter
 from market_data_catalog import default_market_data_paths
@@ -54,9 +55,13 @@ from research_v2.journal import (
 from research_v2.notifications import build_discord_summary_message
 from research_v2.prompting import (
     EDITABLE_REGIONS,
+    build_candidate_response_format_instructions,
     build_candidate_response_schema,
+    build_edit_completion_instructions,
     build_strategy_agents_instructions,
+    build_strategy_candidate_summary_prompt,
     build_strategy_exploration_repair_prompt,
+    build_strategy_no_edit_repair_prompt,
     build_strategy_research_prompt,
     build_strategy_runtime_repair_prompt,
     build_strategy_system_prompt,
@@ -1265,6 +1270,7 @@ class JournalPromptFixesTest(unittest.TestCase):
 
         self.assertIn("15m` 是唯一事实源", prompt)
         self.assertIn("方向流量代理", prompt)
+        self.assertIn("wiki/duplicate_watchlist.md", prompt)
         self.assertIn("wiki/failure_wiki.md", prompt)
         self.assertIn("默认模式", prompt)
         self.assertIn("禁止新增 `PARAMS` 键", prompt)
@@ -1279,10 +1285,13 @@ class JournalPromptFixesTest(unittest.TestCase):
         self.assertIn("promotion_delta > 0.02", prompt)
         self.assertIn("当前回合任务", prompt)
         self.assertIn("本轮阅读顺序（必须执行）", prompt)
+        self.assertIn("duplicate_watchlist.md", prompt)
         self.assertIn("failure_wiki.md", prompt)
         self.assertIn("形成假设后，必须回看一次", prompt)
         self.assertIn("当前因子模式：默认模式", prompt)
-        self.assertIn("不是新增因子的申请通道", prompt)
+        self.assertIn("本轮硬完成条件", prompt)
+        self.assertIn("EDIT_DONE", prompt)
+        self.assertIn("文件 hash 未变化", prompt)
 
     def test_build_strategy_agents_instructions_mentions_all_required_symbols(self):
         prompt = build_strategy_agents_instructions()
@@ -1306,12 +1315,46 @@ class JournalPromptFixesTest(unittest.TestCase):
         self.assertIn("不要“堆屎”", prompt)
         self.assertIn("不要换个名字再写一份重复条件", prompt)
 
-    def test_build_strategy_system_prompt_mentions_agents_md_and_json_only(self):
+    def test_build_strategy_system_prompt_mentions_agents_md_and_text_contract(self):
         prompt = build_strategy_system_prompt()
 
         self.assertIn("AGENTS.md", prompt)
-        self.assertIn("只返回符合 schema 的 JSON", prompt)
+        self.assertIn("纯文本候选摘要", prompt)
         self.assertIn("未读到文件", prompt)
+
+    def test_build_candidate_response_format_instructions_mentions_system_derived_regions(self):
+        prompt = build_candidate_response_format_instructions()
+
+        self.assertIn("不要输出 `edited_regions`", prompt)
+        self.assertIn("真实 diff", prompt)
+
+    def test_build_edit_completion_instructions_mentions_hash_gate_and_edit_done(self):
+        prompt = build_edit_completion_instructions()
+
+        self.assertIn("EDIT_DONE", prompt)
+        self.assertIn("文件 hash 未变化", prompt)
+        self.assertIn("主进程直接丢弃", prompt)
+
+    def test_build_strategy_no_edit_repair_prompt_mentions_discarded_reply(self):
+        prompt = build_strategy_no_edit_repair_prompt(
+            no_edit_attempt=1,
+            error_message="candidate missing actual changed regions",
+            last_response_text="我建议放宽 outer_context",
+        )
+
+        self.assertIn("已被主进程直接丢弃", prompt)
+        self.assertIn("文件 hash 与调用前完全相同", prompt)
+        self.assertIn("只回复 `EDIT_DONE`", prompt)
+
+    def test_build_strategy_candidate_summary_prompt_mentions_do_not_edit(self):
+        prompt = build_strategy_candidate_summary_prompt(
+            diff_summary=["- old", "+ new"],
+            changed_regions=("strategy", "long_final_veto_clear"),
+        )
+
+        self.assertIn("不要再修改任何文件", prompt)
+        self.assertIn("strategy, long_final_veto_clear", prompt)
+        self.assertIn("只描述当前已经落到代码里的改动", prompt)
 
     def test_build_strategy_prompts_include_precise_complexity_budgets(self):
         system_prompt = build_strategy_agents_instructions()
@@ -1401,7 +1444,31 @@ class JournalPromptFixesTest(unittest.TestCase):
 
         self.assertIn("附加反馈（本次必须处理）", prompt)
         self.assertIn("最近连续 behavioral_noop: 2", prompt)
+        self.assertIn("wiki/duplicate_watchlist.md", prompt)
         self.assertIn("wiki/failure_wiki.md", prompt)
+
+    def test_build_strategy_exploration_repair_prompt_requires_rebase_to_reference(self):
+        prompt = build_strategy_exploration_repair_prompt(
+            candidate_id="candidate_1",
+            hypothesis="继续优化多头上车",
+            change_plan="调整 ownership 方向过滤",
+            change_tags=("ownership_takeover",),
+            edited_regions=("strategy",),
+            expected_effects=("提高多头到来阶段捕获",),
+            closest_failed_cluster="ownership_cluster",
+            novelty_proof="和最近失败方向相比，这次会换交易路径。",
+            block_kind="blocked_failure_wiki_exact_cut",
+            blocked_cluster="ownership_cluster",
+            blocked_reason="同一 exact cut 已至少 2 次落回失败盆地",
+            locked_clusters=(),
+            regeneration_attempt=1,
+        )
+
+        self.assertIn("重置为当前正确基底", prompt)
+        self.assertIn("不再是这次改动的基底", prompt)
+        self.assertIn("从当前正确基底重新修改", prompt)
+        self.assertIn("wiki/last_rejected_snapshot.md", prompt)
+        self.assertIn("wiki/last_rejected_candidate.py", prompt)
 
     def test_strategy_prompts_forbid_blocked_no_edit_placeholder_results(self):
         runtime_prompt = build_strategy_research_prompt(
@@ -1522,6 +1589,85 @@ class JournalPromptFixesTest(unittest.TestCase):
                 base_source=base_source,
             )
             self.assertEqual(candidate.candidate_id, "candidate_four_families")
+
+    def test_parse_model_candidate_payload_accepts_text_contract(self):
+        payload = research_script._parse_model_candidate_payload(
+            """
+candidate_id: candidate_text_mode
+hypothesis: 先放宽 long 最后 veto，让多头真实触达最终路由
+change_plan: 调整 long_final_veto_clear，并同步检查 strategy 最终合流
+change_tags: long, merge_veto, strategy
+expected_effects: 增加多头实际入场 || 减少长侧死分支
+closest_failed_cluster: ownership_cluster
+novelty_proof: 这次改最终放行链，不再停在未触达的 helper 阈值
+core_factors: veto_pressure | 当前长侧最后一层否决过重 | long_final_veto_clear 常年卡死
+"""
+        )
+
+        self.assertEqual(payload["candidate_id"], "candidate_text_mode")
+        self.assertEqual(payload["change_tags"], ["long", "merge_veto", "strategy"])
+        self.assertEqual(len(payload["expected_effects"]), 2)
+        self.assertEqual(payload["core_factors"][0]["name"], "veto_pressure")
+
+    def test_candidate_from_payload_uses_system_changed_regions_not_declared_regions(self):
+        base_source = self._minimal_strategy_source()
+        candidate_source = base_source.replace(
+            "def strategy(*args, **kwargs):\n    return None\n",
+            "def strategy(*args, **kwargs):\n    return 1\n",
+            1,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_strategy_file = Path(temp_dir) / "src/strategy_macd_aggressive.py"
+            workspace_strategy_file.parent.mkdir(parents=True, exist_ok=True)
+            workspace_strategy_file.write_text(candidate_source)
+
+            candidate = research_script._candidate_from_payload(
+                {
+                    "candidate_id": "candidate_real_diff",
+                    "hypothesis": "改最终路由",
+                    "change_plan": "只动 strategy",
+                    "closest_failed_cluster": "ownership_cluster",
+                    "novelty_proof": "真实 diff 会触达 strategy。",
+                    "change_tags": ["route_shift"],
+                    "edited_regions": ["_trend_quality_ok"],
+                    "expected_effects": ["改变最终入场"],
+                    "core_factors": [],
+                },
+                workspace_strategy_file=workspace_strategy_file,
+                base_source=base_source,
+            )
+
+            self.assertEqual(candidate.edited_regions, ("strategy",))
+
+    def test_workspace_strategy_changed_source_or_raise_requires_real_file_change(self):
+        base_source = self._minimal_strategy_source()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_strategy_file = Path(temp_dir) / "src/strategy_macd_aggressive.py"
+            workspace_strategy_file.parent.mkdir(parents=True, exist_ok=True)
+            workspace_strategy_file.write_text(base_source)
+
+            with self.assertRaisesRegex(StrategySourceError, "candidate missing actual changed regions"):
+                research_script._workspace_strategy_changed_source_or_raise(
+                    workspace_strategy_file=workspace_strategy_file,
+                    base_source=base_source,
+                )
+
+            workspace_strategy_file.write_text(
+                base_source.replace(
+                    "def strategy(*args, **kwargs):\n    return None\n",
+                    "def strategy(*args, **kwargs):\n    return 1\n",
+                    1,
+                )
+            )
+
+            changed = research_script._workspace_strategy_changed_source_or_raise(
+                workspace_strategy_file=workspace_strategy_file,
+                base_source=base_source,
+            )
+
+            self.assertIn("return 1", changed)
 
     def test_cluster_for_tags_groups_ownership_variants(self):
         self.assertEqual(cluster_for_tags(["acceptance_continuity", "ownership_transfer"]), "ownership_cluster")
@@ -2323,9 +2469,11 @@ class FreqtradeAdapterFixesTest(unittest.TestCase):
 
         block = evaluate_candidate_failure_wiki_guard(candidate, failure_wiki_index)
 
-        self.assertIsNotNone(block)
-        self.assertEqual(block["block_kind"], "failure_wiki_exact_cut")
-        self.assertIn("exact cut", block["blocked_reason"])
+        self.assertIsNone(block)
+        self.assertEqual(failure_wiki_index.get("blocked_cuts"), {})
+        self.assertTrue(
+            any(item.get("block_exact_cut") for item in failure_wiki_index.get("items", []))
+        )
 
     def test_failure_wiki_ignores_technical_duplicate_source_no_edit_entries(self):
         entries = []
@@ -2764,9 +2912,76 @@ class FreqtradeAdapterFixesTest(unittest.TestCase):
             self.assertTrue((memory_root / "summaries/past_stage_summaries.json").exists())
             self.assertTrue((memory_root / "summaries/all_time_tables.json").exists())
             self.assertTrue((memory_root / "prompt/latest_history_package.md").exists())
+            self.assertTrue((memory_root / "wiki/duplicate_watchlist.md").exists())
             self.assertTrue((memory_root / "wiki/failure_wiki.md").exists())
             self.assertTrue((memory_root / "wiki/failure_wiki_index.json").exists())
             self.assertIn("blocked_cuts", load_failure_wiki_index(memory_root))
+
+    def test_journal_summary_writes_duplicate_watchlist_markdown(self):
+        entries = [
+            {
+                "iteration": 1,
+                "candidate_id": "cand_repeat_alpha",
+                "outcome": "rejected",
+                "stop_stage": "full_eval",
+                "promotion_score": 0.10,
+                "quality_score": 0.20,
+                "promotion_delta": -0.05,
+                "gate_reason": "相对当前champion晋级分提升不足(-0.05 <= 0.02)",
+                "decision_reason": "相对当前champion晋级分提升不足(-0.05 <= 0.02)",
+                "code_hash": "hash_repeat_alpha",
+                "change_tags": ["ownership_takeover"],
+                "edited_regions": ["strategy"],
+                "system_changed_regions": ["strategy"],
+                "hypothesis": "第一次尝试",
+                "target_family": "long",
+                "closest_failed_cluster": "ownership_cluster",
+                "metrics": {
+                    "validation_segment_hit_rate": 0.12,
+                    "validation_bull_capture_score": 0.03,
+                    "validation_bear_capture_score": 0.02,
+                    "total_trades": 120,
+                },
+                "score_regime": "trend_capture_v6",
+            },
+            {
+                "iteration": 2,
+                "candidate_id": "cand_repeat_alpha",
+                "outcome": "duplicate_skipped",
+                "stop_stage": "duplicate_history",
+                "promotion_score": None,
+                "quality_score": None,
+                "promotion_delta": None,
+                "gate_reason": "候选源码命中最近研究历史",
+                "decision_reason": "候选源码命中最近研究历史",
+                "code_hash": "hash_repeat_alpha",
+                "change_tags": ["ownership_takeover"],
+                "edited_regions": ["strategy"],
+                "system_changed_regions": ["strategy"],
+                "hypothesis": "第二次重复提交",
+                "target_family": "long",
+                "closest_failed_cluster": "ownership_cluster",
+                "metrics": {},
+                "score_regime": "trend_capture_v6",
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            memory_root = Path(tmpdir) / "memory"
+            build_journal_prompt_summary(
+                entries,
+                limit=8,
+                current_score_regime="trend_capture_v6",
+                active_stage_iteration=1,
+                memory_root=memory_root,
+            )
+
+            duplicate_watchlist = (memory_root / "wiki/duplicate_watchlist.md").read_text()
+
+        self.assertIn("Duplicate Watchlist", duplicate_watchlist)
+        self.assertIn("cand_repeat_alpha", duplicate_watchlist)
+        self.assertIn("ownership_cluster", duplicate_watchlist)
+        self.assertIn("duplicate_history", duplicate_watchlist)
 
     def test_append_journal_archive_writes_raw_history_files(self):
         entry = {
@@ -3048,6 +3263,57 @@ class ResearcherAdaptiveModeTest(unittest.TestCase):
         self.assertEqual(mode, "default")
         self.assertIn("维持 default", reason)
 
+    def test_consecutive_no_edit_runtime_failures_counts_trailing_no_edit_only(self):
+        entries = [
+            {"iteration": 1, "outcome": "runtime_failed", "runtime_failure_stage": "candidate_no_edit", "decision_reason": "candidate missing actual changed regions"},
+            {"iteration": 2, "outcome": "runtime_failed", "runtime_failure_stage": "candidate_validation", "decision_reason": "candidate missing actual changed regions"},
+            {"iteration": 3, "outcome": "runtime_failed", "runtime_failure_stage": "full_eval", "decision_reason": "boom"},
+        ]
+
+        self.assertEqual(research_script._consecutive_no_edit_runtime_failures(entries), 0)
+        self.assertEqual(research_script._consecutive_no_edit_runtime_failures(entries[:2]), 2)
+
+    def test_maybe_stop_for_no_edit_stall_writes_stop_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            journal_path = temp_root / "journal.jsonl"
+            stop_path = temp_root / "research.stop"
+            heartbeat_path = temp_root / "heartbeat.json"
+            journal_entries = [
+                {
+                    "iteration": 1,
+                    "outcome": "runtime_failed",
+                    "runtime_failure_stage": "candidate_no_edit",
+                    "decision_reason": "candidate missing actual changed regions",
+                },
+                {
+                    "iteration": 2,
+                    "outcome": "runtime_failed",
+                    "runtime_failure_stage": "candidate_validation",
+                    "decision_reason": "candidate missing actual changed regions",
+                },
+            ]
+            journal_path.write_text("".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in journal_entries))
+
+            patched_runtime = replace(
+                research_script.RUNTIME,
+                paths=replace(
+                    research_script.RUNTIME.paths,
+                    journal_file=journal_path,
+                    stop_file=stop_path,
+                    heartbeat_file=heartbeat_path,
+                ),
+                max_consecutive_no_edit_failures_before_stop=2,
+            )
+
+            with mock.patch.object(research_script, "RUNTIME", patched_runtime):
+                with mock.patch.object(research_script, "maybe_send_discord"):
+                    stopped = research_script._maybe_stop_for_no_edit_stall(iteration_id=2)
+
+            self.assertTrue(stopped)
+            self.assertTrue(stop_path.exists())
+            self.assertIn("连续 2 轮未把改动落到", stop_path.read_text())
+
     def test_current_stage_journal_entries_prefers_stage_timestamp_after_iteration_reset(self):
         entries = [
             {
@@ -3084,6 +3350,43 @@ class ResearcherAdaptiveModeTest(unittest.TestCase):
 
 
 class CodexExecClientTest(unittest.TestCase):
+    def test_generate_text_response_supports_schema_free_new_session(self):
+        class FakePopen:
+            def __init__(self, *args, **kwargs):
+                self.pid = 43210
+                self.returncode = 0
+
+            def communicate(self, input=None, timeout=None):
+                return ("candidate_id: text_mode\nhypothesis: test\n", "")
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        config = StrategyClientConfig(
+            codex_bin="codex",
+            model="gpt-5.4",
+            reasoning_effort="medium",
+            approval_policy="never",
+            sandbox="read-only",
+            timeout_seconds=90,
+            use_ephemeral=True,
+        )
+
+        with mock.patch("codex_exec_client.shutil.which", return_value="/usr/local/bin/codex"):
+            with mock.patch("codex_exec_client.subprocess.Popen", return_value=FakePopen()) as popen:
+                text = generate_text_response(
+                    prompt="test",
+                    system_prompt="system",
+                    config=config,
+                )
+
+        command = popen.call_args.args[0]
+        self.assertEqual(text, "candidate_id: text_mode\nhypothesis: test")
+        self.assertNotIn("--output-schema", command)
+
     def test_generate_json_object_emits_progress_heartbeats(self):
         events: list[dict[str, object]] = []
 
@@ -3183,6 +3486,56 @@ class CodexExecClientTest(unittest.TestCase):
         command = popen.call_args.args[0]
         self.assertEqual(command[:6], ["codex", "-a", "never", "-s", "danger-full-access", "-C"])
         self.assertEqual(command[7], "exec")
+        self.assertIn("model_max_output_tokens=3200", command)
+
+    def test_generate_json_object_supports_dangerous_bypass_mode(self):
+        class FakePopen:
+            def __init__(self, *args, **kwargs):
+                self.pid = 43210
+                self.returncode = 0
+
+            def communicate(self, input=None, timeout=None):
+                return (json.dumps({"ok": True}), "")
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        config = StrategyClientConfig(
+            codex_bin="codex",
+            model="gpt-5.4",
+            reasoning_effort="medium",
+            approval_policy="never",
+            sandbox="danger-full-access",
+            timeout_seconds=90,
+            use_ephemeral=False,
+            dangerously_bypass_approvals_and_sandbox=True,
+        )
+
+        with mock.patch("codex_exec_client.shutil.which", return_value="/usr/local/bin/codex"):
+            with mock.patch("codex_exec_client.subprocess.Popen", return_value=FakePopen()) as popen:
+                generate_json_object(
+                    prompt="test",
+                    system_prompt="system",
+                    config=config,
+                    text_format={
+                        "type": "json_schema",
+                        "schema": {
+                            "type": "object",
+                            "properties": {"ok": {"type": "boolean"}},
+                            "required": ["ok"],
+                            "additionalProperties": False,
+                        },
+                    },
+                )
+
+        command = popen.call_args.args[0]
+        self.assertEqual(command[:4], ["codex", "--dangerously-bypass-approvals-and-sandbox", "-C", str(Path.cwd())])
+        self.assertEqual(command[4], "exec")
+        self.assertNotIn("-a", command)
+        self.assertNotIn("-s", command)
         self.assertIn("model_max_output_tokens=3200", command)
 
     def test_generate_json_object_supports_resume_and_response_metadata(self):
@@ -3345,6 +3698,56 @@ class ReferenceStateFixesTest(unittest.TestCase):
         config = research_script._model_client_config()
 
         self.assertFalse(config.use_ephemeral)
+        self.assertTrue(config.dangerously_bypass_approvals_and_sandbox)
+
+    def test_rebase_workspace_strategy_to_base_replaces_failed_candidate_source(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_root = Path(temp_dir)
+            strategy_path = workspace_root / "src/strategy_macd_aggressive.py"
+            strategy_path.parent.mkdir(parents=True, exist_ok=True)
+            strategy_path.write_text("failed candidate\n")
+
+            research_script._rebase_workspace_strategy_to_base(
+                workspace_root=workspace_root,
+                base_source="reference baseline\n",
+            )
+
+            self.assertEqual(strategy_path.read_text(), "reference baseline\n")
+
+    def test_persist_last_rejected_candidate_snapshot_writes_reference_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            memory_root = Path(temp_dir)
+            failed_candidate = StrategyCandidate(
+                candidate_id="candidate_bad_1",
+                hypothesis="错误方向",
+                change_plan="在坏版本上继续加条件",
+                closest_failed_cluster="ownership_cluster",
+                novelty_proof="这次换了措辞但没换真实路径。",
+                change_tags=("long", "merge_veto"),
+                edited_regions=("long_final_veto_clear",),
+                expected_effects=("想放出更多多头",),
+                core_factors=(),
+                strategy_code="print('bad candidate')\n",
+            )
+
+            research_script._persist_last_rejected_candidate_snapshot(
+                memory_root=memory_root,
+                base_source="print('base')\n",
+                failed_candidate=failed_candidate,
+                block_info={
+                    "block_kind": "failure_wiki_exact_cut",
+                    "blocked_cluster": "ownership_cluster",
+                    "blocked_reason": "同一 exact cut 已至少 2 次落回失败盆地",
+                },
+            )
+
+            snapshot_md = (memory_root / "wiki/last_rejected_snapshot.md").read_text()
+            snapshot_code = (memory_root / "wiki/last_rejected_candidate.py").read_text()
+
+            self.assertIn("candidate_bad_1", snapshot_md)
+            self.assertIn("failure_wiki_exact_cut", snapshot_md)
+            self.assertIn("last_rejected_candidate.py", snapshot_md)
+            self.assertIn("print('bad candidate')", snapshot_code)
 
     def test_reference_manifest_uses_baseline_role_when_no_champion(self):
         report = EvaluationReport(

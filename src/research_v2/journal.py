@@ -62,6 +62,8 @@ STRUCTURAL_TOKEN_NOVELTY_MAX_OVERLAP = 0.60
 STRUCTURAL_REDUCTION_TAGS = frozenset({"remove_dead_gate", "merge_veto", "widen_outer_context"})
 RESULT_BASIN_ROUND_DIGITS = 6
 RESULT_BASIN_LOOKBACK = 24
+DUPLICATE_WATCHLIST_LOOKBACK = 36
+DUPLICATE_WATCHLIST_LIMIT = 5
 LONG_TARGET_KEYWORDS = (
     "long",
     "bull",
@@ -121,6 +123,7 @@ def _memory_archive_paths(memory_root: Path) -> dict[str, Path]:
         "latest_prompt": memory_root / "prompt/latest_history_package.md",
         "failure_wiki_md": memory_root / "wiki/failure_wiki.md",
         "failure_wiki_json": memory_root / "wiki/failure_wiki_index.json",
+        "duplicate_watchlist_md": memory_root / "wiki/duplicate_watchlist.md",
     }
 
 
@@ -317,6 +320,123 @@ def has_recent_result_basin(
     lookback: int = RESULT_BASIN_LOOKBACK,
 ) -> bool:
     return count_recent_result_basin(entries, basin_key, lookback=lookback) > 0
+
+
+def format_duplicate_watchlist_markdown(
+    entries: list[dict[str, Any]],
+    *,
+    score_regime: str = "",
+    lookback: int = DUPLICATE_WATCHLIST_LOOKBACK,
+    limit: int = DUPLICATE_WATCHLIST_LIMIT,
+) -> str:
+    scoped_entries = _entries_for_score_regime(entries, score_regime) if score_regime else list(entries)
+    scoped_entries = _strategy_relevant_entries(scoped_entries)
+    recent_entries = scoped_entries[-max(lookback, limit):]
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for entry in recent_entries:
+        code_hash = str(entry.get("code_hash", "")).strip()
+        if not code_hash:
+            continue
+        bucket = grouped.setdefault(
+            code_hash,
+            {
+                "count": 0,
+                "duplicate_history_hits": 0,
+                "last_iteration": 0,
+                "candidate_ids": Counter(),
+                "reasons": Counter(),
+                "clusters": Counter(),
+                "targets": Counter(),
+                "changed_regions": Counter(),
+            },
+        )
+        bucket["count"] += 1
+        bucket["last_iteration"] = max(bucket["last_iteration"], _entry_iteration(entry))
+        candidate_id = str(entry.get("candidate_id", "")).strip()
+        if candidate_id:
+            bucket["candidate_ids"][candidate_id] += 1
+        reason = _entry_decision_reason(entry)
+        if reason and reason != "-":
+            bucket["reasons"][reason] += 1
+        cluster = cluster_key_for_entry(entry) or str(entry.get("closest_failed_cluster", "")).strip() or "unclassified"
+        bucket["clusters"][cluster] += 1
+        target_family = str(entry.get("target_family", "")).strip() or "unknown"
+        bucket["targets"][target_family] += 1
+        for region in (
+            entry.get("system_changed_regions", [])
+            or entry.get("edited_regions", [])
+            or []
+        ):
+            region_text = str(region).strip()
+            if region_text:
+                bucket["changed_regions"][region_text] += 1
+        if str(entry.get("stop_stage", "")).strip() == "duplicate_history":
+            bucket["duplicate_history_hits"] += 1
+
+    items: list[dict[str, Any]] = []
+    for bucket in grouped.values():
+        repeat_count = int(bucket["count"]) - 1
+        if repeat_count <= 0 and int(bucket["duplicate_history_hits"]) <= 0:
+            continue
+        candidate_name = next((name for name, _ in bucket["candidate_ids"].most_common(1)), "-")
+        cluster_name = next((name for name, _ in bucket["clusters"].most_common(1)), "unclassified")
+        target_name = next((name for name, _ in bucket["targets"].most_common(1)), "unknown")
+        changed_regions = [name for name, _ in bucket["changed_regions"].most_common(3)]
+        top_reason = next((name for name, _ in bucket["reasons"].most_common(1)), "-")
+        hint = (
+            f"不要再交 {cluster_name}/{','.join(changed_regions) or '-'} 的近似版本；"
+            "若仍研究这条方向，至少切不同 choke point、不同 changed_regions 或不同最终放行链。"
+        )
+        items.append(
+            {
+                "candidate_id": candidate_name,
+                "repeat_count": repeat_count,
+                "duplicate_history_hits": int(bucket["duplicate_history_hits"]),
+                "last_iteration": int(bucket["last_iteration"]),
+                "cluster": cluster_name,
+                "target": target_name,
+                "changed_regions": changed_regions,
+                "reason": top_reason,
+                "hint": hint,
+            }
+        )
+
+    items.sort(
+        key=lambda item: (
+            -int(item["duplicate_history_hits"]),
+            -int(item["repeat_count"]),
+            -int(item["last_iteration"]),
+            str(item["candidate_id"]),
+        )
+    )
+
+    lines = [
+        f"# Duplicate Watchlist ({score_regime or 'current'})",
+        "",
+        "用法：",
+        "- 这里只列最近最容易重复提交的源码指纹摘要，不贴完整代码。",
+        "- 若你当前假设与下列某条在 cluster / changed_regions / target 上高度相似，先改写假设再提交。",
+        "- 这不是运行时硬拦截；后置源码 hash 判重仍然存在。",
+        "",
+        "## 最近高频重复源码",
+        "| 候选 | 重复提交 | duplicate_history | cluster | changed_regions | target | 最近轮次 |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    if not items:
+        lines.append("| - | 0 | 0 | - | - | - | - |")
+        return "\n".join(lines)
+
+    for item in items[: max(1, limit)]:
+        lines.append(
+            f"| {_truncate(item['candidate_id'], 36)} | {item['repeat_count']} | "
+            f"{item['duplicate_history_hits']} | {item['cluster']} | "
+            f"{','.join(item['changed_regions']) or '-'} | {item['target']} | {item['last_iteration']} |"
+        )
+        lines.append(f"- 最近原因: {_truncate(item['reason'], 96)}")
+        lines.append(f"- 避免方式: {_truncate(item['hint'], 120)}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 def _normalize_cluster_name(raw: Any) -> str:
@@ -2534,19 +2654,6 @@ def build_failure_wiki_payload(
             "block_reason": _failure_wiki_block_reason(payload) if block_exact_cut else "",
         }
         items.append(item)
-        if block_exact_cut:
-            blocked_cuts[item["cut_key"]].append(
-                {
-                    "category": item["category"],
-                    "count": item["count"],
-                    "stage_count": item["stage_count"],
-                    "last_iteration": item["last_iteration"],
-                    "cut": item["cut"],
-                    "block_reason": item["block_reason"],
-                    "top_reasons": item["top_reasons"],
-                }
-            )
-
     items.sort(
         key=lambda item: (
             0 if item["block_exact_cut"] else 1,
@@ -2569,28 +2676,25 @@ def build_failure_wiki_payload(
 
 def format_failure_wiki_markdown(payload: dict[str, Any], *, limit: int = 24) -> str:
     items = list(payload.get("items", []))
-    blocked_rows: list[dict[str, Any]] = []
-    for row_list in payload.get("blocked_cuts", {}).values():
-        if isinstance(row_list, list):
-            blocked_rows.extend(item for item in row_list if isinstance(item, dict))
-    blocked_rows.sort(key=lambda item: (-int(item.get("count", 0) or 0), -int(item.get("last_iteration", 0) or 0)))
+    highlighted_rows = [item for item in items if item.get("block_exact_cut")]
+    highlighted_rows.sort(key=lambda item: (-int(item.get("count", 0) or 0), -int(item.get("last_iteration", 0) or 0)))
 
     lines = [
         f"# Failure Wiki ({str(payload.get('score_regime', '')).strip() or 'current'})",
         "",
         "用法：",
-        "- 先看“系统已封死的 exact cuts”。命中时不要再提交同一 cut，应切不同 choke point、不同最终放行链或不同真实交易路径层级。",
+        "- 先看“高风险 exact cuts（仅提示）”。命中时优先切不同 choke point、不同最终放行链或不同真实交易路径层级，但这里不再作为运行时硬拦截。",
         "- 再看“失败模式聚合”。同一失败核或同一 exact cut 的重复出现，只算一个已知坏盆地。",
         "- 未压缩原始历史仍在 `memory/raw/rounds/` 与 `memory/raw/full_history.jsonl`。",
         "",
-        "## 系统已封死的 exact cuts",
+        "## 高风险 exact cuts（仅提示，不拦截）",
         "| 类别 | 次数 | cluster | changed_regions | target | 最近轮次 | 原因 |",
         "| --- | --- | --- | --- | --- | --- | --- |",
     ]
-    if not blocked_rows:
-        lines.append("| - | 0 | - | - | - | - | 暂无被系统封死的 exact cut |")
+    if not highlighted_rows:
+        lines.append("| - | 0 | - | - | - | - | 暂无高风险 exact cut 提示 |")
     else:
-        for item in blocked_rows[:max(1, limit)]:
+        for item in highlighted_rows[:max(1, limit)]:
             cut = item.get("cut", {}) if isinstance(item.get("cut"), dict) else {}
             changed_regions = ",".join(cut.get("changed_regions", []) or []) or "-"
             lines.append(
@@ -2625,7 +2729,7 @@ def format_failure_wiki_markdown(payload: dict[str, Any], *, limit: int = 24) ->
             f"stage命中={item.get('stage_count', 0)}; 最近轮次={item.get('last_iteration', 0)}"
         )
         if item.get("block_exact_cut"):
-            lines.append(f"- 系统结论: {item.get('block_reason', '-')}")
+            lines.append(f"- 系统提示: {item.get('block_reason', '-')}")
         example_text = "；".join(
             f"r{row.get('iteration', 0)}:{_truncate(row.get('candidate_id', '-'), 24)}"
             for row in item.get("examples", []) or []
@@ -2653,55 +2757,9 @@ def evaluate_candidate_failure_wiki_guard(
     base_source: str | None = None,
     editable_regions: tuple[str, ...] | None = None,
 ) -> dict[str, Any] | None:
-    blocked_cuts = failure_wiki_index.get("blocked_cuts", {})
-    if not isinstance(blocked_cuts, dict) or not blocked_cuts:
-        return None
-    candidate_signature = exploration_signature_for_candidate(
-        candidate,
-        base_source=base_source,
-        editable_regions=editable_regions,
-    )
-    cut_key = failure_cut_key_for_signature(candidate_signature)
-    if not cut_key:
-        return None
-    matched = blocked_cuts.get(cut_key)
-    if not isinstance(matched, list) or not matched:
-        return None
-    primary = sorted(
-        (item for item in matched if isinstance(item, dict)),
-        key=lambda item: (-int(item.get("count", 0) or 0), -int(item.get("last_iteration", 0) or 0), str(item.get("category", ""))),
-    )
-    if not primary:
-        return None
-    selected = primary[0]
-    cut = selected.get("cut", {}) if isinstance(selected.get("cut"), dict) else {}
-    changed_regions = ", ".join(cut.get("changed_regions", []) or []) or "-"
-    feedback_note = (
-        "failure wiki 命中 exact cut:\n"
-        f"- category: {selected.get('category', '-')}\n"
-        f"- cluster: {cut.get('cluster', '-') or '-'}\n"
-        f"- changed_regions: {changed_regions}\n"
-        f"- target: {cut.get('target', '-') or '-'}\n"
-        f"- recent_reason: {'；'.join(selected.get('top_reasons', []) or ['-'])}\n"
-        "- 本轮必须切不同 choke point、不同最终放行链，或不同真实交易路径层级。"
-    )
-    return {
-        "block_kind": "failure_wiki_exact_cut",
-        "stop_stage": "blocked_failure_wiki_exact_cut",
-        "blocked_cluster": str(candidate_signature.get("cluster_key", "")).strip() or "-",
-        "blocked_reason": str(selected.get("block_reason", "")).strip() or "命中 failure wiki 已封死 exact cut",
-        "lock_applied": False,
-        "lock_rounds": 0,
-        "lock_level": 0,
-        "lock_trigger_iteration": 0,
-        "lock_expires_before_iteration": 0,
-        "matched_failure_category": str(selected.get("category", "")).strip(),
-        "matched_failure_count": int(selected.get("count", 0) or 0),
-        "matched_failure_stage_count": int(selected.get("stage_count", 0) or 0),
-        "matched_failure_cut": cut,
-        "feedback_note": feedback_note,
-        "current_locks": tuple(),
-    }
+    # exact cut 已降级为 wiki-only 风险提示：继续保留聚合与 markdown，
+    # 但不再参与运行时硬拦截，避免把过宽的探索赛道整条封死。
+    return None
 
 
 def _write_prompt_memory_snapshots(
@@ -2715,7 +2773,15 @@ def _write_prompt_memory_snapshots(
     summary_text: str,
 ) -> None:
     paths = _memory_archive_paths(memory_root)
-    for key in ("current_stage", "past_stages", "all_time_tables", "latest_prompt", "failure_wiki_md", "failure_wiki_json"):
+    for key in (
+        "current_stage",
+        "past_stages",
+        "all_time_tables",
+        "latest_prompt",
+        "failure_wiki_md",
+        "failure_wiki_json",
+        "duplicate_watchlist_md",
+    ):
         paths[key].parent.mkdir(parents=True, exist_ok=True)
     paths["current_stage"].write_text(
         json.dumps(
@@ -2737,6 +2803,12 @@ def _write_prompt_memory_snapshots(
     )
     paths["failure_wiki_json"].write_text(json.dumps(failure_wiki_payload, ensure_ascii=False, indent=2))
     paths["failure_wiki_md"].write_text(format_failure_wiki_markdown(failure_wiki_payload))
+    paths["duplicate_watchlist_md"].write_text(
+        format_duplicate_watchlist_markdown(
+            all_entries,
+            score_regime=str(current_stage_meta.get("score_regime", "")).strip(),
+        )
+    )
 
 
 def _uncompacted_recent_entries(

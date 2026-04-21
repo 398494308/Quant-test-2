@@ -42,6 +42,7 @@ class StrategyClientConfig:
     sandbox: str
     timeout_seconds: int
     use_ephemeral: bool
+    dangerously_bypass_approvals_and_sandbox: bool = False
 
     def describe(self) -> str:
         return (
@@ -51,7 +52,8 @@ class StrategyClientConfig:
             f"approval={self.approval_policy} "
             f"sandbox={self.sandbox} "
             f"timeout={self.timeout_seconds}s "
-            f"ephemeral={int(self.use_ephemeral)}"
+            f"ephemeral={int(self.use_ephemeral)} "
+            f"bypass={int(self.dangerously_bypass_approvals_and_sandbox)}"
         )
 
 
@@ -71,6 +73,7 @@ def load_strategy_client_config() -> StrategyClientConfig:
         sandbox=os.getenv("CODEX_SANDBOX", "read-only").strip() or "read-only",
         timeout_seconds=int(os.getenv("CODEX_TIMEOUT_SECONDS", "600")),
         use_ephemeral=_env_flag("CODEX_EPHEMERAL", True),
+        dangerously_bypass_approvals_and_sandbox=_env_flag("CODEX_DANGEROUS_BYPASS", False),
     )
 
 
@@ -109,12 +112,14 @@ def _build_codex_prompt(
     system_prompt: str,
     *,
     inline_schema: dict[str, Any] | None = None,
+    cli_schema_enforced: bool = False,
 ) -> str:
     parts = []
     if system_prompt.strip():
         parts.append(system_prompt.strip())
-    parts.append("严格遵守给定的输出 schema。不要输出 schema 之外的内容。")
-    if inline_schema is not None:
+    if inline_schema is not None and cli_schema_enforced:
+        parts.append("严格遵守 CLI 提供的输出 schema。不要输出 schema 之外的内容。")
+    elif inline_schema is not None:
         parts.append(
             "恢复 session 时 CLI 不会强制 schema；你必须自己确保最终输出是单个 JSON 对象，且严格匹配下列 schema：\n"
             + json.dumps(inline_schema, ensure_ascii=False, indent=2)
@@ -257,17 +262,63 @@ def generate_json_object(
     schema = _extract_schema(text_format)
     if schema is None:
         raise StrategyGenerationError("Codex CLI client requires a json_schema output format")
+    raw_text = generate_text_response(
+        prompt=prompt,
+        system_prompt=system_prompt,
+        max_output_tokens=max_output_tokens,
+        timeout=timeout,
+        config=client_config,
+        progress_callback=progress_callback,
+        session_id=session_id,
+        response_metadata=response_metadata,
+        inline_schema=schema,
+    )
+    try:
+        payload = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise StrategyGenerationError(
+            f"codex exec returned invalid JSON (line {exc.lineno}, column {exc.colno}): "
+            f"{exc.msg}. Raw prefix: {raw_text[:400]!r}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise StrategyGenerationError("codex exec returned a non-object JSON payload")
+    return payload
 
-    command = [
-        client_config.codex_bin,
-        "-a",
-        client_config.approval_policy,
-        "-s",
-        client_config.sandbox,
-        "-C",
-        str(Path.cwd()),
-        "exec",
-    ]
+
+def generate_text_response(
+    prompt: str,
+    system_prompt: str,
+    max_output_tokens: int = 3200,
+    timeout: float | tuple[float, float] | None = None,
+    config: StrategyClientConfig | None = None,
+    progress_callback: ProgressCallback | None = None,
+    session_id: str | None = None,
+    response_metadata: dict[str, Any] | None = None,
+    inline_schema: dict[str, Any] | None = None,
+) -> str:
+    client_config = config or load_strategy_client_config()
+    if shutil.which(client_config.codex_bin) is None:
+        raise StrategyGenerationError(f"missing Codex CLI binary: {client_config.codex_bin}")
+
+    command = [client_config.codex_bin]
+    if client_config.dangerously_bypass_approvals_and_sandbox:
+        command.append("--dangerously-bypass-approvals-and-sandbox")
+    else:
+        command.extend(
+            [
+                "-a",
+                client_config.approval_policy,
+                "-s",
+                client_config.sandbox,
+            ]
+        )
+    command.extend(
+        [
+            "-C",
+            str(Path.cwd()),
+            "exec",
+        ]
+    )
     if session_id:
         command.append("resume")
     command.extend(
@@ -287,8 +338,8 @@ def generate_json_object(
 
     with tempfile.TemporaryDirectory(prefix="codex-exec-") as temp_dir:
         temp_root = Path(temp_dir)
-        schema_path = temp_root / "schema.json"
         output_path = temp_root / "last_message.json"
+        schema_path = temp_root / "schema.json"
         if session_id:
             command.extend(
                 [
@@ -299,11 +350,11 @@ def generate_json_object(
                 ]
             )
         else:
-            schema_path.write_text(json.dumps(schema, ensure_ascii=False, indent=2))
+            if inline_schema is not None:
+                schema_path.write_text(json.dumps(inline_schema, ensure_ascii=False, indent=2))
+                command.extend(["--output-schema", str(schema_path)])
             command.extend(
                 [
-                    "--output-schema",
-                    str(schema_path),
                     "--output-last-message",
                     str(output_path),
                     "-",
@@ -312,7 +363,8 @@ def generate_json_object(
         full_prompt = _build_codex_prompt(
             prompt,
             system_prompt,
-            inline_schema=schema if session_id else None,
+            inline_schema=inline_schema if session_id else inline_schema,
+            cli_schema_enforced=bool(inline_schema is not None and not session_id),
         )
         process = subprocess.Popen(
             command,
@@ -428,13 +480,4 @@ def generate_json_object(
         raw_text = _read_output_message(output_path, stdout)
         if not raw_text:
             raise StrategyGenerationError("codex exec returned an empty final message")
-        try:
-            payload = json.loads(raw_text)
-        except json.JSONDecodeError as exc:
-            raise StrategyGenerationError(
-                f"codex exec returned invalid JSON (line {exc.lineno}, column {exc.colno}): "
-                f"{exc.msg}. Raw prefix: {raw_text[:400]!r}"
-            ) from exc
-        if not isinstance(payload, dict):
-            raise StrategyGenerationError("codex exec returned a non-object JSON payload")
-        return payload
+        return raw_text

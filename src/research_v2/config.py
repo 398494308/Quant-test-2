@@ -103,7 +103,9 @@ class ResearchRuntimeConfig:
     early_reject_hit_rate_threshold: float
     smoke_window_count: int
     max_repair_attempts: int
+    max_no_edit_repair_attempts: int
     max_exploration_regen_attempts: int
+    max_consecutive_no_edit_failures_before_stop: int
     cluster_lock_rounds_stage1: int
     cluster_lock_rounds_stage2: int
     cluster_lock_rounds_stage3: int
@@ -173,7 +175,12 @@ def load_research_runtime_config(repo_root: Path) -> ResearchRuntimeConfig:
         early_reject_hit_rate_threshold=_env_float("MACD_V2_EARLY_REJECT_HIT_RATE", 0.15),
         smoke_window_count=_env_int("MACD_V2_SMOKE_WINDOW_COUNT", 3),
         max_repair_attempts=_env_int("MACD_V2_MAX_REPAIR_ATTEMPTS", 2),
+        max_no_edit_repair_attempts=_env_int("MACD_V2_MAX_NO_EDIT_REPAIR_ATTEMPTS", 1),
         max_exploration_regen_attempts=_env_int("MACD_V2_MAX_EXPLORATION_REGEN_ATTEMPTS", 2),
+        max_consecutive_no_edit_failures_before_stop=_env_int(
+            "MACD_V2_MAX_CONSECUTIVE_NO_EDIT_FAILURES_BEFORE_STOP",
+            3,
+        ),
         cluster_lock_rounds_stage1=_env_int("MACD_V2_CLUSTER_LOCK_ROUNDS_STAGE1", 3),
         cluster_lock_rounds_stage2=_env_int("MACD_V2_CLUSTER_LOCK_ROUNDS_STAGE2", 6),
         cluster_lock_rounds_stage3=_env_int("MACD_V2_CLUSTER_LOCK_ROUNDS_STAGE3", 10),
