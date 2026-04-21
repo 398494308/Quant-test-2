@@ -16,7 +16,6 @@ import logging
 import os
 import shutil
 import sys
-import tempfile
 import time
 import traceback
 from dataclasses import replace
@@ -32,6 +31,7 @@ sys.path.insert(0, str(SRC_DIR))
 import backtest_macd_aggressive as backtest_module
 import strategy_macd_aggressive as strategy_module
 from codex_exec_client import (
+    StrategyGenerationSessionError,
     StrategyGenerationTransientError,
     build_json_text_format,
     generate_json_object,
@@ -46,16 +46,19 @@ from research_v2.evaluation import (
     summarize_hidden_test_result,
 )
 from research_v2.journal import (
-    ORDINARY_REGION_FAMILIES,
     append_journal_archive,
     append_journal_entry,
     build_journal_prompt_summary,
+    count_recent_result_basin,
+    evaluate_candidate_failure_wiki_guard,
     evaluate_candidate_exploration_guard,
     cluster_key_for_components,
     exploration_signature_for_candidate,
+    load_failure_wiki_index,
     has_recent_code_hash,
     load_journal_entries,
     region_families_for_regions,
+    result_basin_key_for_entry,
     target_family_from_text,
     maybe_compact,
 )
@@ -63,6 +66,7 @@ from research_v2.notifications import build_discord_summary_message, load_discor
 from research_v2.prompting import (
     EDITABLE_REGIONS,
     build_candidate_response_schema,
+    build_strategy_agents_instructions,
     build_strategy_exploration_repair_prompt,
     build_strategy_research_prompt,
     build_strategy_runtime_repair_prompt,
@@ -108,6 +112,7 @@ champion_report: EvaluationReport | None = None
 iteration_counter = 0
 reference_stage_started_at = ""
 reference_stage_iteration = 0
+research_session_state: dict[str, Any] = {}
 
 logging.basicConfig(
     filename=RUNTIME.paths.log_file,
@@ -162,6 +167,9 @@ def _build_model_progress_callback(phase: str, *, repair_attempt: int | None = N
         message = f"iteration {iteration_counter} {phase}"
         if event == "started":
             message += " started"
+        elif event == "thread_started":
+            thread_id = str(payload.get("thread_id", "")).strip()
+            message += f" thread_started {thread_id}" if thread_id else " thread_started"
         elif event == "heartbeat" and timeout_seconds > 0:
             message += f" waiting {elapsed_seconds}s/{timeout_seconds}s"
         elif event == "timeout" and timeout_seconds > 0:
@@ -178,12 +186,188 @@ def _build_model_progress_callback(phase: str, *, repair_attempt: int | None = N
             "provider_model": payload.get("model"),
             "provider_reasoning_effort": payload.get("reasoning_effort"),
         }
+        if str(payload.get("thread_id", "")).strip():
+            heartbeat_payload["session_id"] = str(payload.get("thread_id", "")).strip()
         if repair_attempt is not None:
             heartbeat_payload["repair_attempt"] = repair_attempt
 
         write_heartbeat("model_waiting", **heartbeat_payload)
 
     return callback
+
+
+def _session_scope_payload() -> dict[str, Any]:
+    reference_code_hash = source_hash(best_source) if best_source else ""
+    return {
+        "score_regime": SCORE_REGIME,
+        "reference_role": _reference_role() if best_report is not None else "",
+        "reference_code_hash": reference_code_hash,
+        "reference_stage_started_at": reference_stage_started_at,
+        "reference_stage_iteration": int(reference_stage_iteration or 0),
+    }
+
+
+def _load_research_session_state() -> dict[str, Any]:
+    global research_session_state
+    if research_session_state:
+        return dict(research_session_state)
+    path = RUNTIME.paths.session_state_file
+    if not path.exists():
+        research_session_state = {}
+        return {}
+    try:
+        payload = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        research_session_state = {}
+        return {}
+    research_session_state = payload if isinstance(payload, dict) else {}
+    return dict(research_session_state)
+
+
+def _persist_research_session_state(payload: dict[str, Any]) -> None:
+    global research_session_state
+    path = RUNTIME.paths.session_state_file
+    path.parent.mkdir(parents=True, exist_ok=True)
+    normalized = dict(payload)
+    temp_path = path.with_suffix(".json.tmp")
+    temp_path.write_text(json.dumps(normalized, ensure_ascii=False, indent=2))
+    temp_path.replace(path)
+    research_session_state = normalized
+
+
+def _clear_research_session_state(*, remove_workspace: bool = False, reason: str = "") -> None:
+    global research_session_state
+    research_session_state = {}
+    if RUNTIME.paths.session_state_file.exists():
+        RUNTIME.paths.session_state_file.unlink()
+    if remove_workspace and RUNTIME.paths.agent_workspace_dir.exists():
+        shutil.rmtree(RUNTIME.paths.agent_workspace_dir, ignore_errors=True)
+    if reason:
+        log_info(f"研究 session 已重置: {reason}")
+
+
+def _session_state_matches_current_stage(state: dict[str, Any] | None) -> bool:
+    if not isinstance(state, dict) or not state:
+        return False
+    scope = _session_scope_payload()
+    if not scope["reference_code_hash"]:
+        return False
+    return all(str(state.get(key, "")).strip() == str(scope.get(key, "")).strip() for key in scope)
+
+
+def _active_research_session_id() -> str:
+    state = _load_research_session_state()
+    if not _session_state_matches_current_stage(state):
+        return ""
+    return str(state.get("session_id", "")).strip()
+
+
+def _store_research_session_metadata(
+    *,
+    session_id: str,
+    workspace_root: Path,
+) -> None:
+    if not session_id:
+        return
+    previous = _load_research_session_state()
+    now = datetime.now(UTC).isoformat()
+    payload = {
+        **_session_scope_payload(),
+        "session_id": session_id,
+        "workspace_root": str(workspace_root),
+        "created_at": str(previous.get("created_at", "")).strip() or now,
+        "updated_at": now,
+    }
+    _persist_research_session_state(payload)
+
+
+def _align_research_session_scope(*, force_reset: bool = False) -> None:
+    state = _load_research_session_state()
+    if force_reset:
+        _clear_research_session_state(remove_workspace=True, reason="reference scope changed by explicit reset")
+        return
+    if state and not _session_state_matches_current_stage(state):
+        _clear_research_session_state(remove_workspace=True, reason="reference scope changed")
+
+
+def _refresh_prompt_memory_snapshots() -> str:
+    if best_report is None:
+        return ""
+    benchmark_report = _reference_benchmark_report()
+    reference_metrics = benchmark_report.metrics if benchmark_report is not None else best_report.metrics
+    journal_entries = load_journal_entries(RUNTIME.paths.journal_file)
+    return build_journal_prompt_summary(
+        journal_entries,
+        limit=RUNTIME.max_recent_journal_entries,
+        journal_path=RUNTIME.paths.journal_file,
+        current_score_regime=SCORE_REGIME,
+        current_iteration=iteration_counter or (
+            max((int(entry.get("iteration", 0) or 0) for entry in journal_entries), default=0) + 1
+        ),
+        active_stage_started_at=reference_stage_started_at,
+        active_stage_iteration=reference_stage_iteration,
+        reference_role=_reference_role(),
+        reference_metrics=reference_metrics,
+        memory_root=RUNTIME.paths.memory_dir,
+    )
+
+
+def _ensure_workspace_link(link_path: Path, target_path: Path) -> None:
+    link_path.parent.mkdir(parents=True, exist_ok=True)
+    if link_path.is_symlink():
+        try:
+            if link_path.resolve() == target_path.resolve():
+                return
+        except OSError:
+            pass
+        link_path.unlink()
+    elif link_path.exists():
+        if link_path.is_dir():
+            shutil.rmtree(link_path)
+        else:
+            link_path.unlink()
+    link_path.symlink_to(target_path, target_is_directory=target_path.is_dir())
+
+
+def _prepare_agent_workspace(
+    *,
+    base_source: str,
+    factor_change_mode: str,
+    reset_strategy: bool,
+) -> Path:
+    _refresh_prompt_memory_snapshots()
+    workspace_root = RUNTIME.paths.agent_workspace_dir
+    workspace_root.mkdir(parents=True, exist_ok=True)
+
+    (workspace_root / "src").mkdir(parents=True, exist_ok=True)
+    (workspace_root / "wiki").mkdir(parents=True, exist_ok=True)
+    workspace_strategy_file = workspace_root / MODEL_WORKSPACE_STRATEGY_PATH
+    if reset_strategy or not workspace_strategy_file.exists():
+        write_strategy_source(workspace_strategy_file, base_source)
+
+    agents_path = workspace_root / "AGENTS.md"
+    agents_path.write_text(
+        build_strategy_agents_instructions(factor_change_mode=factor_change_mode),
+    )
+
+    _ensure_workspace_link(workspace_root / "src/backtest_macd_aggressive.py", RUNTIME.paths.backtest_file)
+    if (REPO_ROOT / "data").exists():
+        _ensure_workspace_link(workspace_root / "data", REPO_ROOT / "data")
+    _ensure_workspace_link(workspace_root / "memory", RUNTIME.paths.memory_dir)
+    memory_paths = {
+        "history_package": RUNTIME.paths.memory_dir / "prompt/latest_history_package.md",
+        "failure_wiki_md": RUNTIME.paths.memory_dir / "wiki/failure_wiki.md",
+        "failure_wiki_json": RUNTIME.paths.memory_dir / "wiki/failure_wiki_index.json",
+    }
+    for key, target_path in memory_paths.items():
+        if target_path.exists():
+            link_name = {
+                "history_package": workspace_root / "wiki/latest_history_package.md",
+                "failure_wiki_md": workspace_root / "wiki/failure_wiki.md",
+                "failure_wiki_json": workspace_root / "wiki/failure_wiki_index.json",
+            }[key]
+            _ensure_workspace_link(link_name, target_path)
+    return workspace_root
 
 
 # ==================== 模块热加载 ====================
@@ -270,30 +454,52 @@ def _entry_has_effective_positive_delta(entry: dict[str, Any]) -> bool:
     return promotion_delta > _effective_positive_delta_threshold()
 
 
-def _entry_is_factor_stall(entry: dict[str, Any]) -> bool:
+def _entry_is_factor_stall(
+    entry: dict[str, Any],
+    *,
+    basin_counts: dict[str, int] | None = None,
+) -> bool:
     outcome = str(entry.get("outcome", "")).strip()
-    if outcome in {"behavioral_noop", "exploration_blocked"}:
+    if outcome in {"behavioral_noop", "exploration_blocked", "duplicate_skipped"}:
         return True
-    if outcome not in {"accepted", "rejected"}:
+    if outcome == "runtime_failed":
+        return _is_complexity_error_message(str(entry.get("decision_reason", "")).strip())
+    if outcome not in {"accepted", "rejected", "early_rejected"}:
         return False
     try:
         promotion_delta = float(entry.get("promotion_delta", 0.0) or 0.0)
     except (TypeError, ValueError):
         promotion_delta = 0.0
-    return abs(promotion_delta) <= 1e-9
+    if abs(promotion_delta) <= 1e-9:
+        return True
+    basin_key = result_basin_key_for_entry(entry)
+    if basin_key and basin_counts and basin_counts.get(basin_key, 0) >= 2:
+        return True
+    return False
 
 
 def _resolve_iteration_factor_change_mode(journal_entries: list[dict[str, Any]]) -> tuple[str, str]:
     base_mode = normalize_factor_change_mode(str(RUNTIME.base_factor_change_mode or "default").strip() or "default")
     stage_entries = _current_stage_journal_entries(journal_entries)
-    trailing_stalls = 0
+    stage_tail: list[dict[str, Any]] = []
     factor_admission_rounds = 0
     for entry in reversed(stage_entries):
         if _entry_has_effective_positive_delta(entry):
             break
+        stage_tail.append(entry)
+    for entry in stage_tail:
         if str(entry.get("factor_change_mode", "")).strip() == "factor_admission":
             factor_admission_rounds += 1
-        if _entry_is_factor_stall(entry):
+
+    basin_counts: dict[str, int] = {}
+    for entry in stage_tail:
+        basin_key = result_basin_key_for_entry(entry)
+        if basin_key:
+            basin_counts[basin_key] = basin_counts.get(basin_key, 0) + 1
+
+    trailing_stalls = 0
+    for entry in stage_tail:
+        if _entry_is_factor_stall(entry, basin_counts=basin_counts):
             trailing_stalls += 1
             continue
         break
@@ -304,7 +510,7 @@ def _resolve_iteration_factor_change_mode(journal_entries: list[dict[str, Any]])
         return (
             "factor_admission",
             (
-                f"当前stage已连续 {trailing_stalls} 轮 behavioral_noop/exploration_blocked/zero delta，"
+                f"当前stage已连续 {trailing_stalls} 轮 behavioral_noop/exploration_blocked/重复结果盆地/复杂度连撞，"
                 f"临时开启 factor_admission 第 {factor_admission_rounds + 1}/{FACTOR_ADMISSION_MAX_BURST} 轮"
             ),
         )
@@ -340,6 +546,7 @@ def _discord_data_range_text() -> str:
 def _append_research_journal_entry(entry: dict[str, Any]) -> None:
     append_journal_entry(RUNTIME.paths.journal_file, entry)
     append_journal_archive(RUNTIME.paths.memory_dir, entry)
+    _refresh_prompt_memory_snapshots()
 
 
 def _parse_state_timestamp(value: Any) -> datetime | None:
@@ -1003,14 +1210,19 @@ def _behavioral_noop_block_info(
 ) -> dict[str, Any]:
     smoke_windows = ", ".join(window.label for window in _selected_smoke_windows()) or "-"
     noop_streak = _recent_behavioral_noop_streak(journal_entries)
-    cluster_key = cluster_key_for_components(
-        candidate.closest_failed_cluster,
-        candidate.change_tags,
-    ) or str(candidate.closest_failed_cluster).strip() or "-"
     candidate_signature = exploration_signature_for_candidate(
         candidate,
         base_source=base_source,
         editable_regions=EDITABLE_REGIONS,
+    )
+    cluster_key = (
+        str(candidate_signature.get("cluster_key", "")).strip()
+        or cluster_key_for_components(
+            candidate.closest_failed_cluster,
+            candidate.change_tags,
+        )
+        or str(candidate.closest_failed_cluster).strip()
+        or "-"
     )
     changed_regions = ", ".join(sorted(candidate_signature["changed_regions"])) or "-"
     ordinary_families = ", ".join(sorted(candidate_signature["ordinary_region_families"])) or "-"
@@ -1038,7 +1250,7 @@ def _behavioral_noop_block_info(
         )
     if not candidate_signature["ordinary_region_families"]:
         feedback_lines.append(
-            "- 本轮真实 diff 只动了 `strategy()` / `PARAMS` 特殊区域，没有碰到普通 family；这类近邻阈值微调最容易继续落成 behavioral_noop。"
+            "- 本轮真实 diff 只动了 `strategy()` / `PARAMS` 特殊区域；这是允许的，但前提是你必须明确改变最终信号集合或退出集合，否则最容易继续落成 behavioral_noop。"
         )
     if target_family in {"long", "mixed"}:
         feedback_lines.append(
@@ -1173,18 +1385,62 @@ def _candidate_from_payload(
         raise StrategySourceError("candidate missing closest_failed_cluster")
     if not candidate.novelty_proof:
         raise StrategySourceError("candidate missing novelty_proof")
-    candidate_signature = exploration_signature_for_candidate(
-        candidate,
-        base_source=base_source,
-        editable_regions=EDITABLE_REGIONS,
-    )
-    ordinary_region_families = sorted(candidate_signature["ordinary_region_families"])
-    if not ordinary_region_families:
-        raise StrategySourceError(
-            "candidate must change at least 1 ordinary region family from "
-            f"{', '.join(ORDINARY_REGION_FAMILIES)}; strategy/PARAMS alone are not enough"
-        )
     return candidate
+
+
+def _run_model_json_request(
+    *,
+    prompt: str,
+    system_prompt: str,
+    schema_name: str,
+    phase: str,
+    workspace_root: Path,
+    repair_attempt: int | None = None,
+) -> dict[str, Any]:
+    session_id = _active_research_session_id()
+
+    def _invoke(active_session_id: str | None, metadata: dict[str, Any]) -> dict[str, Any]:
+        with _temporary_cwd(workspace_root):
+            return generate_json_object(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                max_output_tokens=RUNTIME.prompt_max_output_tokens,
+                config=_model_client_config(),
+                text_format=build_json_text_format(
+                    schema=build_candidate_response_schema(),
+                    schema_name=schema_name,
+                    strict=True,
+                ),
+                progress_callback=_build_model_progress_callback(
+                    phase,
+                    repair_attempt=repair_attempt,
+                ),
+                session_id=active_session_id,
+                response_metadata=metadata,
+            )
+
+    response_metadata: dict[str, Any] = {}
+    try:
+        payload = _invoke(session_id or None, response_metadata)
+    except StrategyGenerationSessionError as exc:
+        if not session_id:
+            raise
+        log_info(f"Codex session 无法恢复，改为新 session 重试: {exc}")
+        _clear_research_session_state(remove_workspace=False, reason="invalid provider session")
+        response_metadata = {}
+        payload = _invoke(None, response_metadata)
+
+    resolved_session_id = (
+        str(response_metadata.get("session_id", "")).strip()
+        or str(response_metadata.get("thread_id", "")).strip()
+        or session_id
+    )
+    if resolved_session_id:
+        _store_research_session_metadata(
+            session_id=resolved_session_id,
+            workspace_root=workspace_root,
+        )
+    return payload
 
 
 def _build_model_candidate_payload(
@@ -1201,6 +1457,7 @@ def _build_model_candidate_payload(
     if benchmark_report is None:
         raise StrategySourceError("reference benchmark is not initialized")
 
+    session_mode = "resume" if _active_research_session_id() else "bootstrap"
     prompt = build_strategy_research_prompt(
         evaluation_summary=report.prompt_summary_text,
         journal_summary=build_journal_prompt_summary(
@@ -1221,22 +1478,17 @@ def _build_model_candidate_payload(
         promotion_min_delta=RUNTIME.promotion_min_delta,
         factor_change_mode=factor_change_mode,
         current_complexity_headroom_text=format_strategy_complexity_headroom(base_source),
+        session_mode=session_mode,
     )
-    with _temporary_cwd(workspace_root):
-        return generate_json_object(
-            prompt=prompt,
-            system_prompt=build_strategy_system_prompt(
-                factor_change_mode=factor_change_mode,
-            ),
-            max_output_tokens=RUNTIME.prompt_max_output_tokens,
-            config=_model_client_config(),
-            text_format=build_json_text_format(
-                schema=build_candidate_response_schema(),
-                schema_name="macd_aggressive_strategy_candidate_v2",
-                strict=True,
-            ),
-            progress_callback=_build_model_progress_callback("model_generate"),
-        )
+    return _run_model_json_request(
+        prompt=prompt,
+        system_prompt=build_strategy_system_prompt(
+            factor_change_mode=factor_change_mode,
+        ),
+        schema_name="macd_aggressive_strategy_candidate_v2",
+        phase="model_generate",
+        workspace_root=workspace_root,
+    )
 
 
 def _repair_model_candidate_payload(
@@ -1260,24 +1512,16 @@ def _repair_model_candidate_payload(
         error_message=error_message,
         repair_attempt=repair_attempt,
     )
-    with _temporary_cwd(workspace_root):
-        return generate_json_object(
-            prompt=prompt,
-            system_prompt=build_strategy_system_prompt(
-                factor_change_mode=factor_change_mode,
-            ),
-            max_output_tokens=RUNTIME.prompt_max_output_tokens,
-            config=_model_client_config(),
-            text_format=build_json_text_format(
-                schema=build_candidate_response_schema(),
-                schema_name="macd_aggressive_strategy_candidate_repair_v2",
-                strict=True,
-            ),
-            progress_callback=_build_model_progress_callback(
-                "model_repair",
-                repair_attempt=repair_attempt,
-            ),
-        )
+    return _run_model_json_request(
+        prompt=prompt,
+        system_prompt=build_strategy_system_prompt(
+            factor_change_mode=factor_change_mode,
+        ),
+        schema_name="macd_aggressive_strategy_candidate_repair_v2",
+        phase="model_repair",
+        workspace_root=workspace_root,
+        repair_attempt=repair_attempt,
+    )
 
 
 def _regenerate_model_candidate_payload(
@@ -1305,24 +1549,16 @@ def _regenerate_model_candidate_payload(
         regeneration_attempt=regeneration_attempt,
         feedback_note=str(block_info.get("feedback_note", "")).strip(),
     )
-    with _temporary_cwd(workspace_root):
-        return generate_json_object(
-            prompt=prompt,
-            system_prompt=build_strategy_system_prompt(
-                factor_change_mode=factor_change_mode,
-            ),
-            max_output_tokens=RUNTIME.prompt_max_output_tokens,
-            config=_model_client_config(),
-            text_format=build_json_text_format(
-                schema=build_candidate_response_schema(),
-                schema_name="macd_aggressive_strategy_candidate_regeneration_v2",
-                strict=True,
-            ),
-            progress_callback=_build_model_progress_callback(
-                "model_regenerate",
-                repair_attempt=regeneration_attempt,
-            ),
-        )
+    return _run_model_json_request(
+        prompt=prompt,
+        system_prompt=build_strategy_system_prompt(
+            factor_change_mode=factor_change_mode,
+        ),
+        schema_name="macd_aggressive_strategy_candidate_regeneration_v2",
+        phase="model_regenerate",
+        workspace_root=workspace_root,
+        repair_attempt=regeneration_attempt,
+    )
 
 
 def _candidate_from_payload_with_validation_repair(
@@ -1569,6 +1805,7 @@ def initialize_best_state(force_rebuild: bool = False) -> None:
                 f"promotion={best_report.metrics['promotion_score']:.2f}, "
                 f"gate={best_report.gate_reason}"
             )
+            _align_research_session_scope(force_reset=False)
             write_heartbeat(
                 "initialized",
                 message="loaded saved reference",
@@ -1612,6 +1849,7 @@ def initialize_best_state(force_rebuild: bool = False) -> None:
         f"promotion={best_report.metrics['promotion_score']:.2f}, "
         f"gate={best_report.gate_reason}"
     )
+    _align_research_session_scope(force_reset=force_rebuild)
     write_heartbeat(
         "initialized",
         message="reference ready",
@@ -1703,7 +1941,8 @@ def _build_journal_entry(
             }
             for factor in candidate.core_factors
         ],
-        "cluster_key": cluster_key_for_components(
+        "cluster_key": str(candidate_signature.get("cluster_key", "")).strip()
+        or cluster_key_for_components(
             candidate.closest_failed_cluster,
             candidate.change_tags,
         ),
@@ -1743,8 +1982,10 @@ def _build_journal_entry(
         "core_factor_names": sorted(candidate_signature["core_factor_names"]),
         "score_regime": SCORE_REGIME,
     }
+    entry["result_basin_key"] = result_basin_key_for_entry(entry)
     if extra_fields:
         entry.update(extra_fields)
+        entry["result_basin_key"] = result_basin_key_for_entry(entry)
     return entry
 
 
@@ -2008,90 +2249,98 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
         factor_change_mode=current_factor_change_mode,
         factor_change_reason=factor_change_reason,
     )
+    _align_research_session_scope(force_reset=False)
+    workspace_root = _prepare_agent_workspace(
+        base_source=best_source,
+        factor_change_mode=current_factor_change_mode,
+        reset_strategy=True,
+    )
 
-    with tempfile.TemporaryDirectory(prefix="macd-v2-workspace-") as temp_dir:
-        workspace_root = Path(temp_dir)
-        workspace_strategy_file = workspace_root / MODEL_WORKSPACE_STRATEGY_PATH
-        workspace_strategy_file.parent.mkdir(parents=True, exist_ok=True)
-        write_strategy_source(workspace_strategy_file, best_source)
+    try:
+        candidate = build_strategy_candidate(
+            best_source,
+            journal_entries,
+            workspace_root=workspace_root,
+            factor_change_mode=current_factor_change_mode,
+        )
+    except CandidateRepairExhausted as exc:
+        write_strategy_source(RUNTIME.paths.strategy_file, best_source)
+        reload_strategy_module()
+        _record_runtime_failure(
+            iteration_id=iteration_id,
+            candidate=exc.candidate,
+            base_source=best_source,
+            factor_change_mode=current_factor_change_mode,
+            errors=exc.errors,
+            failure_stage=exc.failure_stage or "candidate_validation",
+            stop_stage="candidate_validation",
+        )
+        log_info(f"第 {iteration_id} 轮候选源码校验失败并已记录: {exc}")
+        write_heartbeat(
+            "iteration_runtime_failed",
+            message=f"iteration {iteration_id} candidate validation failed",
+            error=str(exc),
+        )
+        return "runtime_failed"
+    candidate_report: EvaluationReport | None = None
+    exploration_regeneration_attempt = 0
+    behavioral_noop_regeneration_attempt = 0
 
-        try:
-            candidate = build_strategy_candidate(
-                best_source,
-                journal_entries,
-                workspace_root=workspace_root,
-                factor_change_mode=current_factor_change_mode,
-            )
-        except CandidateRepairExhausted as exc:
-            write_strategy_source(RUNTIME.paths.strategy_file, best_source)
-            reload_strategy_module()
-            _record_runtime_failure(
+    while True:
+        candidate_report = None
+        journal_entries = load_journal_entries(RUNTIME.paths.journal_file)
+        candidate_hash = source_hash(candidate.strategy_code)
+
+        if candidate_hash == source_hash(best_source):
+            _record_duplicate_skip(
                 iteration_id=iteration_id,
-                candidate=exc.candidate,
+                candidate=candidate,
                 base_source=best_source,
                 factor_change_mode=current_factor_change_mode,
-                errors=exc.errors,
-                failure_stage=exc.failure_stage or "candidate_validation",
-                stop_stage="candidate_validation",
+                stop_stage="duplicate_source",
+                gate_reason="候选源码与当前主参考完全相同",
+                note="模型未产生有效代码改动；本轮按重复探索记入研究历史。",
             )
-            log_info(f"第 {iteration_id} 轮候选源码校验失败并已记录: {exc}")
-            write_heartbeat(
-                "iteration_runtime_failed",
-                message=f"iteration {iteration_id} candidate validation failed",
-                error=str(exc),
+            log_info(f"第 {iteration_id} 轮跳过: 候选源码与当前主参考完全相同")
+            write_heartbeat("iteration_skipped", message=f"iteration {iteration_id} duplicate source")
+            return "duplicate_skipped"
+        if has_recent_code_hash(journal_entries, candidate_hash):
+            _record_duplicate_skip(
+                iteration_id=iteration_id,
+                candidate=candidate,
+                base_source=best_source,
+                factor_change_mode=current_factor_change_mode,
+                stop_stage="duplicate_history",
+                gate_reason="候选源码命中最近研究历史",
+                note="模型重复产出了最近已出现过的候选源码；本轮按重复探索记入研究历史。",
             )
-            return "runtime_failed"
-        candidate_report: EvaluationReport | None = None
-        exploration_regeneration_attempt = 0
-        behavioral_noop_regeneration_attempt = 0
+            log_info(f"第 {iteration_id} 轮跳过: 候选源码命中最近研究历史")
+            write_heartbeat("iteration_skipped", message=f"iteration {iteration_id} duplicate journal hash")
+            return "duplicate_skipped"
 
-        while True:
-            candidate_report = None
-            journal_entries = load_journal_entries(RUNTIME.paths.journal_file)
-            candidate_hash = source_hash(candidate.strategy_code)
+        diff_summary = build_diff_summary(best_source, candidate.strategy_code, limit=12)
+        if not diff_summary:
+            _record_duplicate_skip(
+                iteration_id=iteration_id,
+                candidate=candidate,
+                base_source=best_source,
+                factor_change_mode=current_factor_change_mode,
+                stop_stage="empty_diff",
+                gate_reason="候选没有产生有效 diff",
+                note="候选虽然通过了解析，但没有形成可验证的有效改动；本轮按重复探索记入研究历史。",
+            )
+            log_info(f"第 {iteration_id} 轮跳过: 候选没有产生有效 diff")
+            write_heartbeat("iteration_skipped", message=f"iteration {iteration_id} empty diff")
+            return "duplicate_skipped"
 
-            if candidate_hash == source_hash(best_source):
-                _record_duplicate_skip(
-                    iteration_id=iteration_id,
-                    candidate=candidate,
-                    base_source=best_source,
-                    factor_change_mode=current_factor_change_mode,
-                    stop_stage="duplicate_source",
-                    gate_reason="候选源码与当前主参考完全相同",
-                    note="模型未产生有效代码改动；本轮按重复探索记入研究历史。",
-                )
-                log_info(f"第 {iteration_id} 轮跳过: 候选源码与当前主参考完全相同")
-                write_heartbeat("iteration_skipped", message=f"iteration {iteration_id} duplicate source")
-                return "duplicate_skipped"
-            if has_recent_code_hash(journal_entries, candidate_hash):
-                _record_duplicate_skip(
-                    iteration_id=iteration_id,
-                    candidate=candidate,
-                    base_source=best_source,
-                    factor_change_mode=current_factor_change_mode,
-                    stop_stage="duplicate_history",
-                    gate_reason="候选源码命中最近研究历史",
-                    note="模型重复产出了最近已出现过的候选源码；本轮按重复探索记入研究历史。",
-                )
-                log_info(f"第 {iteration_id} 轮跳过: 候选源码命中最近研究历史")
-                write_heartbeat("iteration_skipped", message=f"iteration {iteration_id} duplicate journal hash")
-                return "duplicate_skipped"
-
-            diff_summary = build_diff_summary(best_source, candidate.strategy_code, limit=12)
-            if not diff_summary:
-                _record_duplicate_skip(
-                    iteration_id=iteration_id,
-                    candidate=candidate,
-                    base_source=best_source,
-                    factor_change_mode=current_factor_change_mode,
-                    stop_stage="empty_diff",
-                    gate_reason="候选没有产生有效 diff",
-                    note="候选虽然通过了解析，但没有形成可验证的有效改动；本轮按重复探索记入研究历史。",
-                )
-                log_info(f"第 {iteration_id} 轮跳过: 候选没有产生有效 diff")
-                write_heartbeat("iteration_skipped", message=f"iteration {iteration_id} empty diff")
-                return "duplicate_skipped"
-
+        failure_wiki_index = load_failure_wiki_index(RUNTIME.paths.memory_dir)
+        block_info = evaluate_candidate_failure_wiki_guard(
+            candidate,
+            failure_wiki_index,
+            base_source=best_source,
+            editable_regions=EDITABLE_REGIONS,
+        )
+        if block_info is None:
             block_info = evaluate_candidate_exploration_guard(
                 candidate,
                 journal_entries,
@@ -2103,163 +2352,163 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
                 lock_schedule=_cluster_lock_schedule(),
                 include_current_round_locks=True,
             )
-            if block_info is not None:
-                _record_exploration_block(
-                    iteration_id=iteration_id,
-                    candidate=candidate,
-                    base_source=best_source,
-                    factor_change_mode=current_factor_change_mode,
-                    block_info=block_info,
-                )
-                log_info(
-                    f"第 {iteration_id} 轮候选在评估前被系统拦截: "
-                    f"{block_info['blocked_reason']}"
-                )
-                if exploration_regeneration_attempt >= RUNTIME.max_exploration_regen_attempts:
-                    write_strategy_source(RUNTIME.paths.strategy_file, best_source)
-                    reload_strategy_module()
-                    write_heartbeat(
-                        "iteration_exploration_blocked",
-                        message=f"iteration {iteration_id} exploration blocked",
-                        block_kind=block_info["block_kind"],
-                        blocked_cluster=block_info["blocked_cluster"],
-                    )
-                    return "exploration_blocked"
-
+        if block_info is not None:
+            _record_exploration_block(
+                iteration_id=iteration_id,
+                candidate=candidate,
+                base_source=best_source,
+                factor_change_mode=current_factor_change_mode,
+                block_info=block_info,
+            )
+            log_info(
+                f"第 {iteration_id} 轮候选在评估前被系统拦截: "
+                f"{block_info['blocked_reason']}"
+            )
+            if exploration_regeneration_attempt >= RUNTIME.max_exploration_regen_attempts:
+                write_strategy_source(RUNTIME.paths.strategy_file, best_source)
+                reload_strategy_module()
                 write_heartbeat(
-                    "candidate_regenerating",
-                    message=f"iteration {iteration_id} regenerating candidate",
-                    regeneration_attempt=exploration_regeneration_attempt + 1,
-                    max_regeneration_attempts=RUNTIME.max_exploration_regen_attempts,
+                    "iteration_exploration_blocked",
+                    message=f"iteration {iteration_id} exploration blocked",
                     block_kind=block_info["block_kind"],
                     blocked_cluster=block_info["blocked_cluster"],
                 )
-                exploration_regeneration_attempt += 1
-                candidate = _regenerate_model_candidate(
-                    base_source=best_source,
-                    failed_candidate=candidate,
-                    block_info=block_info,
-                    regeneration_attempt=exploration_regeneration_attempt,
-                    workspace_root=workspace_root,
-                    factor_change_mode=current_factor_change_mode,
-                )
-                continue
+                return "exploration_blocked"
 
-            try:
-                while True:
-                    try:
-                        candidate, candidate_report = _candidate_with_repair(
-                            best_source,
-                            candidate,
-                            workspace_root=workspace_root,
-                            factor_change_mode=current_factor_change_mode,
-                        )
-                        break
-                    except CandidateBehavioralNoop as exc:
-                        write_strategy_source(RUNTIME.paths.strategy_file, best_source)
-                        reload_strategy_module()
-                        journal_entries = load_journal_entries(RUNTIME.paths.journal_file)
-                        if behavioral_noop_regeneration_attempt >= RUNTIME.max_exploration_regen_attempts:
-                            _record_behavioral_noop(
-                                iteration_id=iteration_id,
-                                candidate=exc.candidate,
-                                base_source=best_source,
-                                factor_change_mode=current_factor_change_mode,
-                                behavior_diff=exc.behavior_diff,
-                            )
-                            log_info(
-                                f"第 {iteration_id} 轮跳过: smoke 行为指纹未变化 "
-                                f"(trades={exc.behavior_diff['candidate']['total_trades']})"
-                            )
-                            write_heartbeat(
-                                "iteration_behavioral_noop",
-                                message=f"iteration {iteration_id} behavioral noop",
-                                gate="smoke 行为指纹与当前主参考完全一致",
-                            )
-                            return "behavioral_noop"
+            write_heartbeat(
+                "candidate_regenerating",
+                message=f"iteration {iteration_id} regenerating candidate",
+                regeneration_attempt=exploration_regeneration_attempt + 1,
+                max_regeneration_attempts=RUNTIME.max_exploration_regen_attempts,
+                block_kind=block_info["block_kind"],
+                blocked_cluster=block_info["blocked_cluster"],
+            )
+            exploration_regeneration_attempt += 1
+            candidate = _regenerate_model_candidate(
+                base_source=best_source,
+                failed_candidate=candidate,
+                block_info=block_info,
+                regeneration_attempt=exploration_regeneration_attempt,
+                workspace_root=workspace_root,
+                factor_change_mode=current_factor_change_mode,
+            )
+            continue
 
-                        block_info = _behavioral_noop_block_info(
-                            exc.candidate,
-                            exc.behavior_diff,
-                            journal_entries=journal_entries,
+        try:
+            while True:
+                try:
+                    candidate, candidate_report = _candidate_with_repair(
+                        best_source,
+                        candidate,
+                        workspace_root=workspace_root,
+                        factor_change_mode=current_factor_change_mode,
+                    )
+                    break
+                except CandidateBehavioralNoop as exc:
+                    write_strategy_source(RUNTIME.paths.strategy_file, best_source)
+                    reload_strategy_module()
+                    journal_entries = load_journal_entries(RUNTIME.paths.journal_file)
+                    if behavioral_noop_regeneration_attempt >= RUNTIME.max_exploration_regen_attempts:
+                        _record_behavioral_noop(
+                            iteration_id=iteration_id,
+                            candidate=exc.candidate,
                             base_source=best_source,
-                        )
-                        behavioral_noop_regeneration_attempt += 1
-                        write_heartbeat(
-                            "candidate_regenerating",
-                            message=f"iteration {iteration_id} regenerating candidate after behavioral noop",
-                            regeneration_attempt=behavioral_noop_regeneration_attempt,
-                            max_regeneration_attempts=RUNTIME.max_exploration_regen_attempts,
-                            block_kind=block_info["block_kind"],
-                            blocked_cluster=block_info["blocked_cluster"],
+                            factor_change_mode=current_factor_change_mode,
+                            behavior_diff=exc.behavior_diff,
                         )
                         log_info(
-                            f"第 {iteration_id} 轮候选 smoke 行为未变化，触发同轮重生 "
-                            f"{behavioral_noop_regeneration_attempt}/{RUNTIME.max_exploration_regen_attempts}"
+                            f"第 {iteration_id} 轮跳过: smoke 行为指纹未变化 "
+                            f"(trades={exc.behavior_diff['candidate']['total_trades']})"
                         )
-                        candidate = _regenerate_model_candidate(
-                            base_source=best_source,
-                            failed_candidate=exc.candidate,
-                            block_info=block_info,
-                            regeneration_attempt=behavioral_noop_regeneration_attempt,
-                            workspace_root=workspace_root,
-                            factor_change_mode=current_factor_change_mode,
+                        write_heartbeat(
+                            "iteration_behavioral_noop",
+                            message=f"iteration {iteration_id} behavioral noop",
+                            gate="smoke 行为指纹与当前主参考完全一致",
                         )
-                        break
-            except EarlyRejection as exc:
-                write_strategy_source(RUNTIME.paths.strategy_file, best_source)
-                reload_strategy_module()
-                _append_research_journal_entry(
-                    _build_journal_entry(
-                        iteration_id=iteration_id,
-                        candidate=candidate,
-                        base_source=best_source,
-                        candidate_report=None,
-                        factor_change_mode=current_factor_change_mode,
-                        outcome="early_rejected",
-                        stop_stage="early_reject",
-                        gate_reason="前段趋势捕获过差",
-                        note=str(exc),
-                    )
-                )
-                if maybe_compact(RUNTIME.paths.journal_file):
-                    log_info("研究日志已压缩")
-                log_info(f"第 {iteration_id} 轮提前淘汰: {exc}")
-                write_heartbeat(
-                    "iteration_early_rejected",
-                    message=f"iteration {iteration_id} early rejected: {exc}",
-                    gate="前段趋势捕获过差",
-                )
-                return "early_rejected"
-            except CandidateRepairExhausted as exc:
-                write_strategy_source(RUNTIME.paths.strategy_file, best_source)
-                reload_strategy_module()
-                _record_runtime_failure(
-                    iteration_id=iteration_id,
-                    candidate=exc.candidate,
-                    base_source=best_source,
-                    factor_change_mode=current_factor_change_mode,
-                    errors=exc.errors,
-                    failure_stage=exc.failure_stage or "runtime_error",
-                    stop_stage="runtime_error",
-                )
-                log_info(f"第 {iteration_id} 轮运行失败并已记录: {exc}")
-                write_heartbeat(
-                    "iteration_runtime_failed",
-                    message=f"iteration {iteration_id} runtime failed",
-                    error=str(exc),
-                )
-                return "runtime_failed"
-            except StrategyGenerationTransientError:
-                raise
-            except Exception:
-                write_strategy_source(RUNTIME.paths.strategy_file, best_source)
-                reload_strategy_module()
-                raise
+                        return "behavioral_noop"
 
-            if candidate_report is None:
-                continue
-            break
+                    block_info = _behavioral_noop_block_info(
+                        exc.candidate,
+                        exc.behavior_diff,
+                        journal_entries=journal_entries,
+                        base_source=best_source,
+                    )
+                    behavioral_noop_regeneration_attempt += 1
+                    write_heartbeat(
+                        "candidate_regenerating",
+                        message=f"iteration {iteration_id} regenerating candidate after behavioral noop",
+                        regeneration_attempt=behavioral_noop_regeneration_attempt,
+                        max_regeneration_attempts=RUNTIME.max_exploration_regen_attempts,
+                        block_kind=block_info["block_kind"],
+                        blocked_cluster=block_info["blocked_cluster"],
+                    )
+                    log_info(
+                        f"第 {iteration_id} 轮候选 smoke 行为未变化，触发同轮重生 "
+                        f"{behavioral_noop_regeneration_attempt}/{RUNTIME.max_exploration_regen_attempts}"
+                    )
+                    candidate = _regenerate_model_candidate(
+                        base_source=best_source,
+                        failed_candidate=exc.candidate,
+                        block_info=block_info,
+                        regeneration_attempt=behavioral_noop_regeneration_attempt,
+                        workspace_root=workspace_root,
+                        factor_change_mode=current_factor_change_mode,
+                    )
+                    break
+        except EarlyRejection as exc:
+            write_strategy_source(RUNTIME.paths.strategy_file, best_source)
+            reload_strategy_module()
+            _append_research_journal_entry(
+                _build_journal_entry(
+                    iteration_id=iteration_id,
+                    candidate=candidate,
+                    base_source=best_source,
+                    candidate_report=None,
+                    factor_change_mode=current_factor_change_mode,
+                    outcome="early_rejected",
+                    stop_stage="early_reject",
+                    gate_reason="前段趋势捕获过差",
+                    note=str(exc),
+                )
+            )
+            if maybe_compact(RUNTIME.paths.journal_file):
+                log_info("研究日志已压缩")
+            log_info(f"第 {iteration_id} 轮提前淘汰: {exc}")
+            write_heartbeat(
+                "iteration_early_rejected",
+                message=f"iteration {iteration_id} early rejected: {exc}",
+                gate="前段趋势捕获过差",
+            )
+            return "early_rejected"
+        except CandidateRepairExhausted as exc:
+            write_strategy_source(RUNTIME.paths.strategy_file, best_source)
+            reload_strategy_module()
+            _record_runtime_failure(
+                iteration_id=iteration_id,
+                candidate=exc.candidate,
+                base_source=best_source,
+                factor_change_mode=current_factor_change_mode,
+                errors=exc.errors,
+                failure_stage=exc.failure_stage or "runtime_error",
+                stop_stage="runtime_error",
+            )
+            log_info(f"第 {iteration_id} 轮运行失败并已记录: {exc}")
+            write_heartbeat(
+                "iteration_runtime_failed",
+                message=f"iteration {iteration_id} runtime failed",
+                error=str(exc),
+            )
+            return "runtime_failed"
+        except StrategyGenerationTransientError:
+            raise
+        except Exception:
+            write_strategy_source(RUNTIME.paths.strategy_file, best_source)
+            reload_strategy_module()
+            raise
+
+        if candidate_report is None:
+            continue
+        break
 
     accepted, decision_reason = _promotion_acceptance_decision(candidate_report)
     entry_note = ""
@@ -2277,6 +2526,26 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
         gate_reason=decision_reason if not accepted else None,
         note=entry_note,
     )
+    recent_entries = load_journal_entries(RUNTIME.paths.journal_file)
+    if not accepted:
+        basin_key = str(entry_base.get("result_basin_key", "")).strip()
+        repeated_basin_hits = count_recent_result_basin(recent_entries, basin_key)
+        if repeated_basin_hits > 0:
+            original_reason = str(entry_base.get("decision_reason", "")).strip() or decision_reason
+            entry_base.update(
+                {
+                    "outcome": "duplicate_skipped",
+                    "stop_stage": "duplicate_result_basin",
+                    "gate_reason": "候选结果命中最近重复失败盆地",
+                    "decision_reason": "候选结果命中最近重复失败盆地",
+                    "note": (
+                        f"完整评估已完成，但本轮结果与最近 {repeated_basin_hits} 条研究历史"
+                        f"落在同一结果盆地；原始拒收原因：{original_reason}"
+                    ),
+                    "matched_result_basin_key": basin_key,
+                    "matched_result_basin_hits": repeated_basin_hits,
+                }
+            )
 
     if accepted:
         best_source = candidate.strategy_code
@@ -2307,6 +2576,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
             stage_started_at=reference_stage_started_at,
             stage_iteration=reference_stage_iteration,
         )
+        _clear_research_session_state(remove_workspace=True, reason="new champion accepted")
         _append_research_journal_entry(entry_base)
         if maybe_compact(RUNTIME.paths.journal_file):
             log_info("研究日志已压缩")
@@ -2363,6 +2633,19 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
         log_info("研究日志已压缩")
     write_strategy_source(RUNTIME.paths.strategy_file, best_source)
     reload_strategy_module()
+    if str(entry_base.get("outcome", "")).strip() == "duplicate_skipped":
+        log_info(
+            f"第 {iteration_id} 轮跳过: 候选完整评估后命中最近重复结果盆地 "
+            f"(hits={int(entry_base.get('matched_result_basin_hits', 0) or 0) + 1})"
+        )
+        write_heartbeat(
+            "iteration_skipped",
+            message=f"iteration {iteration_id} duplicate result basin",
+            promotion=candidate_report.metrics["promotion_score"],
+            quality=candidate_report.metrics["quality_score"],
+            gate="候选结果命中最近重复失败盆地",
+        )
+        return "duplicate_skipped"
     log_info(
         f"第 {iteration_id} 轮未保留: "
         f"quality={candidate_report.metrics['quality_score']:.2f}, "

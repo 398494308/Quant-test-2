@@ -50,6 +50,8 @@ class ResearchPaths:
     log_file: Path
     journal_file: Path
     memory_dir: Path
+    session_state_file: Path
+    agent_workspace_dir: Path
     heartbeat_file: Path
     best_state_file: Path
     best_strategy_file: Path
@@ -121,6 +123,8 @@ def load_research_runtime_config(repo_root: Path) -> ResearchRuntimeConfig:
         log_file=repo_root / "logs/macd_aggressive_research_v2.log",
         journal_file=repo_root / "state/research_macd_aggressive_v2_journal.jsonl",
         memory_dir=repo_root / "state/research_macd_aggressive_v2_memory",
+        session_state_file=repo_root / "state/research_macd_aggressive_v2_session.json",
+        agent_workspace_dir=repo_root / "state/research_macd_aggressive_v2_agent_workspace",
         heartbeat_file=repo_root / "state/research_macd_aggressive_v2_heartbeat.json",
         best_state_file=repo_root / "state/research_macd_aggressive_v2_best.json",
         best_strategy_file=repo_root / "backups/strategy_macd_aggressive_v2_best.py",

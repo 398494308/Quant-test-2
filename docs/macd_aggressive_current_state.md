@@ -103,10 +103,10 @@ test 验收：
 
 ## 当前 prompt 结构
 
-当前 prompt 已改成 `3` 层：
+当前 prompt / session 已改成 `4` 层：
 
-1. `system prompt`
-   - 只放稳定项目上下文：项目目标、文件职责、允许修改边界、输出规则
+1. workspace 局部 `AGENTS.md`
+   - 只放稳定项目上下文：项目目标、文件职责、允许修改边界、输出规则、复杂度预算、持久 session 规则
 2. `runtime prompt`
    - 只放本轮动态信息，但顺序改成：刷新条件与目标 -> 本轮阅读顺序 -> 当前诊断摘要 -> 本轮执行框架
 3. `history package`
@@ -116,17 +116,22 @@ test 验收：
    - 历史 `stage` 压缩摘要
    - 当前评分口径全局统计表
    - 旧评分口径弱参考
+4. `failure wiki`
+   - markdown 给模型读
+   - json 给系统 guard 读
 
 当前 prompt 的关键点：
 
 - 不再内嵌完整策略源码
-- `system prompt` 里明确写了项目目的和各核心文件是干什么的
-- 借鉴公开高可信 prompt 组织思路后，改成“稳定规则前置、动态摘要前置、长历史后置”
+- 稳定规则已经从每轮 system prompt 挪到 workspace 局部 `AGENTS.md`，只作用于 `state/research_macd_aggressive_v2_agent_workspace/`
+- 当前 `baseline/champion stage` 内会复用同一个 Codex session；只有在刷新 `champion` 或重建 `baseline` 时，才会清掉旧 session 并新开一个
 - `runtime prompt` 不再重复塞大量稳定约束，注意力更集中在本轮目标、当前诊断和真实 choke point
-- `runtime prompt` 明确要求先看刷新条件和当前诊断，再看历史包最前面的 `stage` 执行摘要与失败核聚合
-- 默认因子模式下，prompt 明确禁止新增 `PARAMS` 键、顶层常量名和顶层 helper 名；只有切到 `factor_admission` 才允许做小规模因子准入
+- `runtime prompt` 明确要求先看刷新条件和当前诊断，再看 `wiki/latest_history_package.md` 与 `wiki/failure_wiki.md` 的前部摘要
+- 形成假设后必须回看一次 `failure wiki` 自检；命中相同或高度相似的失败 cut 时，要求在同一轮内改写
+- 默认因子模式下，prompt 明确禁止新增 `PARAMS` 键；顶层常量和顶层 helper 只允许少量新增，用来做结构化抽离，不能借机堆新因子
 - `history package` 不再按“最近 N 轮”裁切，而是按“自当前 `baseline/champion` 激活以来”的 `current stage`
 - 相同 gate reason 不再逐轮重复广播，而是会先折叠成“失败核”；重复失败被视为同一个坏盆地
+- 新增 `failure wiki`：一份 markdown 给模型查阅，一份 json 给系统 guard 做 exact cut 拦截；同一 cut 连续失败后，会在评估前先挡回去重生
 - prompt/history 不再展示“最近动态核心因子 / 全局高频核心因子”，只保留方向簇、失败标签、改动区域和真实结果；原始 `core_factors` 仍保留在 raw archive
 - 当多空捕获明显失衡时，prompt 会追加“软偏置”提示，优先把探索预算投向更弱的一侧，而不是硬性锁死只看单边
 - `test` 完全不可见
@@ -136,7 +141,7 @@ test 验收：
 - 防重复规则只保留一份，不再多处复写
 - 如果候选在 smoke 窗口上的行为完全不变，系统会在同一轮回灌 smoke 摘要并强制重生
 - 如果候选在源码校验阶段就因为复杂度预算或复杂度增量超限被拒，系统也会先做同轮 repair；仍修不动才把这轮记进 journal 和记忆包
-- ordinary family 不再有 `>3` 的硬报错；系统改成保留“至少 `1` 个 ordinary family”的下限，`1-3` 只是默认软引导，连续 `behavioral_noop` 时允许更大步长
+- ordinary family 不再有硬数量下限；`strategy-only / PARAMS-only` 现在允许进入后续流程，是否算有效探索改由真实 diff、smoke/noop、结果盆地重复和复杂度预算共同决定
 - `behavioral_noop` 回灌现在会明确指出候选真实改动区域、普通 family、目标侧，以及当前该优先看的外层 choke point：`long_outer_context_ok / long_final_veto_clear / short_outer_context_ok / short_final_veto_clear`
 - prompt 里的可编辑区域已切到真实存在的命名规则块，能直接改 `sideways / flow / trend_quality / followthrough / long_entry / short_entry / strategy`
 
@@ -176,16 +181,23 @@ Discord 现在只保留：
   - `summaries/past_stage_summaries.json`
   - `summaries/all_time_tables.json`
   - `prompt/latest_history_package.md`
+- 失败 wiki 会额外维护：
+  - `wiki/failure_wiki.md`
+  - `wiki/failure_wiki_index.json`
+- 当前 stage session 会额外维护：
+  - `state/research_macd_aggressive_v2_session.json`
+  - `state/research_macd_aggressive_v2_agent_workspace/`
 - `best_state` 现在会持久化 `reference_stage_started_at/reference_stage_iteration`，重启后不会把当前 stage 切乱
 - 当前基底策略里，研究器被显式引导优先检查外层总闸门和最终 veto 链，而不是继续把注意力浪费在未触达真实出单层的局部 helper 上
 - 候选报错时会在同一轮 repair
+- 如果候选命中 failure wiki 已封死的 exact cut，会在完整评估前直接被拦回去同轮重生
 - 同簇低变化近邻会在评估前被系统拦截，不再白跑 `smoke/full eval`
-- 连续 `behavioral_noop` 现在也会进入同簇低变化上下文，后续若继续沿同簇近邻试错，会被评估前拦截
+- 连续 `behavioral_noop`、重复结果盆地和复杂度连撞都会被当成 stall，后续若继续沿同簇近邻试错，会更早触发放宽或拦截
 - 被探索硬约束拦截后，会在同一轮里强制重生候选方向
 - 同一方向簇再次触发该机制后，会进入短期冷却锁
 - 冷却锁采用 `3 -> 6 -> 10` 轮递增
 - 低变化近邻判定会同时看真实 diff、参数族变化和 AST 派生结构签名，不再优先相信模型自报的最近失败簇
-- `duplicate source / duplicate hash / empty diff / behavioral_noop` 会写入 journal
+- `duplicate source / duplicate hash / empty diff / behavioral_noop / duplicate result basin` 都会写入 journal
 - `exploration_blocked` 表示候选在评估前就被系统探索硬约束拒收
 - prompt 最近轮次表只展示最近有限条，避免长串重复 noop 淹没当前硬约束；`behavioral_noop` 未跑完整评估的指标也不再显示成伪 `0.00`
 - heartbeat 会写出当前阶段和窗口名
@@ -220,5 +232,5 @@ PY
 - 本轮已在 `2026-04-19` 做过一次彻底历史清理：
   - `state/research_macd_aggressive_v2_journal.jsonl` 已清空
   - `state/research_macd_aggressive_v2_journal.compact.json` 已清空
-  - `scripts/reset_research_macd_aggressive_v2_state.sh` 现在也会把 `state/research_macd_aggressive_v2_memory/` 一并归档
+  - `scripts/reset_research_macd_aggressive_v2_state.sh` 现在也会把 `state/research_macd_aggressive_v2_memory/`、`state/research_macd_aggressive_v2_session.json`、`state/research_macd_aggressive_v2_agent_workspace/` 一并归档
   - 原文件已按时间戳归档

@@ -45,6 +45,8 @@ class StrategyCandidate:
 
 PARAM_BLOCK_PATTERN = re.compile(r"# PARAMS_START\s*\nPARAMS = (.*?)\n# PARAMS_END", re.DOTALL)
 FACTOR_CHANGE_MODES = frozenset({"default", "factor_admission"})
+DEFAULT_MODE_MAX_NEW_TOP_LEVEL_CONSTANTS = 2
+DEFAULT_MODE_MAX_NEW_TOP_LEVEL_HELPERS = 2
 
 # 参数硬性范围：防止参数漂移到无意义的区域
 # 格式: key -> (最小值, 最大值)
@@ -221,8 +223,10 @@ def factor_change_mode_prompt_hint(mode: str | None) -> str:
             "新增后必须同时删减旧复杂度，避免净复杂度继续膨胀。"
         )
     return (
-        "当前因子模式：默认模式。禁止新增 `PARAMS` 键、顶层常量名或顶层 helper 名；"
-        "只能在现有规则和现有因子上做删减、合并、收紧或放宽。"
+        "当前因子模式：默认模式。禁止新增 `PARAMS` 键；"
+        f"允许最多新增 {DEFAULT_MODE_MAX_NEW_TOP_LEVEL_CONSTANTS} 个顶层常量和 "
+        f"{DEFAULT_MODE_MAX_NEW_TOP_LEVEL_HELPERS} 个顶层 helper，用于结构化抽离现有逻辑；"
+        "不允许借这个口子堆新因子或复制旧规则。"
     )
 
 def load_strategy_source(path: Path) -> str:
@@ -833,16 +837,30 @@ def _validate_factor_change_policy(
         )
 
     new_constant_names = sorted(_top_level_constant_names(tree) - _top_level_constant_names(base_tree))
-    if new_constant_names:
+    invalid_constant_names = [name for name in new_constant_names if name.upper() != name]
+    if invalid_constant_names:
         raise StrategySourceError(
-            "factor mode default forbids new top-level constants: "
+            "default mode new top-level constants must use UPPER_CASE names: "
+            + ", ".join(invalid_constant_names[:8])
+        )
+    if len(new_constant_names) > DEFAULT_MODE_MAX_NEW_TOP_LEVEL_CONSTANTS:
+        raise StrategySourceError(
+            "default mode allows at most "
+            f"{DEFAULT_MODE_MAX_NEW_TOP_LEVEL_CONSTANTS} new top-level constants: "
             + ", ".join(new_constant_names[:8])
         )
 
     new_function_names = sorted(_top_level_function_names(tree) - _top_level_function_names(base_tree))
-    if new_function_names:
+    invalid_function_names = [name for name in new_function_names if not name.startswith("_")]
+    if invalid_function_names:
         raise StrategySourceError(
-            "factor mode default forbids new top-level helpers: "
+            "default mode new top-level helpers must use private helper names: "
+            + ", ".join(invalid_function_names[:8])
+        )
+    if len(new_function_names) > DEFAULT_MODE_MAX_NEW_TOP_LEVEL_HELPERS:
+        raise StrategySourceError(
+            "default mode allows at most "
+            f"{DEFAULT_MODE_MAX_NEW_TOP_LEVEL_HELPERS} new top-level helpers: "
             + ", ".join(new_function_names[:8])
         )
 

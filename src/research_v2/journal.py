@@ -24,7 +24,13 @@ NEGATIVE_OUTCOMES = {
     "duplicate_skipped",
     "behavioral_noop",
 }
-NO_OP_STOP_STAGES = {"duplicate_source", "duplicate_history", "empty_diff", "behavioral_noop"}
+NO_OP_STOP_STAGES = {
+    "duplicate_source",
+    "duplicate_history",
+    "empty_diff",
+    "behavioral_noop",
+    "duplicate_result_basin",
+}
 
 CLUSTER_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("ownership_cluster", ("ownership", "acceptance", "handoff", "transfer", "reset_reclaim")),
@@ -53,6 +59,8 @@ DEFAULT_CLUSTER_LOCK_STEPS = (3, 6, 10)
 TAG_NOVELTY_MAX_OVERLAP = 0.34
 STRUCTURAL_TOKEN_NOVELTY_MAX_OVERLAP = 0.60
 STRUCTURAL_REDUCTION_TAGS = frozenset({"remove_dead_gate", "merge_veto", "widen_outer_context"})
+RESULT_BASIN_ROUND_DIGITS = 6
+RESULT_BASIN_LOOKBACK = 24
 LONG_TARGET_KEYWORDS = (
     "long",
     "bull",
@@ -110,6 +118,8 @@ def _memory_archive_paths(memory_root: Path) -> dict[str, Path]:
         "past_stages": memory_root / "summaries/past_stage_summaries.json",
         "all_time_tables": memory_root / "summaries/all_time_tables.json",
         "latest_prompt": memory_root / "prompt/latest_history_package.md",
+        "failure_wiki_md": memory_root / "wiki/failure_wiki.md",
+        "failure_wiki_json": memory_root / "wiki/failure_wiki_index.json",
     }
 
 
@@ -201,12 +211,79 @@ def _entry_decision_reason(entry: dict[str, Any]) -> str:
     return gate_reason or "-"
 
 
-def cluster_for_tags(tags: list[str] | tuple[str, ...]) -> str:
-    normalized = [str(tag).strip().lower() for tag in tags if str(tag).strip()]
-    for cluster_name, keywords in CLUSTER_KEYWORDS:
-        if any(keyword in tag for tag in normalized for keyword in keywords):
-            return cluster_name
-    return normalized[0] if normalized else "unclassified"
+def _entry_changed_regions(entry: dict[str, Any]) -> tuple[str, ...]:
+    stored = entry.get("system_changed_regions", []) or entry.get("edited_regions", [])
+    return tuple(str(item).strip() for item in stored if str(item).strip())
+
+
+def _entry_region_families(entry: dict[str, Any]) -> tuple[str, ...]:
+    stored = entry.get("system_region_families", []) or entry.get("region_families", [])
+    if stored:
+        return tuple(str(item).strip() for item in stored if str(item).strip())
+    return region_families_for_regions(_entry_changed_regions(entry))
+
+
+def _round_result_basin_value(value: Any, *, digits: int = RESULT_BASIN_ROUND_DIGITS) -> float:
+    return round(_score_value(value), digits)
+
+
+def result_basin_key_for_entry(entry: dict[str, Any]) -> str:
+    raw_outcome = str(entry.get("outcome", "")).strip()
+    if raw_outcome in {"accepted", "rejected", "early_rejected"}:
+        metrics = entry.get("metrics", {})
+        if not isinstance(metrics, dict):
+            metrics = {}
+        payload = {
+            "bucket": raw_outcome,
+            "decision": _entry_decision_reason(entry),
+            "quality": _round_result_basin_value(entry.get("quality_score")),
+            "promotion": _round_result_basin_value(entry.get("promotion_score")),
+            "validation_hit": _round_result_basin_value(metrics.get("validation_segment_hit_rate"), digits=4),
+            "validation_bull": _round_result_basin_value(metrics.get("validation_bull_capture_score"), digits=4),
+            "validation_bear": _round_result_basin_value(metrics.get("validation_bear_capture_score"), digits=4),
+            "total_trades": int(_score_value(metrics.get("total_trades"))),
+        }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    if raw_outcome == "runtime_failed":
+        payload = {
+            "bucket": raw_outcome,
+            "decision": _entry_decision_reason(entry),
+            "runtime_stage": str(entry.get("runtime_failure_stage", "")).strip(),
+            "bloat": bool(entry.get("system_bloat_flag")),
+        }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    if raw_outcome in {"behavioral_noop", "duplicate_skipped", "exploration_blocked"}:
+        payload = {
+            "bucket": raw_outcome,
+            "decision": _entry_decision_reason(entry),
+            "stop_stage": str(entry.get("stop_stage", "")).strip(),
+        }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return ""
+
+
+def count_recent_result_basin(
+    entries: list[dict[str, Any]],
+    basin_key: str,
+    *,
+    lookback: int = RESULT_BASIN_LOOKBACK,
+) -> int:
+    if not basin_key:
+        return 0
+    count = 0
+    for entry in reversed(entries[-lookback:]):
+        if result_basin_key_for_entry(entry) == basin_key:
+            count += 1
+    return count
+
+
+def has_recent_result_basin(
+    entries: list[dict[str, Any]],
+    basin_key: str,
+    *,
+    lookback: int = RESULT_BASIN_LOOKBACK,
+) -> bool:
+    return count_recent_result_basin(entries, basin_key, lookback=lookback) > 0
 
 
 def _normalize_cluster_name(raw: Any) -> str:
@@ -221,20 +298,54 @@ def _normalize_cluster_name(raw: Any) -> str:
     return text
 
 
+def _canonical_cluster_name(raw: Any) -> str:
+    normalized = _normalize_cluster_name(raw)
+    if not normalized:
+        return ""
+    if normalized in CANONICAL_CLUSTER_NAMES:
+        return normalized
+    for cluster_name in CANONICAL_CLUSTER_NAMES:
+        if (
+            normalized == cluster_name
+            or normalized.startswith(f"{cluster_name}_")
+            or normalized.endswith(f"_{cluster_name}")
+            or cluster_name in normalized
+        ):
+            return cluster_name
+    for cluster_name, keywords in CLUSTER_KEYWORDS:
+        if any(keyword in normalized for keyword in keywords):
+            return cluster_name
+    return ""
+
+
+def cluster_for_tags(tags: list[str] | tuple[str, ...]) -> str:
+    normalized = [str(tag).strip().lower() for tag in tags if str(tag).strip()]
+    for cluster_name, keywords in CLUSTER_KEYWORDS:
+        if any(keyword in tag for tag in normalized for keyword in keywords):
+            return cluster_name
+    for tag in normalized:
+        canonical = _canonical_cluster_name(tag)
+        if canonical:
+            return canonical
+    return normalized[0] if normalized else "unclassified"
+
+
 def cluster_key_for_components(closest_failed_cluster: Any, change_tags: list[str] | tuple[str, ...]) -> str:
     declared = _normalize_cluster_name(closest_failed_cluster)
     inferred = cluster_for_tags(change_tags)
-    if inferred in CANONICAL_CLUSTER_NAMES:
-        return inferred
-    if declared in CANONICAL_CLUSTER_NAMES:
-        return declared
+    inferred_canonical = _canonical_cluster_name(inferred)
+    declared_canonical = _canonical_cluster_name(declared)
+    if inferred_canonical:
+        return inferred_canonical
+    if declared_canonical:
+        return declared_canonical
     if declared and declared == inferred:
         return declared
     return declared or inferred
 
 
 def cluster_key_for_entry(entry: dict[str, Any]) -> str:
-    stored = _normalize_cluster_name(entry.get("cluster_key", ""))
+    stored = _canonical_cluster_name(entry.get("cluster_key", "")) or _normalize_cluster_name(entry.get("cluster_key", ""))
     if stored:
         return stored
     return cluster_key_for_components(
@@ -357,6 +468,37 @@ def target_family_from_text(
     return "unknown"
 
 
+def _system_cluster_key_from_regions(
+    changed_regions: set[str] | tuple[str, ...] | list[str],
+    ordinary_region_families_set: set[str] | tuple[str, ...] | list[str],
+) -> str:
+    region_set = {
+        str(item).strip()
+        for item in changed_regions
+        if str(item).strip()
+    }
+    family_set = {
+        str(item).strip()
+        for item in ordinary_region_families_set
+        if str(item).strip()
+    }
+    if region_set & {"_is_sideways_regime", "_sideways_release_flags"}:
+        return "sideways_cluster"
+    if region_set & {"_flow_signal_metrics", "_flow_confirmation_ok", "_flow_entry_ok"}:
+        return "trigger_efficiency_cluster"
+    if region_set & {"breakdown_ready", "short_breakdown_ok", "short_bounce_fail_ok"}:
+        return "post_breakdown_cluster"
+    if region_set & {"long_final_veto_clear", "short_final_veto_clear", "_trend_followthrough_long", "_trend_followthrough_short"}:
+        return "ownership_cluster"
+    if region_set & {"long_outer_context_ok", "short_outer_context_ok"}:
+        return "participation_cluster"
+    if region_set & {"long_breakout_ok", "long_pullback_ok", "long_signal_path_ok", "_long_entry_signal", "_short_entry_signal"}:
+        return "trigger_efficiency_cluster"
+    if family_set == {"sideways"}:
+        return "sideways_cluster"
+    return ""
+
+
 def exploration_signature_for_entry(entry: dict[str, Any]) -> dict[str, Any]:
     stored_regions = entry.get("system_region_families", []) or entry.get("region_families", [])
     if stored_regions:
@@ -437,8 +579,13 @@ def exploration_signature_for_entry(entry: dict[str, Any]) -> dict[str, Any]:
         if str(item).strip()
     }
 
+    system_cluster_key = _system_cluster_key_from_regions(
+        changed_regions,
+        ordinary_region_family_set,
+    )
+
     return {
-        "cluster_key": cluster_key_for_entry(entry),
+        "cluster_key": system_cluster_key or cluster_key_for_entry(entry),
         "tags": {
             str(tag).strip()
             for tag in entry.get("change_tags", [])
@@ -506,8 +653,13 @@ def exploration_signature_for_candidate(
     special_region_family_set = set(special_region_families(region_families))
     ordinary_changed_region_set = set(ordinary_changed_regions(changed_regions))
 
+    system_cluster_key = _system_cluster_key_from_regions(
+        changed_regions,
+        ordinary_region_family_set,
+    )
+
     return {
-        "cluster_key": cluster_key_for_components(
+        "cluster_key": system_cluster_key or cluster_key_for_components(
             getattr(candidate, "closest_failed_cluster", ""),
             getattr(candidate, "change_tags", ()),
         ),
@@ -570,7 +722,7 @@ def _compact_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
     )
     for entry in entries:
         outcome = _outcome_bucket(str(entry.get("outcome", "")))
-        for region in entry.get("edited_regions", []):
+        for region in _entry_changed_regions(entry):
             if outcome in {"accepted", "rejected"}:
                 region_stats[region][outcome] = region_stats[region].get(outcome, 0) + 1
 
@@ -1002,8 +1154,11 @@ def _current_round_lock_state(
 
 def _same_cluster_low_change_context(entries: list[dict[str, Any]], score_regime: str) -> dict[str, Any] | None:
     scoped_entries = _entries_for_score_regime(entries, score_regime)
-    tail = _low_change_tail(scoped_entries)
-    source_kind = "low_change"
+    tail = _repeated_result_basin_tail(scoped_entries)
+    source_kind = "repeated_basin"
+    if not tail:
+        tail = _low_change_tail(scoped_entries)
+        source_kind = "low_change"
     if not tail:
         tail = _noop_tail(scoped_entries)
         source_kind = "noop"
@@ -1073,33 +1228,30 @@ def _candidate_has_structural_novelty(
     candidate_regions = candidate_signature["ordinary_region_families"]
     candidate_changed_regions = candidate_signature["ordinary_changed_regions"]
     candidate_target = candidate_signature["target_family"]
-    candidate_factors = candidate_signature["core_factor_names"]
     candidate_tags = candidate_signature["tags"]
     candidate_param_families = candidate_signature["param_families"]
     candidate_structural_tokens = candidate_signature["structural_tokens"]
     candidate_signature_hash = candidate_signature["signature_hash"]
 
+    if candidate_signature_hash and candidate_signature_hash in low_change_context["signature_hashes"]:
+        return False
+
     if candidate_regions and not candidate_regions.issubset(low_change_context["ordinary_region_families"]):
         return True
     if candidate_changed_regions and not candidate_changed_regions.issubset(low_change_context["ordinary_changed_regions"]):
         return True
-    if candidate_target in {"long", "short"} and candidate_target not in low_change_context["target_families"]:
-        return True
-    if candidate_factors - low_change_context["core_factor_names"]:
+    if candidate_target in {"long", "short", "mixed"} and candidate_target not in low_change_context["target_families"]:
         return True
     if candidate_regions and candidate_param_families - low_change_context["param_families"]:
         return True
-    if candidate_signature_hash and candidate_signature_hash in low_change_context["signature_hashes"]:
-        return False
     if candidate_tags & STRUCTURAL_REDUCTION_TAGS and candidate_changed_regions:
-        return True
+        if not candidate_changed_regions.issubset(low_change_context["ordinary_changed_regions"]):
+            return True
     if candidate_regions and candidate_structural_tokens:
+        if len(candidate_structural_tokens - low_change_context["structural_tokens"]) >= 2:
+            return True
         overlap_ratio = len(candidate_structural_tokens & low_change_context["structural_tokens"]) / max(len(candidate_structural_tokens), 1)
         if len(candidate_structural_tokens) >= 4 and overlap_ratio <= STRUCTURAL_TOKEN_NOVELTY_MAX_OVERLAP:
-            return True
-    if candidate_regions and candidate_tags:
-        overlap_ratio = len(candidate_tags & low_change_context["tag_union"]) / max(len(candidate_tags), 1)
-        if len(candidate_tags) >= 2 and overlap_ratio <= TAG_NOVELTY_MAX_OVERLAP:
             return True
     return False
 
@@ -1194,7 +1346,13 @@ def evaluate_candidate_exploration_guard(
     current_round_count = same_cluster_rounds + 1
     lock_applied = current_round_count >= 2
     lock_level = lock_trigger_rounds + 1 if lock_applied else lock_trigger_rounds
-    source_label = "连续行为无变化" if low_change_context.get("source_kind") == "noop" else "低变化打转"
+    source_kind = str(low_change_context.get("source_kind", "")).strip()
+    if source_kind == "noop":
+        source_label = "连续行为无变化"
+    elif source_kind == "repeated_basin":
+        source_label = "同一结果盆地反复回落"
+    else:
+        source_label = "低变化打转"
     if lock_applied:
         schedule_index = min(max(lock_level - 1, 0), max(len(lock_schedule) - 1, 0))
         lock_rounds = int(lock_schedule[schedule_index])
@@ -1428,6 +1586,20 @@ def _low_change_tail(entries: list[dict[str, Any]], streak: int = LOW_CHANGE_STR
     return tail
 
 
+def _repeated_result_basin_tail(entries: list[dict[str, Any]], streak: int = LOW_CHANGE_STREAK) -> list[dict[str, Any]]:
+    eligible = [
+        entry for entry in entries
+        if result_basin_key_for_entry(entry)
+    ]
+    if len(eligible) < streak:
+        return []
+    tail = eligible[-streak:]
+    basin_keys = [result_basin_key_for_entry(entry) for entry in tail]
+    if basin_keys and len(set(basin_keys)) == 1:
+        return tail
+    return []
+
+
 def _noop_tail(entries: list[dict[str, Any]], streak: int = LOW_CHANGE_STREAK) -> list[dict[str, Any]]:
     if len(entries) < streak:
         return []
@@ -1454,7 +1626,7 @@ def _exploration_trigger_lines(entries: list[dict[str, Any]], limit: int) -> lis
                 tag_text = str(tag).strip()
                 if tag_text and tag_text not in tags:
                     tags.append(tag_text)
-            for region in entry.get("edited_regions", []):
+            for region in _entry_changed_regions(entry):
                 region_text = str(region).strip()
                 if region_text and region_text not in regions:
                     regions.append(region_text)
@@ -1468,6 +1640,36 @@ def _exploration_trigger_lines(entries: list[dict[str, Any]], limit: int) -> lis
             f"- 重复原因：{'；'.join(reasons[:limit]) or '-'}",
             f"- 近期近邻方向簇：{', '.join(clusters[:limit]) or '-'}；标签：{', '.join(tags[:limit]) or '-'}；高频区域：{', '.join(regions[:limit]) or '-'}",
             "- 下一轮必须先产出有效 diff，并且必须改变 smoke 窗口的实际交易路径；若继续沿用相近方向，至少切换方向簇、普通 family、long-short target 中的一项。",
+        ]
+
+    repeated_basin_tail = _repeated_result_basin_tail(entries)
+    if repeated_basin_tail:
+        clusters: list[str] = []
+        tags: list[str] = []
+        regions: list[str] = []
+        reasons: list[str] = []
+        for entry in repeated_basin_tail:
+            cluster = cluster_key_for_entry(entry)
+            if cluster and cluster not in clusters:
+                clusters.append(cluster)
+            for tag in entry.get("change_tags", []):
+                tag_text = str(tag).strip()
+                if tag_text and tag_text not in tags:
+                    tags.append(tag_text)
+            for region in _entry_changed_regions(entry):
+                region_text = str(region).strip()
+                if region_text and region_text not in regions:
+                    regions.append(region_text)
+            reason_text = _entry_decision_reason(entry)
+            if reason_text and reason_text not in reasons:
+                reasons.append(reason_text)
+
+        return [
+            "探索触发（必须执行）:",
+            f"最近 {LOW_CHANGE_STREAK} 轮反复落回同一结果盆地：分数、命中率、弱侧捕获和 gate 原因几乎一致，不应继续把它们当成独立新证据。",
+            f"- 结果盆地原因：{'；'.join(reasons[:limit]) or '-'}",
+            f"- 近期近邻方向簇：{', '.join(clusters[:limit]) or '-'}；标签：{', '.join(tags[:limit]) or '-'}；高频区域：{', '.join(regions[:limit]) or '-'}",
+            "- 下一轮必须优先切不同方向簇；若仍留在同簇，必须切不同 choke point 或不同最终放行链，而不是继续换候选名、tag 或措辞。",
         ]
 
     tail = _low_change_tail(entries)
@@ -1485,7 +1687,7 @@ def _exploration_trigger_lines(entries: list[dict[str, Any]], limit: int) -> lis
             tag_text = str(tag).strip()
             if tag_text and tag_text not in tags:
                 tags.append(tag_text)
-        for region in entry.get("edited_regions", []):
+        for region in _entry_changed_regions(entry):
             region_text = str(region).strip()
             if region_text and region_text not in regions:
                 regions.append(region_text)
@@ -1534,7 +1736,7 @@ def _cluster_overheat_lines(entries: list[dict[str, Any]], limit: int) -> list[s
             tag_text = str(tag).strip()
             if tag_text and tag_text not in tags:
                 tags.append(tag_text)
-        for region in entry.get("edited_regions", []):
+        for region in _entry_changed_regions(entry):
             region_text = str(region).strip()
             if region_text and region_text not in regions:
                 regions.append(region_text)
@@ -1775,7 +1977,20 @@ def _entry_ordinary_region_families(entry: dict[str, Any]) -> tuple[str, ...]:
     stored = entry.get("system_ordinary_region_families")
     if isinstance(stored, (list, tuple, set)):
         return ordinary_region_families(stored)
-    return ordinary_region_families(region_families_for_regions(entry.get("edited_regions", [])))
+    return ordinary_region_families(_entry_region_families(entry))
+
+
+def _repeated_result_basin_entry_count(entries: list[dict[str, Any]]) -> int:
+    basin_counts = Counter(
+        basin_key
+        for basin_key in (result_basin_key_for_entry(entry) for entry in entries)
+        if basin_key
+    )
+    return sum(
+        1
+        for entry in entries
+        if basin_counts.get(result_basin_key_for_entry(entry), 0) >= 2
+    )
 
 
 def _top_counter_labels(counter: Counter[str], limit: int) -> str:
@@ -2074,9 +2289,379 @@ def _format_all_time_tables(payload: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _entry_identity_key(entry: dict[str, Any]) -> tuple[int, str, str]:
+    return (
+        _entry_iteration(entry),
+        str(entry.get("candidate_id", "")).strip(),
+        str(entry.get("timestamp", "")).strip(),
+    )
+
+
+def _failure_category_for_entry(entry: dict[str, Any]) -> str:
+    outcome = str(entry.get("outcome", "")).strip()
+    stop_stage = str(entry.get("stop_stage", "")).strip()
+    reason = _entry_decision_reason(entry).lower()
+    if outcome == "behavioral_noop":
+        return "BEHAVIORAL_NOOP"
+    if outcome == "exploration_blocked":
+        return "OVERUSED_DIRECTION"
+    if outcome == "runtime_failed":
+        if "complexity" in reason:
+            return "COMPLEXITY_TRAP"
+        if any(token in reason for token in ("editable", "boundary", "missing", "forbid", "region")):
+            return "BOUNDARY_ERROR"
+        return "RUNTIME_FAILURE"
+    if outcome == "duplicate_skipped":
+        if stop_stage == "duplicate_result_basin":
+            return "FAILED_BASIN"
+        if stop_stage in NO_OP_STOP_STAGES:
+            return "OVERUSED_DIRECTION"
+    if outcome in {"rejected", "early_rejected"}:
+        return "FAILED_BASIN"
+    return ""
+
+
+def _failure_cut_payload_from_signature(signature: dict[str, Any]) -> dict[str, Any]:
+    cluster = str(signature.get("cluster_key", "")).strip() or "unclassified"
+    ordinary_families = sorted(str(item).strip() for item in signature.get("ordinary_region_families", set()) if str(item).strip())
+    ordinary_changed_regions = sorted(
+        str(item).strip()
+        for item in signature.get("ordinary_changed_regions", set())
+        if str(item).strip()
+    )
+    changed_regions = ordinary_changed_regions or sorted(
+        str(item).strip()
+        for item in signature.get("changed_regions", set())
+        if str(item).strip()
+    )
+    param_families = sorted(
+        str(item).strip()
+        for item in signature.get("param_families", set())
+        if str(item).strip()
+    )
+    target_family = str(signature.get("target_family", "")).strip() or "unknown"
+    if not changed_regions and not ordinary_families and not param_families:
+        return {}
+    return {
+        "cluster": cluster,
+        "families": ordinary_families,
+        "changed_regions": changed_regions,
+        "target": target_family,
+        "params": param_families,
+    }
+
+
+def failure_cut_key_for_signature(signature: dict[str, Any]) -> str:
+    payload = _failure_cut_payload_from_signature(signature)
+    if not payload:
+        return ""
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def failure_cut_key_for_entry(entry: dict[str, Any]) -> str:
+    return failure_cut_key_for_signature(exploration_signature_for_entry(entry))
+
+
+def _failure_wiki_block_reason(item: dict[str, Any]) -> str:
+    category = str(item.get("category", "")).strip()
+    count = int(item.get("count", 0) or 0)
+    if category == "BEHAVIORAL_NOOP":
+        return f"同一 exact cut 已连续 {count} 次未改变 smoke 真实交易路径。"
+    if category == "OVERUSED_DIRECTION":
+        return f"同一 exact cut 已连续 {count} 次落入系统探索拦截/重复空转。"
+    if category == "COMPLEXITY_TRAP":
+        return f"同一 exact cut 已连续 {count} 次撞上复杂度预算。"
+    if category == "BOUNDARY_ERROR":
+        return f"同一 exact cut 已连续 {count} 次触发边界或结构错误。"
+    if category == "FAILED_BASIN":
+        return f"同一 exact cut 已至少 {count} 次落回失败盆地，且没有产生正向 delta。"
+    return "命中 failure wiki 已知失败 exact cut。"
+
+
+def build_failure_wiki_payload(
+    entries: list[dict[str, Any]],
+    *,
+    score_regime: str = "",
+    current_stage_entries: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    scoped_entries = _entries_for_score_regime(entries, score_regime) if score_regime else list(entries)
+    current_stage_key_set = {
+        _entry_identity_key(entry)
+        for entry in (current_stage_entries or [])
+    }
+    grouped: dict[str, dict[str, Any]] = {}
+
+    for entry in scoped_entries:
+        category = _failure_category_for_entry(entry)
+        if not category:
+            continue
+        signature = exploration_signature_for_entry(entry)
+        cut_payload = _failure_cut_payload_from_signature(signature)
+        if not cut_payload:
+            continue
+        cut_key = json.dumps(cut_payload, ensure_ascii=False, sort_keys=True)
+        bucket_key = json.dumps(
+            {"category": category, "cut_key": cut_key},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        bucket = grouped.setdefault(
+            bucket_key,
+            {
+                "category": category,
+                "cut_key": cut_key,
+                "cut": cut_payload,
+                "count": 0,
+                "stage_count": 0,
+                "last_iteration": 0,
+                "best_delta": 0.0,
+                "reasons": Counter(),
+                "stop_stages": Counter(),
+                "tags": Counter(),
+                "clusters": Counter(),
+                "families": Counter(),
+                "targets": Counter(),
+                "examples": [],
+            },
+        )
+        bucket["count"] += 1
+        if _entry_identity_key(entry) in current_stage_key_set:
+            bucket["stage_count"] += 1
+        bucket["last_iteration"] = max(bucket["last_iteration"], _entry_iteration(entry))
+        bucket["best_delta"] = max(bucket["best_delta"], _score_value(entry.get("promotion_delta")))
+        reason = _entry_decision_reason(entry)
+        if reason and reason != "-":
+            bucket["reasons"][reason] += 1
+        stop_stage = str(entry.get("stop_stage", "")).strip()
+        if stop_stage:
+            bucket["stop_stages"][stop_stage] += 1
+        for tag in entry.get("change_tags", []):
+            tag_text = str(tag).strip()
+            if tag_text:
+                bucket["tags"][tag_text] += 1
+        for family in signature.get("ordinary_region_families", set()):
+            family_text = str(family).strip()
+            if family_text:
+                bucket["families"][family_text] += 1
+        target_text = str(signature.get("target_family", "")).strip()
+        if target_text:
+            bucket["targets"][target_text] += 1
+        cluster_text = str(signature.get("cluster_key", "")).strip() or "unclassified"
+        bucket["clusters"][cluster_text] += 1
+        bucket["examples"].append(
+            {
+                "iteration": _entry_iteration(entry),
+                "candidate_id": str(entry.get("candidate_id", "")).strip() or "-",
+                "reason": reason or "-",
+                "outcome": str(entry.get("outcome", "")).strip() or "-",
+            }
+        )
+
+    items: list[dict[str, Any]] = []
+    blocked_cuts: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for payload in grouped.values():
+        category = str(payload["category"]).strip()
+        count = int(payload["count"])
+        best_delta = float(payload["best_delta"])
+        block_exact_cut = False
+        if category in {"BEHAVIORAL_NOOP", "OVERUSED_DIRECTION", "COMPLEXITY_TRAP", "BOUNDARY_ERROR"}:
+            block_exact_cut = count >= 2
+        elif category == "FAILED_BASIN":
+            block_exact_cut = count >= 2 and best_delta <= 0.0
+
+        item = {
+            "category": category,
+            "cut_key": str(payload["cut_key"]),
+            "cut": payload["cut"],
+            "count": count,
+            "stage_count": int(payload["stage_count"]),
+            "last_iteration": int(payload["last_iteration"]),
+            "best_delta": best_delta,
+            "top_reasons": [name for name, _ in payload["reasons"].most_common(3)],
+            "stop_stages": [name for name, _ in payload["stop_stages"].most_common(3)],
+            "top_tags": [name for name, _ in payload["tags"].most_common(4)],
+            "top_clusters": [name for name, _ in payload["clusters"].most_common(2)],
+            "top_families": [name for name, _ in payload["families"].most_common(3)],
+            "top_targets": [name for name, _ in payload["targets"].most_common(2)],
+            "examples": sorted(payload["examples"], key=lambda row: row["iteration"], reverse=True)[:3],
+            "block_exact_cut": block_exact_cut,
+            "block_reason": _failure_wiki_block_reason(payload) if block_exact_cut else "",
+        }
+        items.append(item)
+        if block_exact_cut:
+            blocked_cuts[item["cut_key"]].append(
+                {
+                    "category": item["category"],
+                    "count": item["count"],
+                    "stage_count": item["stage_count"],
+                    "last_iteration": item["last_iteration"],
+                    "cut": item["cut"],
+                    "block_reason": item["block_reason"],
+                    "top_reasons": item["top_reasons"],
+                }
+            )
+
+    items.sort(
+        key=lambda item: (
+            0 if item["block_exact_cut"] else 1,
+            -int(item["count"]),
+            -int(item["stage_count"]),
+            -int(item["last_iteration"]),
+            str(item["category"]),
+        )
+    )
+    return {
+        "generated_at": datetime.now(UTC).isoformat(),
+        "score_regime": score_regime,
+        "entry_count": len(scoped_entries),
+        "failure_item_count": len(items),
+        "blocked_cut_count": sum(len(payloads) for payloads in blocked_cuts.values()),
+        "blocked_cuts": dict(blocked_cuts),
+        "items": items,
+    }
+
+
+def format_failure_wiki_markdown(payload: dict[str, Any], *, limit: int = 24) -> str:
+    items = list(payload.get("items", []))
+    blocked_rows: list[dict[str, Any]] = []
+    for row_list in payload.get("blocked_cuts", {}).values():
+        if isinstance(row_list, list):
+            blocked_rows.extend(item for item in row_list if isinstance(item, dict))
+    blocked_rows.sort(key=lambda item: (-int(item.get("count", 0) or 0), -int(item.get("last_iteration", 0) or 0)))
+
+    lines = [
+        f"# Failure Wiki ({str(payload.get('score_regime', '')).strip() or 'current'})",
+        "",
+        "用法：",
+        "- 先看“系统已封死的 exact cuts”。命中时不要再提交同一 cut，应切不同 choke point、不同最终放行链或不同真实交易路径层级。",
+        "- 再看“失败模式聚合”。同一失败核或同一 exact cut 的重复出现，只算一个已知坏盆地。",
+        "- 未压缩原始历史仍在 `memory/raw/rounds/` 与 `memory/raw/full_history.jsonl`。",
+        "",
+        "## 系统已封死的 exact cuts",
+        "| 类别 | 次数 | cluster | changed_regions | target | 最近轮次 | 原因 |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    if not blocked_rows:
+        lines.append("| - | 0 | - | - | - | - | 暂无被系统封死的 exact cut |")
+    else:
+        for item in blocked_rows[:max(1, limit)]:
+            cut = item.get("cut", {}) if isinstance(item.get("cut"), dict) else {}
+            changed_regions = ",".join(cut.get("changed_regions", []) or []) or "-"
+            lines.append(
+                f"| {item.get('category', '-')} | {int(item.get('count', 0) or 0)} | "
+                f"{cut.get('cluster', '-') or '-'} | {changed_regions} | "
+                f"{cut.get('target', '-') or '-'} | {int(item.get('last_iteration', 0) or 0) or '-'} | "
+                f"{_truncate(item.get('block_reason', '-'), 48)} |"
+            )
+
+    lines.append("")
+    lines.append("## 失败模式聚合")
+    if not items:
+        lines.append("- 暂无失败历史。")
+        return "\n".join(lines)
+
+    for index, item in enumerate(items[:max(1, limit)], start=1):
+        cut = item.get("cut", {}) if isinstance(item.get("cut"), dict) else {}
+        lines.append(
+            f"### {index}. {item['category']} | {item['count']} 次 | "
+            f"cluster={cut.get('cluster', '-') or '-'} | target={cut.get('target', '-') or '-'}"
+        )
+        lines.append(
+            f"- exact cut: families={','.join(cut.get('families', []) or []) or '-'}; "
+            f"changed_regions={','.join(cut.get('changed_regions', []) or []) or '-'}; "
+            f"params={','.join(cut.get('params', []) or []) or '-'}"
+        )
+        lines.append(
+            f"- 最近原因: {'；'.join(item.get('top_reasons', []) or ['-'])}"
+        )
+        lines.append(
+            f"- 高频标签: {', '.join(item.get('top_tags', []) or ['-'])}; "
+            f"stage命中={item.get('stage_count', 0)}; 最近轮次={item.get('last_iteration', 0)}"
+        )
+        if item.get("block_exact_cut"):
+            lines.append(f"- 系统结论: {item.get('block_reason', '-')}")
+        example_text = "；".join(
+            f"r{row.get('iteration', 0)}:{_truncate(row.get('candidate_id', '-'), 24)}"
+            for row in item.get("examples", []) or []
+        ) or "-"
+        lines.append(f"- 最近样本: {example_text}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def load_failure_wiki_index(memory_root: Path) -> dict[str, Any]:
+    path = _memory_archive_paths(memory_root)["failure_wiki_json"]
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def evaluate_candidate_failure_wiki_guard(
+    candidate: Any,
+    failure_wiki_index: dict[str, Any],
+    *,
+    base_source: str | None = None,
+    editable_regions: tuple[str, ...] | None = None,
+) -> dict[str, Any] | None:
+    blocked_cuts = failure_wiki_index.get("blocked_cuts", {})
+    if not isinstance(blocked_cuts, dict) or not blocked_cuts:
+        return None
+    candidate_signature = exploration_signature_for_candidate(
+        candidate,
+        base_source=base_source,
+        editable_regions=editable_regions,
+    )
+    cut_key = failure_cut_key_for_signature(candidate_signature)
+    if not cut_key:
+        return None
+    matched = blocked_cuts.get(cut_key)
+    if not isinstance(matched, list) or not matched:
+        return None
+    primary = sorted(
+        (item for item in matched if isinstance(item, dict)),
+        key=lambda item: (-int(item.get("count", 0) or 0), -int(item.get("last_iteration", 0) or 0), str(item.get("category", ""))),
+    )
+    if not primary:
+        return None
+    selected = primary[0]
+    cut = selected.get("cut", {}) if isinstance(selected.get("cut"), dict) else {}
+    changed_regions = ", ".join(cut.get("changed_regions", []) or []) or "-"
+    feedback_note = (
+        "failure wiki 命中 exact cut:\n"
+        f"- category: {selected.get('category', '-')}\n"
+        f"- cluster: {cut.get('cluster', '-') or '-'}\n"
+        f"- changed_regions: {changed_regions}\n"
+        f"- target: {cut.get('target', '-') or '-'}\n"
+        f"- recent_reason: {'；'.join(selected.get('top_reasons', []) or ['-'])}\n"
+        "- 本轮必须切不同 choke point、不同最终放行链，或不同真实交易路径层级。"
+    )
+    return {
+        "block_kind": "failure_wiki_exact_cut",
+        "stop_stage": "blocked_failure_wiki_exact_cut",
+        "blocked_cluster": str(candidate_signature.get("cluster_key", "")).strip() or "-",
+        "blocked_reason": str(selected.get("block_reason", "")).strip() or "命中 failure wiki 已封死 exact cut",
+        "lock_applied": False,
+        "lock_rounds": 0,
+        "lock_level": 0,
+        "lock_trigger_iteration": 0,
+        "lock_expires_before_iteration": 0,
+        "matched_failure_category": str(selected.get("category", "")).strip(),
+        "matched_failure_count": int(selected.get("count", 0) or 0),
+        "matched_failure_stage_count": int(selected.get("stage_count", 0) or 0),
+        "matched_failure_cut": cut,
+        "feedback_note": feedback_note,
+        "current_locks": tuple(),
+    }
+
+
 def _write_prompt_memory_snapshots(
     memory_root: Path,
     *,
+    all_entries: list[dict[str, Any]],
     current_stage_entries: list[dict[str, Any]],
     current_stage_meta: dict[str, Any],
     past_stage_summaries: list[dict[str, Any]],
@@ -2084,7 +2669,7 @@ def _write_prompt_memory_snapshots(
     summary_text: str,
 ) -> None:
     paths = _memory_archive_paths(memory_root)
-    for key in ("current_stage", "past_stages", "all_time_tables", "latest_prompt"):
+    for key in ("current_stage", "past_stages", "all_time_tables", "latest_prompt", "failure_wiki_md", "failure_wiki_json"):
         paths[key].parent.mkdir(parents=True, exist_ok=True)
     paths["current_stage"].write_text(
         json.dumps(
@@ -2099,6 +2684,13 @@ def _write_prompt_memory_snapshots(
     paths["past_stages"].write_text(json.dumps(past_stage_summaries, ensure_ascii=False, indent=2))
     paths["all_time_tables"].write_text(json.dumps(all_time_tables, ensure_ascii=False, indent=2))
     paths["latest_prompt"].write_text(summary_text)
+    failure_wiki_payload = build_failure_wiki_payload(
+        all_entries,
+        score_regime=str(current_stage_meta.get("score_regime", "")).strip(),
+        current_stage_entries=current_stage_entries,
+    )
+    paths["failure_wiki_json"].write_text(json.dumps(failure_wiki_payload, ensure_ascii=False, indent=2))
+    paths["failure_wiki_md"].write_text(format_failure_wiki_markdown(failure_wiki_payload))
 
 
 def _uncompacted_recent_entries(
@@ -2256,7 +2848,7 @@ def _recent_round_meta_lines(entries: list[dict[str, Any]], start_index: int) ->
         candidate_id = _truncate(entry.get("candidate_id", "unknown"), 28)
         cluster = _truncate(cluster_key_for_entry(entry) or "-", 24)
         tags = _truncate(",".join(entry.get("change_tags", [])) or "-", 40)
-        regions = _truncate(",".join(entry.get("edited_regions", [])) or "-", 20)
+        regions = _truncate(",".join(_entry_changed_regions(entry)) or "-", 20)
         summary = _truncate(entry.get("note") or entry.get("hypothesis") or "-", 64)
         complexity = _truncate(entry.get("system_complexity_summary") or "-", 48)
         bloat_suffix = "; bloat=YES" if bool(entry.get("system_bloat_flag")) else ""
@@ -2309,7 +2901,7 @@ def _empty_prompt_tables(stage_title: str = "当前 stage") -> list[str]:
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         "| - | - | - | 低 | 0 | - | - | - | - | - | 暂无需要降权的高风险轮次 |",
         "",
-        f"{stage_title} 共 0 条：保留 0，未保留 0，重复跳过 0，探索拦截 0，提前淘汰 0，运行失败 0。",
+        f"{stage_title} 共 0 条：保留 0，未保留 0，重复跳过 0，结果盆地重复 0，探索拦截 0，提前淘汰 0，运行失败 0。",
         f"{stage_title} 运营指标表:",
         "| accept rate | behavioral_noop rate | exploration_blocked rate | smoke->full_eval | 平均改动 ordinary families | 弱侧探索占比 |",
         "| --- | --- | --- | --- | --- | --- |",
@@ -2544,6 +3136,7 @@ def build_journal_prompt_summary(
             early_rejected_count = sum(1 for entry in board_entries if entry.get("outcome") == "early_rejected")
             runtime_failed_count = sum(1 for entry in board_entries if entry.get("outcome") == "runtime_failed")
             bloat_flag_count = sum(1 for entry in board_entries if bool(entry.get("system_bloat_flag")))
+            repeated_basin_count = _repeated_result_basin_entry_count(board_entries)
             operating_metrics = _stage_operating_metrics(
                 board_entries,
                 reference_metrics=reference_metrics,
@@ -2552,6 +3145,7 @@ def build_journal_prompt_summary(
                 f"{stage_scope} 共 {len(board_entries)} 条："
                 f"保留 {accepted_count}，未保留 {rejected_count}，"
                 f"重复跳过 {duplicate_skipped_count}，"
+                f"结果盆地重复 {repeated_basin_count}，"
                 f"行为无变化 {behavioral_noop_count}，"
                 f"探索拦截 {exploration_blocked_count}，"
                 f"提前淘汰 {early_rejected_count}，运行失败 {runtime_failed_count}，"
@@ -2623,6 +3217,7 @@ def build_journal_prompt_summary(
         }
         _write_prompt_memory_snapshots(
             memory_root,
+            all_entries=current_entries,
             current_stage_entries=current_stage_entries,
             current_stage_meta=snapshot_meta,
             past_stage_summaries=past_stage_summaries,

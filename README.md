@@ -38,19 +38,22 @@
 研究器每轮会按下面的顺序执行：
 
 1. 读取当前主参考策略。
-2. 创建临时 workspace，把当前主参考策略复制到里面。
-3. 把“当前诊断 + 方向风险表 + 方向冷却表 + 过拟合风险表 + 最近轮次摘要 + 压缩历史弱参考”喂给模型。
-4. 模型只允许改 `src/strategy_macd_aggressive.py` 的可编辑区域，并在 workspace 里原地改文件。
-5. 主进程校验候选只修改了允许区域。
-6. 先做评估前硬约束检查；如果候选仍然是同簇低变化近邻，或命中锁簇，会在同一轮直接强制重生，而不是白跑评估。
-7. 通过前置检查后，先跑少量 `smoke` 窗口；如果运行报错，会在同一轮进入 repair loop，而不是直接开始下一轮。
-8. `smoke` 通过后，主进程还会对比候选和当前参考在 smoke 窗口里的行为指纹；如果收益、交易数、信号统计、退出原因和交易摘要完全一致，不会立刻结束本轮，而是把 smoke 摘要回灌给模型，在同一轮里强制重生候选。
-9. 只有连续重生后仍然无法改变 smoke 行为，才会正式记一次 `behavioral_noop`。
-10. 只有 smoke 行为真的变了，才会继续跑整套 `train walk-forward + val`。
-11. 只有 `gate` 通过，且相对当前 `champion` 的 `promotion_delta` 至少高 `0.02`，才刷新当前主参考。
-12. 如果当前还没有 `gate-passed champion`，而现有基线本身又没过 gate，那么第一条过 gate 的候选会直接晋升为新 `champion`。
-13. 刷新 `champion` 之后，才会额外跑一次隐藏 `test`；它只做验收，不参与 `champion` 选择，也不会喂给模型。
-14. 每轮结果都会写进 journal，包含 `accepted / rejected / duplicate_skipped / behavioral_noop / exploration_blocked / early_rejected / runtime_failed`。
+2. 进入阶段级持久 workspace：`state/research_macd_aggressive_v2_agent_workspace/`。这里有局部 `AGENTS.md`、可写策略副本、只读 `wiki/` 与 `memory/` 链接。
+3. 同一 `baseline/champion stage` 内会复用同一个 Codex session；只有当 `champion` 或 `baseline` 刷新时，才会清掉旧 session 并新开一个。
+4. 每轮开始先把当前主参考重新写回 workspace 里的 `src/strategy_macd_aggressive.py`，避免上一轮残留源码污染新一轮。
+5. 动态 prompt 只补“当前诊断 + 本轮目标 + 本轮失败反馈”；稳定规则放进 workspace 局部 `AGENTS.md`，长历史放进 `wiki/latest_history_package.md` 与 `wiki/failure_wiki.md`。
+6. 模型只允许改 `src/strategy_macd_aggressive.py` 的可编辑区域，并在 workspace 里原地改文件。
+7. 主进程校验候选只修改了允许区域。
+8. 先做评估前硬约束检查；如果候选命中 failure wiki 已封死的 exact cut、仍然是同簇低变化近邻，或命中锁簇，会在同一轮直接强制重生，而不是白跑评估。
+9. 通过前置检查后，先跑少量 `smoke` 窗口；如果运行报错，会在同一轮进入 repair loop，而不是直接开始下一轮。
+10. `smoke` 通过后，主进程还会对比候选和当前参考在 smoke 窗口里的行为指纹；如果收益、交易数、信号统计、退出原因和交易摘要完全一致，不会立刻结束本轮，而是把 smoke 摘要回灌给模型，在同一轮里强制重生候选。
+11. 只有连续重生后仍然无法改变 smoke 行为，才会正式记一次 `behavioral_noop`。
+12. 只有 smoke 行为真的变了，才会继续跑整套 `train walk-forward + val`。
+13. 只有 `gate` 通过，且相对当前 `champion` 的 `promotion_delta` 至少高 `0.02`，才刷新当前主参考。
+14. 如果当前还没有 `gate-passed champion`，而现有基线本身又没过 gate，那么第一条过 gate 的候选会直接晋升为新 `champion`。
+15. 刷新 `champion` 之后，研究器会清掉旧 session / workspace 上下文，并为下一个 stage 准备新 session。
+16. 刷新 `champion` 之后，才会额外跑一次隐藏 `test`；它只做验收，不参与 `champion` 选择，也不会喂给模型。
+17. 每轮结果都会写进 journal，包含 `accepted / rejected / duplicate_skipped / behavioral_noop / exploration_blocked / early_rejected / runtime_failed`。
 
 ## 当前评分口径
 
@@ -121,31 +124,28 @@
 
 ## Prompt 现在怎么组织
 
-当前 prompt 的顺序是：
+当前 prompt 现在拆成四层：
 
-1. 刷新条件与本轮目标
-2. 本轮阅读顺序
-3. 当前诊断摘要
-4. 本轮执行框架
-5. 历史研究包里的 `stage` 执行摘要
-6. 失败核聚合
-7. 风险表 / 最近轮次附录
-8. 硬约束与输出要求
+1. workspace 局部 `AGENTS.md`
+2. runtime prompt
+3. `wiki/latest_history_package.md`
+4. `wiki/failure_wiki.md`
 
 现在的 prompt 有几个重要变化：
 
 - 不再把整份策略源码塞进 prompt。
-- 借鉴公开高可信 prompt 组织原则后，改成“稳定规则前置、动态摘要前置、长历史后置”；先看目标和现状，再看失败核和附录。
-- runtime prompt 现在显式写出“先目标 -> 再现状 -> 再失败核 -> 再提出单一假设”的阅读顺序，减少模型一上来被长历史带偏。
+- 稳定规则已经从每轮 system prompt 挪到 workspace 局部 `AGENTS.md`，只影响研究器自己的工作区，不会污染仓库根目录环境。
+- runtime prompt 现在只放本轮动态信息，并显式写出“先目标 -> 再现状 -> 再 failure wiki / history package -> 再提出单一假设 -> 再回看 failure wiki 自检”的阅读顺序。
 - `evaluation` 的 prompt 摘要不再平铺全部指标，而是先给 `gate` 主失败项、弱侧、`val` 漏斗堵点和当前风险/成本摘要。
 - `history package` 不再先摆方向风险表，而是先给 `stage` 执行摘要和失败核聚合；相同 gate reason 会先折叠成同一个“坏盆地”。
+- 失败信息新增成独立 `failure wiki`：一份 markdown 给模型读，一份 json 给系统 guard 读；同一 exact cut 连续失败后，会在评估前直接被挡回去重生。
 - 防重复约束只保留一份，不再在多个位置重复同一句规则。
 - 模型可以看到 `val` 的聚合诊断，但完全看不到 `test`。
 - prompt 会明确写出：只有 `gate` 通过且 `promotion_delta > 0.02` 才可能刷新当前 `champion`。
 - 如果候选在 smoke 窗口上的行为完全不变，系统会在同一轮回灌 smoke 摘要并强制重生，而不是直接白白结束整轮。
 - 如果候选在源码校验阶段就因为复杂度预算或复杂度增量超限被拒，系统也会先做同轮 repair；修不动才把这类失败写进当前 `stage` 记忆。
 - runtime prompt 会额外显示当前基底最紧张的 complexity headroom，让模型先看到哪个 family / function 已经贴边。
-- `edited_regions` 不再硬卡 `1-3`；系统只保留“至少改到 1 个 ordinary family”的下限，并继续用真实代码 diff / AST 派生的 `system signature` 复核，不再只信模型自报元信息。
+- `edited_regions` 不再硬卡 `1-3`，也不再要求“至少改到 1 个 ordinary family”；`strategy-only / PARAMS-only` 也允许进入后续流程，是否算有效探索改由真实 diff / smoke / 结果盆地重复 / complexity 共同决定。
 - prompt 里的可编辑区域已经扩成真实存在的命名规则块，允许模型直接动 `sideways / flow / trend_quality / followthrough / long_entry / short_entry / strategy` 这些结构块。
 - 最近轮次摘要仍保留“核心指标表 + 元信息摘要”，但在它前面新增了 `stage` 执行摘要和失败核聚合，逐轮表只作为附录。
 
@@ -226,13 +226,16 @@ PY
 研究器现在还带了新的防局部最优保护：
 
 - 如果候选只是落在同一方向簇里的低变化近邻，系统会在评估前直接拦截
-- 连续 `behavioral_noop` 现在也会进入同簇低变化上下文，后续若仍沿同簇近邻试错，会被评估前拦截并触发冷却锁
+- 连续 `behavioral_noop`、重复结果盆地和复杂度连撞都会进入 stall 上下文，后续若仍沿同簇近邻试错，会更快触发放宽或拦截并进入冷却锁
 - 被拦截后不会立刻浪费下一轮，而是会在同一轮里强制重生候选
 - 如果同一方向簇反复触发该问题，会进入短期冷却锁，默认是 `3 -> 6 -> 10` 轮递增
-- 低变化近邻的判定不再主要靠 `closest_failed_cluster / change_tags / edited_regions` 自报，而会同时看真实 diff、参数族变化和 AST 派生的结构签名
+- 低变化近邻的判定不再主要靠 `closest_failed_cluster / change_tags / edited_regions` 自报，而会同时看真实 diff、参数族变化、AST 派生结构签名和结果盆地重复
 - `smoke` 默认覆盖 `5` 个窗口，当前会取早 train / val / 中前段 train / 中段 train / 尾段 train
 - `smoke` 现在还会比较行为指纹；如果候选和当前参考的 smoke 交易行为完全一致，会先在同一轮回灌 smoke 摘要并强制重生，只有连续重生后仍不变化才记 `behavioral_noop`
 - prompt 的最近轮次表现在只展示最近有限条，避免长串重复 noop 淹没当前硬约束；`behavioral_noop` 未跑完整评估的指标也不再伪装成 `0.00`
+- 当前 stage 的 Codex session 会持久化到 `state/research_macd_aggressive_v2_session.json`
+- 研究器独立工作区在 `state/research_macd_aggressive_v2_agent_workspace/`
+- `reset_research_macd_aggressive_v2_state.sh` 现在会把 journal/memory 之外的 session 文件和 agent workspace 也一并归档
 
 ## Discord 播报说明
 

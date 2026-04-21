@@ -15,7 +15,12 @@ sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 import backtest_macd_aggressive as backtest
-from codex_exec_client import StrategyClientConfig, StrategyGenerationTransientError, generate_json_object
+from codex_exec_client import (
+    StrategyClientConfig,
+    StrategyGenerationSessionError,
+    StrategyGenerationTransientError,
+    generate_json_object,
+)
 import freqtrade_macd_aggressive as ft_adapter
 from market_data_catalog import default_market_data_paths
 import scripts.research_macd_aggressive_v2 as research_script
@@ -40,7 +45,9 @@ from research_v2.journal import (
     cluster_for_tags,
     cluster_key_for_components,
     cluster_key_for_entry,
+    evaluate_candidate_failure_wiki_guard,
     evaluate_candidate_exploration_guard,
+    load_failure_wiki_index,
     ordinary_region_families,
     region_families_for_regions,
 )
@@ -48,6 +55,7 @@ from research_v2.notifications import build_discord_summary_message
 from research_v2.prompting import (
     EDITABLE_REGIONS,
     build_candidate_response_schema,
+    build_strategy_agents_instructions,
     build_strategy_exploration_repair_prompt,
     build_strategy_research_prompt,
     build_strategy_runtime_repair_prompt,
@@ -1252,12 +1260,12 @@ class JournalPromptFixesTest(unittest.TestCase):
 
         self.assertEqual(schema["properties"]["edited_regions"]["maxItems"], len(EDITABLE_REGIONS))
 
-    def test_build_strategy_system_prompt_mentions_15m_single_source_and_flow(self):
-        prompt = build_strategy_system_prompt()
+    def test_build_strategy_agents_instructions_mentions_15m_single_source_and_flow(self):
+        prompt = build_strategy_agents_instructions()
 
         self.assertIn("15m` 是唯一事实源", prompt)
         self.assertIn("方向流量代理", prompt)
-        self.assertIn("state/research_macd_aggressive_v2_memory", prompt)
+        self.assertIn("wiki/failure_wiki.md", prompt)
         self.assertIn("默认模式", prompt)
         self.assertIn("禁止新增 `PARAMS` 键", prompt)
 
@@ -1271,41 +1279,49 @@ class JournalPromptFixesTest(unittest.TestCase):
         self.assertIn("promotion_delta > 0.02", prompt)
         self.assertIn("当前回合任务", prompt)
         self.assertIn("本轮阅读顺序（必须执行）", prompt)
-        self.assertIn("相同失败核只算一个坏盆地", prompt)
+        self.assertIn("failure_wiki.md", prompt)
+        self.assertIn("形成假设后，必须回看一次", prompt)
         self.assertIn("当前因子模式：默认模式", prompt)
         self.assertIn("不是新增因子的申请通道", prompt)
 
-    def test_build_strategy_system_prompt_mentions_all_required_symbols(self):
-        prompt = build_strategy_system_prompt()
+    def test_build_strategy_agents_instructions_mentions_all_required_symbols(self):
+        prompt = build_strategy_agents_instructions()
 
         for function_name in REQUIRED_FUNCTIONS:
             self.assertIn(f"`{function_name}()`", prompt)
 
-    def test_build_strategy_system_prompt_mentions_ordinary_family_budget(self):
-        prompt = build_strategy_system_prompt()
+    def test_build_strategy_agents_instructions_mentions_ordinary_family_budget(self):
+        prompt = build_strategy_agents_instructions()
 
         self.assertIn("`strategy()` 与 `PARAMS` 属于特殊区域", prompt)
         for family_name in ORDINARY_REGION_FAMILIES:
             self.assertIn(f"`{family_name}`", prompt)
         self.assertIn("普通 family", prompt)
 
-    def test_build_strategy_system_prompt_mentions_delete_first_rule(self):
-        prompt = build_strategy_system_prompt()
+    def test_build_strategy_agents_instructions_mentions_delete_first_rule(self):
+        prompt = build_strategy_agents_instructions()
 
         self.assertIn("默认先做删减、合并、替换", prompt)
         self.assertIn("不要继续叠分叉", prompt)
         self.assertIn("不要“堆屎”", prompt)
         self.assertIn("不要换个名字再写一份重复条件", prompt)
 
+    def test_build_strategy_system_prompt_mentions_agents_md_and_json_only(self):
+        prompt = build_strategy_system_prompt()
+
+        self.assertIn("AGENTS.md", prompt)
+        self.assertIn("只返回符合 schema 的 JSON", prompt)
+
     def test_build_strategy_prompts_include_precise_complexity_budgets(self):
-        system_prompt = build_strategy_system_prompt()
+        system_prompt = build_strategy_agents_instructions()
         runtime_prompt = build_strategy_research_prompt(
             evaluation_summary="诊断",
             journal_summary="记忆",
             previous_best_score=1.23,
         )
 
-        for prompt in (system_prompt, runtime_prompt):
+        self.assertNotIn("复杂度硬上限（超了直接拒收）", runtime_prompt)
+        for prompt in (system_prompt,):
             self.assertIn("复杂度硬上限（超了直接拒收）", prompt)
             self.assertIn("`_is_sideways_regime`: lines <= 90 / bool_ops <= 32 / ifs <= 14", prompt)
             self.assertIn("`_trend_followthrough_ok`: lines <= 90 / bool_ops <= 36 / ifs <= 12", prompt)
@@ -1384,6 +1400,7 @@ class JournalPromptFixesTest(unittest.TestCase):
 
         self.assertIn("附加反馈（本次必须处理）", prompt)
         self.assertIn("最近连续 behavioral_noop: 2", prompt)
+        self.assertIn("wiki/failure_wiki.md", prompt)
 
     def test_region_family_mapping_merges_entry_path_blocks(self):
         region_families = region_families_for_regions(
@@ -1393,7 +1410,7 @@ class JournalPromptFixesTest(unittest.TestCase):
         self.assertEqual(region_families, ("entry_path", "flow", "strategy", "params"))
         self.assertEqual(ordinary_region_families(region_families), ("entry_path", "flow"))
 
-    def test_candidate_from_payload_rejects_strategy_without_ordinary_family(self):
+    def test_candidate_from_payload_allows_strategy_only_when_source_really_changes(self):
         base_source = self._minimal_strategy_source()
         candidate_source = base_source.replace(
             "def strategy(*args, **kwargs):\n    return None\n",
@@ -1418,12 +1435,12 @@ class JournalPromptFixesTest(unittest.TestCase):
                 "core_factors": [],
             }
 
-            with self.assertRaisesRegex(StrategySourceError, "strategy/PARAMS alone are not enough"):
-                research_script._candidate_from_payload(
-                    payload,
-                    workspace_strategy_file=workspace_strategy_file,
-                    base_source=base_source,
-                )
+            candidate = research_script._candidate_from_payload(
+                payload,
+                workspace_strategy_file=workspace_strategy_file,
+                base_source=base_source,
+            )
+            self.assertEqual(candidate.candidate_id, "candidate_only_strategy")
 
     def test_candidate_from_payload_allows_four_ordinary_families(self):
         base_source = self._minimal_strategy_source()
@@ -2228,7 +2245,59 @@ class FreqtradeAdapterFixesTest(unittest.TestCase):
 
         self.assertIsNotNone(block)
         self.assertEqual(block["block_kind"], "same_cluster")
-        self.assertIn("连续行为无变化", block["blocked_reason"])
+        self.assertTrue(
+            any(label in block["blocked_reason"] for label in ("连续行为无变化", "同一结果盆地反复回落"))
+        )
+
+    def test_failure_wiki_guard_blocks_exact_cut_after_repeated_noop(self):
+        entries = []
+        for idx in range(2):
+            entries.append(
+                {
+                    "iteration": idx + 1,
+                    "candidate_id": f"noop_exact_{idx}",
+                    "outcome": "behavioral_noop",
+                    "stop_stage": "behavioral_noop",
+                    "promotion_delta": None,
+                    "gate_reason": "smoke 行为指纹与当前主参考完全一致",
+                    "closest_failed_cluster": "ownership_cluster",
+                    "change_tags": ["ownership_takeover", "acceptance_continuity"],
+                    "edited_regions": ["strategy"],
+                    "hypothesis": "连续行为无变化",
+                    "expected_effects": ["提高多头上车"],
+                    "score_regime": "trend_capture_v5",
+                }
+            )
+
+        candidate = StrategyCandidate(
+            candidate_id="candidate_wiki_guard",
+            hypothesis="继续沿用相同 exact cut",
+            change_plan="继续微调 strategy 最终路由",
+            closest_failed_cluster="ownership_cluster",
+            novelty_proof="这次还是同一条 cut。",
+            change_tags=("ownership_takeover", "acceptance_continuity"),
+            edited_regions=("strategy",),
+            expected_effects=("提高多头上车",),
+            core_factors=(),
+            strategy_code="def strategy():\n    return None\n",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            memory_root = Path(tmpdir) / "memory"
+            build_journal_prompt_summary(
+                entries,
+                limit=8,
+                current_score_regime="trend_capture_v5",
+                active_stage_iteration=1,
+                memory_root=memory_root,
+            )
+            failure_wiki_index = load_failure_wiki_index(memory_root)
+
+        block = evaluate_candidate_failure_wiki_guard(candidate, failure_wiki_index)
+
+        self.assertIsNotNone(block)
+        self.assertEqual(block["block_kind"], "failure_wiki_exact_cut")
+        self.assertIn("exact cut", block["blocked_reason"])
 
     def test_journal_summary_limits_recent_rows_and_meta_lines_to_requested_limit(self):
         entries = []
@@ -2537,6 +2606,9 @@ class FreqtradeAdapterFixesTest(unittest.TestCase):
             self.assertTrue((memory_root / "summaries/past_stage_summaries.json").exists())
             self.assertTrue((memory_root / "summaries/all_time_tables.json").exists())
             self.assertTrue((memory_root / "prompt/latest_history_package.md").exists())
+            self.assertTrue((memory_root / "wiki/failure_wiki.md").exists())
+            self.assertTrue((memory_root / "wiki/failure_wiki_index.json").exists())
+            self.assertIn("blocked_cuts", load_failure_wiki_index(memory_root))
 
     def test_append_journal_archive_writes_raw_history_files(self):
         entry = {
@@ -2951,8 +3023,108 @@ class CodexExecClientTest(unittest.TestCase):
                 )
 
         command = popen.call_args.args[0]
-        self.assertEqual(command[:4], ["codex", "-a", "never", "exec"])
+        self.assertEqual(command[:6], ["codex", "-a", "never", "-s", "danger-full-access", "-C"])
+        self.assertEqual(command[7], "exec")
         self.assertIn("model_max_output_tokens=3200", command)
+
+    def test_generate_json_object_supports_resume_and_response_metadata(self):
+        class FakePopen:
+            def __init__(self, *args, **kwargs):
+                self.pid = 43210
+                self.returncode = 0
+
+            def communicate(self, input=None, timeout=None):
+                return ('{"type":"thread.started","thread_id":"thread_123"}\n', "")
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        config = StrategyClientConfig(
+            codex_bin="codex",
+            model="gpt-5.4",
+            reasoning_effort="medium",
+            approval_policy="never",
+            sandbox="read-only",
+            timeout_seconds=90,
+            use_ephemeral=True,
+        )
+        metadata: dict[str, object] = {}
+
+        with mock.patch("codex_exec_client.shutil.which", return_value="/usr/local/bin/codex"):
+            with mock.patch("codex_exec_client.subprocess.Popen", return_value=FakePopen()) as popen:
+                with mock.patch("codex_exec_client._read_output_message", return_value='{"ok": true}'):
+                    payload = generate_json_object(
+                        prompt="test",
+                        system_prompt="system",
+                        config=config,
+                        session_id="thread_legacy",
+                        response_metadata=metadata,
+                        text_format={
+                            "type": "json_schema",
+                            "schema": {
+                                "type": "object",
+                                "properties": {"ok": {"type": "boolean"}},
+                                "required": ["ok"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    )
+
+        command = popen.call_args.args[0]
+        self.assertEqual(payload, {"ok": True})
+        self.assertIn("resume", command)
+        self.assertIn("thread_legacy", command)
+        self.assertNotIn("--output-schema", command)
+        self.assertEqual(metadata["thread_id"], "thread_123")
+        self.assertEqual(metadata["session_id"], "thread_123")
+        self.assertTrue(metadata["resumed"])
+
+    def test_generate_json_object_raises_session_error_on_invalid_resume(self):
+        class FakePopen:
+            def __init__(self, *args, **kwargs):
+                self.pid = 43210
+                self.returncode = 1
+
+            def communicate(self, input=None, timeout=None):
+                return ("", "Error: thread/resume: thread/resume failed: no rollout found for thread id thread_old")
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        config = StrategyClientConfig(
+            codex_bin="codex",
+            model="gpt-5.4",
+            reasoning_effort="medium",
+            approval_policy="never",
+            sandbox="read-only",
+            timeout_seconds=90,
+            use_ephemeral=True,
+        )
+
+        with mock.patch("codex_exec_client.shutil.which", return_value="/usr/local/bin/codex"):
+            with mock.patch("codex_exec_client.subprocess.Popen", return_value=FakePopen()):
+                with self.assertRaises(StrategyGenerationSessionError):
+                    generate_json_object(
+                        prompt="test",
+                        system_prompt="system",
+                        config=config,
+                        session_id="thread_old",
+                        text_format={
+                            "type": "json_schema",
+                            "schema": {
+                                "type": "object",
+                                "properties": {"ok": {"type": "boolean"}},
+                                "required": ["ok"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    )
 
     def test_generate_json_object_kills_process_group_after_timeout(self):
         class FakePopen:

@@ -22,6 +22,10 @@ class StrategyGenerationTransientError(StrategyGenerationError):
     """Raised when Codex appears temporarily unavailable or times out."""
 
 
+class StrategyGenerationSessionError(StrategyGenerationError):
+    """Raised when attempting to resume an invalid or expired Codex session."""
+
+
 ProgressCallback = Callable[[dict[str, Any]], None]
 
 _PROGRESS_POLL_SECONDS = 15.0
@@ -100,11 +104,21 @@ def _extract_schema(text_format: dict[str, Any] | None) -> dict[str, Any] | None
     return None
 
 
-def _build_codex_prompt(prompt: str, system_prompt: str) -> str:
+def _build_codex_prompt(
+    prompt: str,
+    system_prompt: str,
+    *,
+    inline_schema: dict[str, Any] | None = None,
+) -> str:
     parts = []
     if system_prompt.strip():
         parts.append(system_prompt.strip())
     parts.append("严格遵守给定的输出 schema。不要输出 schema 之外的内容。")
+    if inline_schema is not None:
+        parts.append(
+            "恢复 session 时 CLI 不会强制 schema；你必须自己确保最终输出是单个 JSON 对象，且严格匹配下列 schema：\n"
+            + json.dumps(inline_schema, ensure_ascii=False, indent=2)
+        )
     parts.append(prompt.strip())
     return "\n\n".join(parts)
 
@@ -139,12 +153,34 @@ def _is_retryable_error(stderr: str) -> bool:
     )
 
 
+def _is_session_resume_error(stderr: str) -> bool:
+    haystack = stderr.lower()
+    session_terms = ("resume", "session", "thread", "conversation")
+    failure_terms = ("not found", "missing", "invalid", "expired", "unknown", "no such", "no rollout")
+    return any(term in haystack for term in session_terms) and any(term in haystack for term in failure_terms)
+
+
 def _read_output_message(path: Path, stdout: str) -> str:
     if path.exists():
         text = path.read_text().strip()
         if text:
             return text
     return stdout.strip()
+
+
+def _parse_jsonl_events(stdout: str) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for line in stdout.splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            events.append(payload)
+    return events
 
 
 def _emit_progress(callback: ProgressCallback | None, **payload: Any) -> None:
@@ -211,6 +247,8 @@ def generate_json_object(
     config: StrategyClientConfig | None = None,
     text_format: dict[str, Any] | None = None,
     progress_callback: ProgressCallback | None = None,
+    session_id: str | None = None,
+    response_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     client_config = config or load_strategy_client_config()
     if shutil.which(client_config.codex_bin) is None:
@@ -224,39 +262,58 @@ def generate_json_object(
         client_config.codex_bin,
         "-a",
         client_config.approval_policy,
-        "exec",
-        "--cd",
-        str(Path.cwd()),
-        "--sandbox",
+        "-s",
         client_config.sandbox,
-        "--skip-git-repo-check",
-        "--color",
-        "never",
-        "-m",
-        client_config.model,
-        "-c",
-        f'model_reasoning_effort="{client_config.reasoning_effort}"',
+        "-C",
+        str(Path.cwd()),
+        "exec",
     ]
+    if session_id:
+        command.append("resume")
+    command.extend(
+        [
+            "--json",
+            "--skip-git-repo-check",
+            "-m",
+            client_config.model,
+            "-c",
+            f'model_reasoning_effort="{client_config.reasoning_effort}"',
+        ]
+    )
     if max_output_tokens > 0:
         command.extend(["-c", f"model_max_output_tokens={int(max_output_tokens)}"])
-    if client_config.use_ephemeral:
+    if client_config.use_ephemeral and not session_id:
         command.append("--ephemeral")
 
     with tempfile.TemporaryDirectory(prefix="codex-exec-") as temp_dir:
         temp_root = Path(temp_dir)
         schema_path = temp_root / "schema.json"
         output_path = temp_root / "last_message.json"
-        schema_path.write_text(json.dumps(schema, ensure_ascii=False, indent=2))
-        command.extend(
-            [
-                "--output-schema",
-                str(schema_path),
-                "--output-last-message",
-                str(output_path),
-                "-",
-            ]
+        if session_id:
+            command.extend(
+                [
+                    "--output-last-message",
+                    str(output_path),
+                    session_id,
+                    "-",
+                ]
+            )
+        else:
+            schema_path.write_text(json.dumps(schema, ensure_ascii=False, indent=2))
+            command.extend(
+                [
+                    "--output-schema",
+                    str(schema_path),
+                    "--output-last-message",
+                    str(output_path),
+                    "-",
+                ]
+            )
+        full_prompt = _build_codex_prompt(
+            prompt,
+            system_prompt,
+            inline_schema=schema if session_id else None,
         )
-        full_prompt = _build_codex_prompt(prompt, system_prompt)
         process = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
@@ -317,6 +374,35 @@ def generate_json_object(
             _terminate_process_tree(process)
             raise
 
+        events = _parse_jsonl_events(stdout)
+        thread_id = next(
+            (
+                str(event.get("thread_id", "")).strip()
+                for event in events
+                if str(event.get("type", "")).strip() == "thread.started"
+                and str(event.get("thread_id", "")).strip()
+            ),
+            "",
+        )
+        if response_metadata is not None:
+            response_metadata.clear()
+            response_metadata.update(
+                {
+                    "thread_id": thread_id,
+                    "session_id": thread_id or (session_id or ""),
+                    "resumed": bool(session_id),
+                    "events": events,
+                }
+            )
+        if thread_id:
+            _emit_progress(
+                progress_callback,
+                event="thread_started",
+                pid=process.pid,
+                thread_id=thread_id,
+                resumed=bool(session_id),
+            )
+
         _emit_progress(
             progress_callback,
             event="completed",
@@ -333,6 +419,8 @@ def generate_json_object(
                 f"codex exec failed with exit code {process.returncode}: "
                 f"{_tail(stderr or stdout or 'no output')}"
             )
+            if session_id and _is_session_resume_error(stderr or stdout):
+                raise StrategyGenerationSessionError(message)
             if _is_retryable_error(stderr or stdout):
                 raise StrategyGenerationTransientError(message)
             raise StrategyGenerationError(message)
