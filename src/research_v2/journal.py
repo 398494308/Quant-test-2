@@ -31,6 +31,7 @@ NO_OP_STOP_STAGES = {
     "behavioral_noop",
     "duplicate_result_basin",
 }
+TECHNICAL_INVALID_STOP_STAGES = frozenset({"duplicate_source", "empty_diff", "blocked_invalid_generation"})
 
 CLUSTER_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("ownership_cluster", ("ownership", "acceptance", "handoff", "transfer", "reset_reclaim")),
@@ -216,6 +217,13 @@ def _entry_changed_regions(entry: dict[str, Any]) -> tuple[str, ...]:
     return tuple(str(item).strip() for item in stored if str(item).strip())
 
 
+def _entry_system_changed_regions(entry: dict[str, Any]) -> tuple[str, ...] | None:
+    if "system_changed_regions" not in entry:
+        return None
+    stored = entry.get("system_changed_regions") or []
+    return tuple(str(item).strip() for item in stored if str(item).strip())
+
+
 def _entry_region_families(entry: dict[str, Any]) -> tuple[str, ...]:
     stored = entry.get("system_region_families", []) or entry.get("region_families", [])
     if stored:
@@ -223,11 +231,36 @@ def _entry_region_families(entry: dict[str, Any]) -> tuple[str, ...]:
     return region_families_for_regions(_entry_changed_regions(entry))
 
 
+def _entry_is_technical_generation_invalid(entry: dict[str, Any]) -> bool:
+    if bool(entry.get("technical_generation_invalid")):
+        return True
+
+    outcome = str(entry.get("outcome", "")).strip()
+    stop_stage = str(entry.get("stop_stage", "")).strip()
+    block_kind = str(entry.get("block_kind", "")).strip()
+    system_changed_regions = _entry_system_changed_regions(entry)
+    changed_regions = system_changed_regions if system_changed_regions is not None else _entry_changed_regions(entry)
+
+    if outcome == "generation_invalid":
+        return True
+    if outcome == "exploration_blocked" and block_kind == "invalid_generation":
+        return True
+    if outcome == "duplicate_skipped" and stop_stage in TECHNICAL_INVALID_STOP_STAGES and not changed_regions:
+        return True
+    return False
+
+
+def _strategy_relevant_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [entry for entry in entries if not _entry_is_technical_generation_invalid(entry)]
+
+
 def _round_result_basin_value(value: Any, *, digits: int = RESULT_BASIN_ROUND_DIGITS) -> float:
     return round(_score_value(value), digits)
 
 
 def result_basin_key_for_entry(entry: dict[str, Any]) -> str:
+    if _entry_is_technical_generation_invalid(entry):
+        return ""
     raw_outcome = str(entry.get("outcome", "")).strip()
     if raw_outcome in {"accepted", "rejected", "early_rejected"}:
         metrics = entry.get("metrics", {})
@@ -694,20 +727,22 @@ def _compact_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
     if not entries:
         return {}
 
-    accepted = [e for e in entries if _outcome_bucket(str(e.get("outcome", ""))) == "accepted"]
-    rejected = [e for e in entries if _outcome_bucket(str(e.get("outcome", ""))) == "rejected"]
-    duplicate_skipped_count = sum(1 for e in entries if e.get("outcome") == "duplicate_skipped")
-    behavioral_noop_count = sum(1 for e in entries if e.get("outcome") == "behavioral_noop")
-    exploration_blocked_count = sum(1 for e in entries if e.get("outcome") == "exploration_blocked")
-    early_rejected_count = sum(1 for e in entries if e.get("outcome") == "early_rejected")
-    runtime_failed_count = sum(1 for e in entries if e.get("outcome") == "runtime_failed")
-    bloat_flag_count = sum(1 for e in entries if bool(e.get("system_bloat_flag")))
+    relevant_entries = _strategy_relevant_entries(entries)
+    technical_invalid_count = len(entries) - len(relevant_entries)
+    accepted = [e for e in relevant_entries if _outcome_bucket(str(e.get("outcome", ""))) == "accepted"]
+    rejected = [e for e in relevant_entries if _outcome_bucket(str(e.get("outcome", ""))) == "rejected"]
+    duplicate_skipped_count = sum(1 for e in relevant_entries if e.get("outcome") == "duplicate_skipped")
+    behavioral_noop_count = sum(1 for e in relevant_entries if e.get("outcome") == "behavioral_noop")
+    exploration_blocked_count = sum(1 for e in relevant_entries if e.get("outcome") == "exploration_blocked")
+    early_rejected_count = sum(1 for e in relevant_entries if e.get("outcome") == "early_rejected")
+    runtime_failed_count = sum(1 for e in relevant_entries if e.get("outcome") == "runtime_failed")
+    bloat_flag_count = sum(1 for e in relevant_entries if bool(e.get("system_bloat_flag")))
 
     # 标签统计：哪些方向有效 / 无效
     tag_stats: dict[str, dict[str, Any]] = defaultdict(
         lambda: {"accepted": 0, "rejected": 0, "scores": []}
     )
-    for entry in entries:
+    for entry in relevant_entries:
         outcome = _outcome_bucket(str(entry.get("outcome", "")))
         score = _score_value(entry.get("promotion_score"))
         for tag in entry.get("change_tags", []):
@@ -720,7 +755,7 @@ def _compact_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
     region_stats: dict[str, dict[str, int]] = defaultdict(
         lambda: {"accepted": 0, "rejected": 0}
     )
-    for entry in entries:
+    for entry in relevant_entries:
         outcome = _outcome_bucket(str(entry.get("outcome", "")))
         for region in _entry_changed_regions(entry):
             if outcome in {"accepted", "rejected"}:
@@ -754,8 +789,9 @@ def _compact_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
                 }
 
     # 最佳 / 最差候选摘要
-    best_entry = max(entries, key=lambda e: _score_value(e.get("promotion_score")))
-    worst_entry = min(entries, key=lambda e: _score_value(e.get("promotion_score")))
+    ranking_entries = relevant_entries or entries
+    best_entry = max(ranking_entries, key=lambda e: _score_value(e.get("promotion_score")))
+    worst_entry = min(ranking_entries, key=lambda e: _score_value(e.get("promotion_score")))
 
     tag_summary = {}
     for tag, stats in tag_stats.items():
@@ -766,7 +802,7 @@ def _compact_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
         }
 
     cluster_summary: dict[str, dict[str, Any]] = {}
-    for entry in entries:
+    for entry in relevant_entries:
         cluster = cluster_key_for_entry(entry)
         outcome = _outcome_bucket(str(entry.get("outcome", "")))
         promotion_delta = _score_value(entry.get("promotion_delta"))
@@ -811,6 +847,7 @@ def _compact_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
 
     return {
         "entry_count": len(entries),
+        "technical_invalid_count": technical_invalid_count,
         "score_regime": _entry_score_regime(entries[-1]),
         "accepted_count": len(accepted),
         "rejected_count": len(rejected),
@@ -820,7 +857,7 @@ def _compact_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
         "early_rejected_count": early_rejected_count,
         "runtime_failed_count": runtime_failed_count,
         "bloat_flag_count": bloat_flag_count,
-        "accept_rate": len(accepted) / len(entries) if entries else 0.0,
+        "accept_rate": len(accepted) / len(relevant_entries) if relevant_entries else 0.0,
         "tag_summary": tag_summary,
         "cluster_summary": cluster_summary,
         "exploration_summary": exploration_summary,
@@ -1264,20 +1301,21 @@ def build_exploration_guard_state(
     current_iteration: int,
     include_current_round_locks: bool = False,
 ) -> dict[str, Any]:
+    relevant_entries = _strategy_relevant_entries(entries)
     return {
         "history_counts": _merged_exploration_history(
-            entries,
+            relevant_entries,
             journal_path=journal_path,
             score_regime=score_regime,
             current_iteration=current_iteration,
         ),
         "active_locks": _current_round_lock_state(
-            entries,
+            relevant_entries,
             score_regime=score_regime,
             current_iteration=current_iteration,
             include_current_round_locks=include_current_round_locks,
         ),
-        "low_change_context": _same_cluster_low_change_context(entries, score_regime),
+        "low_change_context": _same_cluster_low_change_context(relevant_entries, score_regime),
     }
 
 
@@ -1398,6 +1436,7 @@ def evaluate_candidate_exploration_guard(
 
 
 def _direction_risk_board(entries: list[dict[str, Any]], limit: int) -> list[str]:
+    entries = _strategy_relevant_entries(entries)
     if not entries:
         return []
 
@@ -1612,6 +1651,7 @@ def _noop_tail(entries: list[dict[str, Any]], streak: int = LOW_CHANGE_STREAK) -
 
 
 def _exploration_trigger_lines(entries: list[dict[str, Any]], limit: int) -> list[str]:
+    entries = _strategy_relevant_entries(entries)
     noop_tail = _noop_tail(entries)
     if noop_tail:
         clusters: list[str] = []
@@ -2062,6 +2102,7 @@ def _stage_executive_summary_lines(
     reference_metrics: dict[str, Any] | None = None,
     limit: int = 6,
 ) -> list[str]:
+    entries = _strategy_relevant_entries(entries)
     if not entries:
         return []
 
@@ -2114,6 +2155,7 @@ def _stage_executive_summary_lines(
 
 
 def _summarize_stage_entries(stage_entries: list[dict[str, Any]], *, stage_id: int) -> dict[str, Any]:
+    stage_entries = _strategy_relevant_entries(stage_entries)
     if not stage_entries:
         return {}
 
@@ -2208,6 +2250,7 @@ def _format_past_stage_summary_lines(stage_summaries: list[dict[str, Any]], limi
 
 
 def _all_time_tables_payload(entries: list[dict[str, Any]], limit: int) -> dict[str, Any]:
+    entries = _strategy_relevant_entries(entries)
     cluster_bucket: dict[str, dict[str, Any]] = defaultdict(
         lambda: {
             "attempts": 0,
@@ -2298,6 +2341,8 @@ def _entry_identity_key(entry: dict[str, Any]) -> tuple[int, str, str]:
 
 
 def _failure_category_for_entry(entry: dict[str, Any]) -> str:
+    if _entry_is_technical_generation_invalid(entry):
+        return ""
     outcome = str(entry.get("outcome", "")).strip()
     stop_stage = str(entry.get("stop_stage", "")).strip()
     reason = _entry_decision_reason(entry).lower()
@@ -2385,9 +2430,10 @@ def build_failure_wiki_payload(
     current_stage_entries: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     scoped_entries = _entries_for_score_regime(entries, score_regime) if score_regime else list(entries)
+    scoped_entries = _strategy_relevant_entries(scoped_entries)
     current_stage_key_set = {
         _entry_identity_key(entry)
-        for entry in (current_stage_entries or [])
+        for entry in _strategy_relevant_entries(list(current_stage_entries or []))
     }
     grouped: dict[str, dict[str, Any]] = {}
 
@@ -2729,6 +2775,7 @@ def _display_outcome(raw_outcome: str) -> str:
         "accepted": "保留",
         "rejected": "未保留",
         "duplicate_skipped": "重复跳过",
+        "generation_invalid": "技术退回",
         "behavioral_noop": "行为无变化",
         "exploration_blocked": "探索拦截",
         "early_rejected": "提前淘汰",
@@ -2748,6 +2795,8 @@ def _display_stage(entry: dict[str, Any]) -> str:
         return "历史重复"
     if stage == "empty_diff":
         return "无有效diff"
+    if stage == "blocked_invalid_generation":
+        return "无真实改动"
     if stage == "behavioral_noop":
         return "行为无变化"
     if stage == "candidate_validation":
@@ -3052,12 +3101,15 @@ def build_journal_prompt_summary(
             default=0,
         ) + 1
     current_entries = _entries_for_score_regime(all_entries, active_score_regime)
+    current_relevant_entries = _strategy_relevant_entries(current_entries)
     current_stage_entries, past_stage_entries, stage_meta = _partition_entries_by_stage(
         all_entries,
         score_regime=active_score_regime,
         active_stage_started_at=active_stage_started_at,
         active_stage_iteration=active_stage_iteration,
     )
+    current_stage_relevant_entries = _strategy_relevant_entries(current_stage_entries)
+    current_stage_technical_invalid_count = len(current_stage_entries) - len(current_stage_relevant_entries)
     stage_name = (
         f"当前 {reference_role} stage"
         if reference_role in {"baseline", "champion"}
@@ -3079,96 +3131,108 @@ def build_journal_prompt_summary(
         parts.extend(_empty_prompt_tables(stage_scope))
     else:
         if current_stage_entries:
-            board_entries = current_stage_entries
-            display_entries = board_entries[-max(1, limit):]
-            stage_start_index = max(0, int(stage_meta.get("stage_iteration", 0) or 0) - 1)
-            executive_lines = _stage_executive_summary_lines(
-                board_entries,
-                stage_name=stage_name,
-                reference_metrics=reference_metrics,
-                limit=min(8, limit),
-            )
-            if executive_lines:
-                parts.extend(executive_lines)
-                parts.append("")
-
-            failure_nucleus_lines = _stage_failure_nucleus_lines(board_entries, limit=min(4, limit))
-            if failure_nucleus_lines:
-                parts.extend(failure_nucleus_lines)
-                parts.append("")
-
-            board_lines = _direction_risk_board(board_entries, limit=min(8, limit))
-            if board_lines:
-                parts.extend(board_lines)
-                parts.append("")
-
-            cooling_lines = _direction_cooling_board(
-                board_entries,
-                limit=min(8, limit),
-                journal_path=journal_path,
-                score_regime=active_score_regime,
-                current_iteration=current_iteration,
-            )
-            if cooling_lines:
-                parts.extend(cooling_lines)
-                parts.append("")
-
-            overheat_lines = _cluster_overheat_lines(board_entries, limit=min(8, limit))
-            if overheat_lines:
-                parts.extend(overheat_lines)
-                parts.append("")
-
-            overfit_lines = _overfit_risk_board(board_entries, limit=min(8, limit))
-            if overfit_lines:
-                parts.extend(overfit_lines)
-                parts.append("")
-
-            exploration_lines = _exploration_trigger_lines(board_entries, limit=min(8, limit))
-            if exploration_lines:
-                parts.extend(exploration_lines)
-                parts.append("")
-
-            accepted_count = sum(1 for entry in board_entries if entry.get("outcome") == "accepted")
-            rejected_count = sum(1 for entry in board_entries if entry.get("outcome") == "rejected")
-            duplicate_skipped_count = sum(1 for entry in board_entries if entry.get("outcome") == "duplicate_skipped")
-            behavioral_noop_count = sum(1 for entry in board_entries if entry.get("outcome") == "behavioral_noop")
-            exploration_blocked_count = sum(1 for entry in board_entries if entry.get("outcome") == "exploration_blocked")
-            early_rejected_count = sum(1 for entry in board_entries if entry.get("outcome") == "early_rejected")
-            runtime_failed_count = sum(1 for entry in board_entries if entry.get("outcome") == "runtime_failed")
-            bloat_flag_count = sum(1 for entry in board_entries if bool(entry.get("system_bloat_flag")))
-            repeated_basin_count = _repeated_result_basin_entry_count(board_entries)
-            operating_metrics = _stage_operating_metrics(
-                board_entries,
-                reference_metrics=reference_metrics,
-            )
-            parts.append(
-                f"{stage_scope} 共 {len(board_entries)} 条："
-                f"保留 {accepted_count}，未保留 {rejected_count}，"
-                f"重复跳过 {duplicate_skipped_count}，"
-                f"结果盆地重复 {repeated_basin_count}，"
-                f"行为无变化 {behavioral_noop_count}，"
-                f"探索拦截 {exploration_blocked_count}，"
-                f"提前淘汰 {early_rejected_count}，运行失败 {runtime_failed_count}，"
-                f"复杂度超标 {bloat_flag_count}。"
-            )
-            parts.extend(
-                _format_stage_operating_metrics(
-                    operating_metrics,
-                    stage_name=stage_name,
-                )
-            )
-            if len(display_entries) < len(board_entries):
+            board_entries = current_stage_relevant_entries
+            if not board_entries:
+                parts.extend(_empty_prompt_tables(stage_scope))
                 parts.append(
-                    f"以下表格与元信息仅展示最近 {len(display_entries)} 条；完整当前 stage 已写入 memory 归档。"
+                    f"{stage_scope} 最近仅出现 {current_stage_technical_invalid_count} 条技术性空转；"
+                    "它们已从 failure wiki / 方向风险 / 过热统计中隔离，不作为策略失败方向证据。"
                 )
-            failure_tag_lines = _recent_failure_tag_lines(board_entries, limit=min(8, limit))
-            if failure_tag_lines:
-                parts.append("当前 stage 高频失败标签:")
-                parts.extend(failure_tag_lines)
-            parts.append(f"{stage_name} 核心指标表:")
-            parts.extend(_format_recent_rounds_table(display_entries, stage_start_index))
-            parts.append("")
-            parts.extend(_recent_round_meta_lines(display_entries, stage_start_index))
+            else:
+                display_entries = board_entries[-max(1, limit):]
+                stage_start_index = max(0, int(stage_meta.get("stage_iteration", 0) or 0) - 1)
+                executive_lines = _stage_executive_summary_lines(
+                    board_entries,
+                    stage_name=stage_name,
+                    reference_metrics=reference_metrics,
+                    limit=min(8, limit),
+                )
+                if executive_lines:
+                    parts.extend(executive_lines)
+                    parts.append("")
+
+                failure_nucleus_lines = _stage_failure_nucleus_lines(board_entries, limit=min(4, limit))
+                if failure_nucleus_lines:
+                    parts.extend(failure_nucleus_lines)
+                    parts.append("")
+
+                board_lines = _direction_risk_board(board_entries, limit=min(8, limit))
+                if board_lines:
+                    parts.extend(board_lines)
+                    parts.append("")
+
+                cooling_lines = _direction_cooling_board(
+                    board_entries,
+                    limit=min(8, limit),
+                    journal_path=journal_path,
+                    score_regime=active_score_regime,
+                    current_iteration=current_iteration,
+                )
+                if cooling_lines:
+                    parts.extend(cooling_lines)
+                    parts.append("")
+
+                overheat_lines = _cluster_overheat_lines(board_entries, limit=min(8, limit))
+                if overheat_lines:
+                    parts.extend(overheat_lines)
+                    parts.append("")
+
+                overfit_lines = _overfit_risk_board(board_entries, limit=min(8, limit))
+                if overfit_lines:
+                    parts.extend(overfit_lines)
+                    parts.append("")
+
+                exploration_lines = _exploration_trigger_lines(board_entries, limit=min(8, limit))
+                if exploration_lines:
+                    parts.extend(exploration_lines)
+                    parts.append("")
+
+                accepted_count = sum(1 for entry in board_entries if entry.get("outcome") == "accepted")
+                rejected_count = sum(1 for entry in board_entries if entry.get("outcome") == "rejected")
+                duplicate_skipped_count = sum(1 for entry in board_entries if entry.get("outcome") == "duplicate_skipped")
+                behavioral_noop_count = sum(1 for entry in board_entries if entry.get("outcome") == "behavioral_noop")
+                exploration_blocked_count = sum(1 for entry in board_entries if entry.get("outcome") == "exploration_blocked")
+                early_rejected_count = sum(1 for entry in board_entries if entry.get("outcome") == "early_rejected")
+                runtime_failed_count = sum(1 for entry in board_entries if entry.get("outcome") == "runtime_failed")
+                bloat_flag_count = sum(1 for entry in board_entries if bool(entry.get("system_bloat_flag")))
+                repeated_basin_count = _repeated_result_basin_entry_count(board_entries)
+                operating_metrics = _stage_operating_metrics(
+                    board_entries,
+                    reference_metrics=reference_metrics,
+                )
+                parts.append(
+                    f"{stage_scope} 共 {len(current_stage_entries)} 条："
+                    f"保留 {accepted_count}，未保留 {rejected_count}，"
+                    f"重复跳过 {duplicate_skipped_count}，"
+                    f"结果盆地重复 {repeated_basin_count}，"
+                    f"行为无变化 {behavioral_noop_count}，"
+                    f"探索拦截 {exploration_blocked_count}，"
+                    f"提前淘汰 {early_rejected_count}，运行失败 {runtime_failed_count}，"
+                    f"复杂度超标 {bloat_flag_count}，技术空转 {current_stage_technical_invalid_count}。"
+                )
+                parts.extend(
+                    _format_stage_operating_metrics(
+                        operating_metrics,
+                        stage_name=stage_name,
+                    )
+                )
+                if len(display_entries) < len(board_entries):
+                    parts.append(
+                        f"以下表格与元信息仅展示最近 {len(display_entries)} 条；完整当前 stage 已写入 memory 归档。"
+                    )
+                if current_stage_technical_invalid_count > 0:
+                    parts.append(
+                        f"- 本 stage 另有 {current_stage_technical_invalid_count} 条技术性空转已被隔离；"
+                        "它们不会进入 failure wiki exact cut、方向风险表或过热统计。"
+                    )
+                failure_tag_lines = _recent_failure_tag_lines(board_entries, limit=min(8, limit))
+                if failure_tag_lines:
+                    parts.append("当前 stage 高频失败标签:")
+                    parts.extend(failure_tag_lines)
+                parts.append(f"{stage_name} 核心指标表:")
+                parts.extend(_format_recent_rounds_table(display_entries, stage_start_index))
+                parts.append("")
+                parts.extend(_recent_round_meta_lines(display_entries, stage_start_index))
         else:
             parts.extend(_empty_prompt_tables(stage_scope))
 
@@ -3184,7 +3248,7 @@ def build_journal_prompt_summary(
                 parts.append("")
             parts.extend(past_stage_lines)
 
-        all_time_payload = _all_time_tables_payload(current_entries, limit=min(8, limit))
+        all_time_payload = _all_time_tables_payload(current_relevant_entries, limit=min(8, limit))
         all_time_lines = _format_all_time_tables(all_time_payload)
         if all_time_lines:
             if parts:
@@ -3192,7 +3256,7 @@ def build_journal_prompt_summary(
             parts.extend(all_time_lines)
     if current_entries and not past_stage_entries:
         past_stage_summaries = []
-        all_time_payload = _all_time_tables_payload(current_entries, limit=min(8, limit))
+        all_time_payload = _all_time_tables_payload(current_relevant_entries, limit=min(8, limit))
     elif not current_entries:
         past_stage_summaries = []
         all_time_payload = {}

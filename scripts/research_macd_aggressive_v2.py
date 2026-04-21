@@ -105,6 +105,7 @@ SCORE_REGIME = "trend_capture_v6"
 MODEL_WORKSPACE_STRATEGY_PATH = Path("src/strategy_macd_aggressive.py")
 FACTOR_ADMISSION_TRIGGER_STALLS = 3
 FACTOR_ADMISSION_MAX_BURST = 2
+INVALID_GENERATION_SESSION_RESET_STREAK = 2
 
 best_source = ""
 best_report: EvaluationReport | None = None
@@ -277,7 +278,40 @@ def _store_research_session_metadata(
         "workspace_root": str(workspace_root),
         "created_at": str(previous.get("created_at", "")).strip() or now,
         "updated_at": now,
+        "invalid_generation_streak": int(previous.get("invalid_generation_streak", 0) or 0),
     }
+    _persist_research_session_state(payload)
+
+
+def _session_invalid_generation_streak() -> int:
+    state = _load_research_session_state()
+    if not _session_state_matches_current_stage(state):
+        return 0
+    try:
+        return max(0, int(state.get("invalid_generation_streak", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _set_session_invalid_generation_streak(value: int) -> None:
+    normalized = max(0, int(value))
+    previous = _load_research_session_state()
+    if not _session_state_matches_current_stage(previous):
+        previous = {}
+    if not previous and normalized <= 0:
+        return
+
+    now = datetime.now(UTC).isoformat()
+    payload = {
+        **_session_scope_payload(),
+        "session_id": str(previous.get("session_id", "")).strip(),
+        "workspace_root": str(previous.get("workspace_root", "")).strip(),
+        "created_at": str(previous.get("created_at", "")).strip() or now,
+        "updated_at": now,
+        "invalid_generation_streak": normalized,
+    }
+    if not payload["session_id"] and not payload["workspace_root"] and normalized <= 0:
+        return
     _persist_research_session_state(payload)
 
 
@@ -465,7 +499,7 @@ def _entry_is_factor_stall(
     basin_counts: dict[str, int] | None = None,
 ) -> bool:
     outcome = str(entry.get("outcome", "")).strip()
-    if outcome in {"behavioral_noop", "exploration_blocked", "duplicate_skipped"}:
+    if outcome in {"behavioral_noop", "exploration_blocked", "duplicate_skipped", "generation_invalid"}:
         return True
     if outcome == "runtime_failed":
         return _is_complexity_error_message(str(entry.get("decision_reason", "")).strip())
@@ -1290,6 +1324,68 @@ def _behavioral_noop_block_info(
     }
 
 
+def _candidate_invalid_generation_block_info(
+    candidate: StrategyCandidate,
+    *,
+    base_source: str,
+) -> dict[str, Any] | None:
+    candidate_signature = exploration_signature_for_candidate(
+        candidate,
+        base_source=base_source,
+        editable_regions=EDITABLE_REGIONS,
+    )
+    candidate_hash = source_hash(candidate.strategy_code)
+    base_hash = source_hash(base_source)
+    actual_changed_regions = sorted(candidate_signature["changed_regions"])
+    diff_summary = build_diff_summary(base_source, candidate.strategy_code, limit=12)
+    declared_regions = sorted(str(item).strip() for item in candidate.edited_regions if str(item).strip())
+    declared_regions_match_system = declared_regions == actual_changed_regions
+
+    invalid_reasons: list[str] = []
+    if candidate_hash == base_hash:
+        invalid_reasons.append("候选源码与当前主参考完全相同")
+    if not actual_changed_regions:
+        invalid_reasons.append("系统未检测到任何真实可编辑区域改动")
+    if not diff_summary:
+        invalid_reasons.append("候选没有形成可验证的有效 diff")
+    if declared_regions and not declared_regions_match_system:
+        invalid_reasons.append("声明改动区域与系统实际改动区域不一致")
+
+    if not invalid_reasons:
+        return None
+
+    blocked_tags = sorted(
+        tag
+        for tag in candidate.change_tags
+        if str(tag).strip().lower() in {"blocked", "no_edit", "no_change", "blocked_env", "sandbox_blocked"}
+    )
+    feedback_lines = [
+        "候选无效：本轮没有形成真实代码改动。",
+        f"- 系统检测改动区域: {', '.join(actual_changed_regions) or '-'}",
+        f"- 候选声明改动区域: {', '.join(declared_regions) or '-'}",
+        f"- diff 摘要条数: {len(diff_summary)}",
+        f"- 无效原因: {'；'.join(invalid_reasons)}",
+        "- `wiki/failure_wiki.md` / `wiki/latest_history_package.md` 是高优先级参考，但读不到它们不是合法 no-edit 理由。",
+        "- 即使辅助记忆文件暂不可用，也必须继续以 `src/strategy_macd_aggressive.py` 为事实源直接改代码。",
+        "- 禁止继续提交 `blocked` / `no_edit` / `no_change` / “未执行代码改动” 这类占位答案。",
+        "- 下一版必须先形成真实 diff，并让系统检测到至少一个可编辑区域发生变化。",
+    ]
+    if blocked_tags:
+        feedback_lines.append(f"- 当前候选使用了占位标签: {', '.join(blocked_tags)}")
+
+    return {
+        "block_kind": "invalid_generation",
+        "stop_stage": "blocked_invalid_generation",
+        "blocked_cluster": str(candidate_signature.get("cluster_key", "")).strip() or "-",
+        "blocked_reason": "候选未产生真实代码改动，不能作为有效研究候选进入后续流程",
+        "current_locks": tuple(),
+        "invalid_reasons": tuple(invalid_reasons),
+        "actual_changed_regions": tuple(actual_changed_regions),
+        "declared_regions_match_system": declared_regions_match_system,
+        "feedback_note": "\n".join(feedback_lines),
+    }
+
+
 # ==================== 候选策略生成 ====================
 
 
@@ -2045,6 +2141,39 @@ def _record_duplicate_skip(
         log_info("研究日志已压缩")
 
 
+def _record_generation_invalid(
+    *,
+    iteration_id: int,
+    candidate: StrategyCandidate,
+    base_source: str,
+    factor_change_mode: str,
+    block_info: dict[str, Any],
+    note: str,
+) -> None:
+    _append_research_journal_entry(
+        _build_journal_entry(
+            iteration_id=iteration_id,
+            candidate=candidate,
+            base_source=base_source,
+            candidate_report=None,
+            factor_change_mode=factor_change_mode,
+            outcome="generation_invalid",
+            stop_stage=str(block_info.get("stop_stage", "blocked_invalid_generation")),
+            gate_reason=str(block_info.get("blocked_reason", "")).strip() or "候选未产生真实代码改动",
+            note=note,
+            extra_fields={
+                "block_kind": str(block_info.get("block_kind", "")).strip(),
+                "blocked_cluster": str(block_info.get("blocked_cluster", "")).strip(),
+                "technical_generation_invalid": True,
+                "current_locks": list(block_info.get("current_locks", ()) or ()),
+                "invalid_reasons": list(block_info.get("invalid_reasons", ()) or ()),
+            },
+        )
+    )
+    if maybe_compact(RUNTIME.paths.journal_file):
+        log_info("研究日志已压缩")
+
+
 def _record_exploration_block(
     *,
     iteration_id: int,
@@ -2294,6 +2423,81 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
     while True:
         candidate_report = None
         journal_entries = load_journal_entries(RUNTIME.paths.journal_file)
+        invalid_generation_block = _candidate_invalid_generation_block_info(
+            candidate,
+            base_source=best_source,
+        )
+        if invalid_generation_block is not None:
+            invalid_generation_streak = _session_invalid_generation_streak() + 1
+            _set_session_invalid_generation_streak(invalid_generation_streak)
+
+            session_reset_applied = False
+            if (
+                invalid_generation_streak >= INVALID_GENERATION_SESSION_RESET_STREAK
+                and _active_research_session_id()
+            ):
+                _clear_research_session_state(
+                    remove_workspace=True,
+                    reason="consecutive invalid no-edit candidates",
+                )
+                _set_session_invalid_generation_streak(0)
+                session_reset_applied = True
+                workspace_root = _prepare_agent_workspace(
+                    base_source=best_source,
+                    factor_change_mode=current_factor_change_mode,
+                    reset_strategy=True,
+                )
+                invalid_generation_block["feedback_note"] = (
+                    f"{invalid_generation_block['feedback_note']}\n"
+                    "- 系统已重置被污染的持久 session；请不要继续沿用上一版“读不到所以不改”的叙事。"
+                )
+
+            if exploration_regeneration_attempt >= RUNTIME.max_exploration_regen_attempts:
+                _record_generation_invalid(
+                    iteration_id=iteration_id,
+                    candidate=candidate,
+                    base_source=best_source,
+                    factor_change_mode=current_factor_change_mode,
+                    block_info=invalid_generation_block,
+                    note=(
+                        "候选未产出真实代码改动；该轮已按技术性空转记账，"
+                        "并从 failure wiki / 方向风险记忆中隔离。"
+                    ),
+                )
+                log_info(
+                    f"第 {iteration_id} 轮候选作废: "
+                    f"{invalid_generation_block['blocked_reason']}"
+                )
+                write_heartbeat(
+                    "iteration_generation_invalid",
+                    message=f"iteration {iteration_id} generation invalid",
+                    block_kind=invalid_generation_block["block_kind"],
+                    blocked_cluster=invalid_generation_block["blocked_cluster"],
+                    session_reset_applied=session_reset_applied,
+                )
+                return "generation_invalid"
+
+            write_heartbeat(
+                "candidate_regenerating",
+                message=f"iteration {iteration_id} regenerating invalid candidate",
+                regeneration_attempt=exploration_regeneration_attempt + 1,
+                max_regeneration_attempts=RUNTIME.max_exploration_regen_attempts,
+                block_kind=invalid_generation_block["block_kind"],
+                blocked_cluster=invalid_generation_block["blocked_cluster"],
+                session_reset_applied=session_reset_applied,
+            )
+            exploration_regeneration_attempt += 1
+            candidate = _regenerate_model_candidate(
+                base_source=best_source,
+                failed_candidate=candidate,
+                block_info=invalid_generation_block,
+                regeneration_attempt=exploration_regeneration_attempt,
+                workspace_root=workspace_root,
+                factor_change_mode=current_factor_change_mode,
+            )
+            continue
+
+        _set_session_invalid_generation_streak(0)
         candidate_hash = source_hash(candidate.strategy_code)
 
         if candidate_hash == source_hash(best_source):
@@ -2759,6 +2963,7 @@ def main() -> int:
                 "accepted",
                 "rejected",
                 "duplicate_skipped",
+                "generation_invalid",
                 "behavioral_noop",
                 "runtime_failed",
                 "exploration_blocked",

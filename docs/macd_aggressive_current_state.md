@@ -128,6 +128,7 @@ test 验收：
 - `runtime prompt` 不再重复塞大量稳定约束，注意力更集中在本轮目标、当前诊断和真实 choke point
 - `runtime prompt` 明确要求先看刷新条件和当前诊断，再看 `wiki/latest_history_package.md` 与 `wiki/failure_wiki.md` 的前部摘要
 - 形成假设后必须回看一次 `failure wiki` 自检；命中相同或高度相似的失败 cut 时，要求在同一轮内改写
+- “未执行代码改动 / blocked / no_edit / no_change / sandbox_blocked” 这类占位结果现在被显式判定为非法提交；辅助记忆缺失时也必须退化为直接修改当前策略源码
 - 默认因子模式下，prompt 明确禁止新增 `PARAMS` 键；顶层常量和顶层 helper 只允许少量新增，用来做结构化抽离，不能借机堆新因子
 - `history package` 不再按“最近 N 轮”裁切，而是按“自当前 `baseline/champion` 激活以来”的 `current stage`
 - 相同 gate reason 不再逐轮重复广播，而是会先折叠成“失败核”；重复失败被视为同一个坏盆地
@@ -141,6 +142,8 @@ test 验收：
 - 防重复规则只保留一份，不再多处复写
 - 如果候选在 smoke 窗口上的行为完全不变，系统会在同一轮回灌 smoke 摘要并强制重生
 - 如果候选在源码校验阶段就因为复杂度预算或复杂度增量超限被拒，系统也会先做同轮 repair；仍修不动才把这轮记进 journal 和记忆包
+- 如果候选根本没有真实 diff，系统会先记为 `generation_invalid` 技术退回，并在同轮强制重生
+- 同一个持久 session 若连续两次交回这类“无真实改动”候选，会自动清掉旧 session 和 workspace，再重建一套干净上下文
 - ordinary family 不再有硬数量下限；`strategy-only / PARAMS-only` 现在允许进入后续流程，是否算有效探索改由真实 diff、smoke/noop、结果盆地重复和复杂度预算共同决定
 - `behavioral_noop` 回灌现在会明确指出候选真实改动区域、普通 family、目标侧，以及当前该优先看的外层 choke point：`long_outer_context_ok / long_final_veto_clear / short_outer_context_ok / short_final_veto_clear`
 - prompt 里的可编辑区域已切到真实存在的命名规则块，能直接改 `sideways / flow / trend_quality / followthrough / long_entry / short_entry / strategy`
@@ -198,6 +201,7 @@ Discord 现在只保留：
 - 冷却锁采用 `3 -> 6 -> 10` 轮递增
 - 低变化近邻判定会同时看真实 diff、参数族变化和 AST 派生结构签名，不再优先相信模型自报的最近失败簇
 - `duplicate source / duplicate hash / empty diff / behavioral_noop / duplicate result basin` 都会写入 journal
+- 其中 `duplicate source / empty diff / blocked_invalid_generation / generation_invalid` 这类技术空转会单独隔离：保留在 raw history，但不会进入 failure wiki exact cut、方向风险表、结果盆地和过热统计
 - `exploration_blocked` 表示候选在评估前就被系统探索硬约束拒收
 - prompt 最近轮次表只展示最近有限条，避免长串重复 noop 淹没当前硬约束；`behavioral_noop` 未跑完整评估的指标也不再显示成伪 `0.00`
 - heartbeat 会写出当前阶段和窗口名

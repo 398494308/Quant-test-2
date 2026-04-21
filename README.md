@@ -44,7 +44,7 @@
 5. 动态 prompt 只补“当前诊断 + 本轮目标 + 本轮失败反馈”；稳定规则放进 workspace 局部 `AGENTS.md`，长历史放进 `wiki/latest_history_package.md` 与 `wiki/failure_wiki.md`。
 6. 模型只允许改 `src/strategy_macd_aggressive.py` 的可编辑区域，并在 workspace 里原地改文件。
 7. 主进程校验候选只修改了允许区域。
-8. 先做评估前硬约束检查；如果候选命中 failure wiki 已封死的 exact cut、仍然是同簇低变化近邻，或命中锁簇，会在同一轮直接强制重生，而不是白跑评估。
+8. 先做评估前硬约束检查；如果候选命中 failure wiki 已封死的 exact cut、仍然是同簇低变化近邻、命中锁簇，或根本没有产出真实源码改动，会在同一轮直接强制重生，而不是白跑评估。
 9. 通过前置检查后，先跑少量 `smoke` 窗口；如果运行报错，会在同一轮进入 repair loop，而不是直接开始下一轮。
 10. `smoke` 通过后，主进程还会对比候选和当前参考在 smoke 窗口里的行为指纹；如果收益、交易数、信号统计、退出原因和交易摘要完全一致，不会立刻结束本轮，而是把 smoke 摘要回灌给模型，在同一轮里强制重生候选。
 11. 只有连续重生后仍然无法改变 smoke 行为，才会正式记一次 `behavioral_noop`。
@@ -53,7 +53,8 @@
 14. 如果当前还没有 `gate-passed champion`，而现有基线本身又没过 gate，那么第一条过 gate 的候选会直接晋升为新 `champion`。
 15. 刷新 `champion` 之后，研究器会清掉旧 session / workspace 上下文，并为下一个 stage 准备新 session。
 16. 刷新 `champion` 之后，才会额外跑一次隐藏 `test`；它只做验收，不参与 `champion` 选择，也不会喂给模型。
-17. 每轮结果都会写进 journal，包含 `accepted / rejected / duplicate_skipped / behavioral_noop / exploration_blocked / early_rejected / runtime_failed`。
+17. 每轮结果都会写进 journal，包含 `accepted / rejected / duplicate_skipped / behavioral_noop / exploration_blocked / early_rejected / runtime_failed / generation_invalid`。
+18. 如果同一个持久 session 连续两次交回“无真实改动”的技术空转候选，研究器会自动清掉该 session 和 workspace，再重建一套干净上下文继续跑。
 
 ## 当前评分口径
 
@@ -139,6 +140,7 @@
 - `evaluation` 的 prompt 摘要不再平铺全部指标，而是先给 `gate` 主失败项、弱侧、`val` 漏斗堵点和当前风险/成本摘要。
 - `history package` 不再先摆方向风险表，而是先给 `stage` 执行摘要和失败核聚合；相同 gate reason 会先折叠成同一个“坏盆地”。
 - 失败信息新增成独立 `failure wiki`：一份 markdown 给模型读，一份 json 给系统 guard 读；同一 exact cut 连续失败后，会在评估前直接被挡回去重生。
+- “未执行代码改动 / blocked / no_edit / no_change / sandbox_blocked” 这类占位结果现在被显式视为非法提交；辅助记忆缺失时也必须退化为直接修改当前策略源码。
 - 防重复约束只保留一份，不再在多个位置重复同一句规则。
 - 模型可以看到 `val` 的聚合诊断，但完全看不到 `test`。
 - prompt 会明确写出：只有 `gate` 通过且 `promotion_delta > 0.02` 才可能刷新当前 `champion`。
@@ -232,6 +234,7 @@ PY
 - 低变化近邻的判定不再主要靠 `closest_failed_cluster / change_tags / edited_regions` 自报，而会同时看真实 diff、参数族变化、AST 派生结构签名和结果盆地重复
 - `smoke` 默认覆盖 `5` 个窗口，当前会取早 train / val / 中前段 train / 中段 train / 尾段 train
 - `smoke` 现在还会比较行为指纹；如果候选和当前参考的 smoke 交易行为完全一致，会先在同一轮回灌 smoke 摘要并强制重生，只有连续重生后仍不变化才记 `behavioral_noop`
+- `duplicate source / empty diff / generation_invalid` 这类“技术空转”会写入 raw history，但会从 failure wiki、方向风险表、结果盆地和过热统计里隔离出去，避免污染真正的失败记忆
 - prompt 的最近轮次表现在只展示最近有限条，避免长串重复 noop 淹没当前硬约束；`behavioral_noop` 未跑完整评估的指标也不再伪装成 `0.00`
 - 当前 stage 的 Codex session 会持久化到 `state/research_macd_aggressive_v2_session.json`
 - 研究器独立工作区在 `state/research_macd_aggressive_v2_agent_workspace/`

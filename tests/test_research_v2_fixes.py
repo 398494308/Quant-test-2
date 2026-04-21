@@ -1311,6 +1311,7 @@ class JournalPromptFixesTest(unittest.TestCase):
 
         self.assertIn("AGENTS.md", prompt)
         self.assertIn("只返回符合 schema 的 JSON", prompt)
+        self.assertIn("未读到文件", prompt)
 
     def test_build_strategy_prompts_include_precise_complexity_budgets(self):
         system_prompt = build_strategy_agents_instructions()
@@ -1401,6 +1402,33 @@ class JournalPromptFixesTest(unittest.TestCase):
         self.assertIn("附加反馈（本次必须处理）", prompt)
         self.assertIn("最近连续 behavioral_noop: 2", prompt)
         self.assertIn("wiki/failure_wiki.md", prompt)
+
+    def test_strategy_prompts_forbid_blocked_no_edit_placeholder_results(self):
+        runtime_prompt = build_strategy_research_prompt(
+            evaluation_summary="诊断",
+            journal_summary="记忆",
+            previous_best_score=1.23,
+        )
+        agents_prompt = build_strategy_agents_instructions()
+        exploration_prompt = build_strategy_exploration_repair_prompt(
+            candidate_id="candidate_1",
+            hypothesis="继续优化多头上车",
+            change_plan="调整 ownership 方向过滤",
+            change_tags=("ownership_takeover", "acceptance_continuity"),
+            edited_regions=("strategy",),
+            expected_effects=("提高多头到来阶段捕获",),
+            closest_failed_cluster="ownership_cluster",
+            novelty_proof="和最近失败方向相比，这次会换交易路径。",
+            block_kind="invalid_generation",
+            blocked_cluster="ownership_cluster",
+            blocked_reason="候选未产生真实代码改动",
+            locked_clusters=(),
+            regeneration_attempt=1,
+        )
+
+        for prompt in (runtime_prompt, agents_prompt, exploration_prompt):
+            self.assertIn("no_edit", prompt)
+            self.assertIn("未执行代码改动", prompt)
 
     def test_region_family_mapping_merges_entry_path_blocks(self):
         region_families = region_families_for_regions(
@@ -2298,6 +2326,104 @@ class FreqtradeAdapterFixesTest(unittest.TestCase):
         self.assertIsNotNone(block)
         self.assertEqual(block["block_kind"], "failure_wiki_exact_cut")
         self.assertIn("exact cut", block["blocked_reason"])
+
+    def test_failure_wiki_ignores_technical_duplicate_source_no_edit_entries(self):
+        entries = []
+        for idx in range(3):
+            entries.append(
+                {
+                    "iteration": idx + 1,
+                    "candidate_id": f"stage_resume_env_blocked_v{idx}",
+                    "outcome": "duplicate_skipped",
+                    "stop_stage": "duplicate_source",
+                    "promotion_delta": None,
+                    "gate_reason": "候选源码与当前主参考完全相同",
+                    "closest_failed_cluster": "environment_blocked_nearest_to_long_outer_context_widen",
+                    "change_tags": ["blocked", "no_edit"],
+                    "edited_regions": ["strategy"],
+                    "system_changed_regions": [],
+                    "hypothesis": "环境阻塞，未执行代码改动",
+                    "expected_effects": ["无"],
+                    "score_regime": "trend_capture_v5",
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            memory_root = Path(tmpdir) / "memory"
+            build_journal_prompt_summary(
+                entries,
+                limit=8,
+                current_score_regime="trend_capture_v5",
+                active_stage_iteration=1,
+                memory_root=memory_root,
+            )
+            failure_wiki_index = load_failure_wiki_index(memory_root)
+
+        self.assertEqual(failure_wiki_index.get("blocked_cuts"), {})
+
+    def test_journal_summary_mentions_technical_invalid_count_and_keeps_it_out_of_failure_memory(self):
+        entries = [
+            {
+                "iteration": 1,
+                "candidate_id": "stage_resume_env_blocked_v1",
+                "outcome": "duplicate_skipped",
+                "stop_stage": "duplicate_source",
+                "promotion_delta": None,
+                "gate_reason": "候选源码与当前主参考完全相同",
+                "closest_failed_cluster": "environment_blocked_nearest_to_long_outer_context_widen",
+                "change_tags": ["blocked", "no_edit"],
+                "edited_regions": ["strategy"],
+                "system_changed_regions": [],
+                "hypothesis": "环境阻塞，未执行代码改动",
+                "score_regime": "trend_capture_v5",
+            },
+            {
+                "iteration": 2,
+                "candidate_id": "candidate_real",
+                "outcome": "rejected",
+                "stop_stage": "full_eval",
+                "promotion_score": 0.1,
+                "quality_score": 0.2,
+                "promotion_delta": -0.03,
+                "gate_reason": "val命中率偏低(7%)",
+                "closest_failed_cluster": "ownership_cluster",
+                "change_tags": ["ownership_takeover"],
+                "edited_regions": ["strategy"],
+                "system_changed_regions": ["strategy"],
+                "hypothesis": "真实策略失败",
+                "score_regime": "trend_capture_v5",
+            },
+        ]
+
+        summary = build_journal_prompt_summary(entries, limit=8, current_score_regime="trend_capture_v5")
+
+        self.assertIn("技术空转 1", summary)
+        self.assertIn("ownership_cluster", summary)
+
+    def test_candidate_invalid_generation_block_info_flags_no_edit_candidate(self):
+        base_source = (REPO_ROOT / "src/strategy_macd_aggressive.py").read_text()
+        candidate = StrategyCandidate(
+            candidate_id="stage_resume_env_blocked_v1",
+            hypothesis="未执行代码改动",
+            change_plan="环境阻塞，未执行代码改动",
+            closest_failed_cluster="environment_blocked_nearest_to_long_outer_context_widen",
+            novelty_proof="未形成真实 diff",
+            change_tags=("blocked", "no_edit"),
+            edited_regions=("strategy",),
+            expected_effects=("无",),
+            core_factors=(),
+            strategy_code=base_source,
+        )
+
+        block = research_script._candidate_invalid_generation_block_info(
+            candidate,
+            base_source=base_source,
+        )
+
+        self.assertIsNotNone(block)
+        self.assertEqual(block["block_kind"], "invalid_generation")
+        self.assertIn("真实代码改动", block["blocked_reason"])
+        self.assertIn("完全相同", "；".join(block["invalid_reasons"]))
 
     def test_journal_summary_limits_recent_rows_and_meta_lines_to_requested_limit(self):
         entries = []
