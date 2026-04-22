@@ -39,22 +39,24 @@
 
 1. 读取当前主参考策略。
 2. 进入阶段级持久 workspace：`state/research_macd_aggressive_v2_agent_workspace/`。这里有局部 `AGENTS.md`、可写策略副本、只读 `wiki/` 与 `memory/` 链接。
-3. 同一 `baseline/champion stage` 内会复用同一个 Codex session；只有当 `champion` 或 `baseline` 刷新时，才会清掉旧 session 并新开一个。
+3. 同一 `baseline/champion stage` 内只复用一个 `planner` Codex session；只有当 `champion`、`baseline` 或手工重置 session 时，才会清掉旧 session 并新开一个。
 4. 每轮开始先把当前主参考重新写回 workspace 里的 `src/strategy_macd_aggressive.py`，避免上一轮残留源码污染新一轮。
-5. 动态 prompt 只补“当前诊断 + 本轮目标 + 本轮失败反馈”；稳定规则放进 workspace 局部 `AGENTS.md`，长历史放进 `wiki/latest_history_package.md` 与 `wiki/failure_wiki.md`。
-6. 模型只允许改 `src/strategy_macd_aggressive.py` 的可编辑区域，并在 workspace 里原地改文件。
-7. 主进程校验候选只修改了允许区域。
-8. 先做评估前硬约束检查；如果候选命中 failure wiki 已封死的 exact cut、仍然是同簇低变化近邻、命中锁簇，或根本没有产出真实源码改动，会在同一轮直接强制重生，而不是白跑评估。
-9. 通过前置检查后，先跑少量 `smoke` 窗口；如果运行报错，会在同一轮进入 repair loop，而不是直接开始下一轮。
-10. `smoke` 通过后，主进程还会对比候选和当前参考在 smoke 窗口里的行为指纹；如果收益、交易数、信号统计、退出原因和交易摘要完全一致，不会立刻结束本轮，而是把 smoke 摘要回灌给模型，在同一轮里强制重生候选。
-11. 只有连续重生后仍然无法改变 smoke 行为，才会正式记一次 `behavioral_noop`。
-12. 只有 smoke 行为真的变了，才会继续跑整套 `train walk-forward + val`。
-13. 只有 `gate` 通过，且相对当前 `champion` 的 `promotion_delta` 至少高 `0.02`，才刷新当前主参考。
-14. 如果当前还没有 `gate-passed champion`，而现有基线本身又没过 gate，那么第一条过 gate 的候选会直接晋升为新 `champion`。
-15. 刷新 `champion` 之后，研究器会清掉旧 session / workspace 上下文，并为下一个 stage 准备新 session。
-16. 刷新 `champion` 之后，才会额外跑一次隐藏 `test`；它只做验收，不参与 `champion` 选择，也不会喂给模型。
-17. 每轮结果都会写进 journal，包含 `accepted / rejected / duplicate_skipped / behavioral_noop / exploration_blocked / early_rejected / runtime_failed / generation_invalid`。
-18. 如果候选交回了完整 JSON 但没有真实代码改动，研究器不会刷新 session；它会留在同一个 session 里继续重生，并把下一版任务压缩成“先确定单一策略方向，再把这个方向落到代码里”。
+5. `planner` 动态 prompt 只补“当前诊断 + 本轮目标 + 本轮失败反馈”；稳定规则放进 workspace 局部 `AGENTS.md`，长历史放进 `wiki/latest_history_package.md` 与 `wiki/failure_wiki.md`。
+6. `planner` 不再直接改代码，只产出一个 round brief：`hypothesis / change_plan / novelty_proof / change_tags / expected_effects`。
+7. 每轮会新开一个短生命周期 `edit_worker` session，只根据 round brief 直接修改 `src/strategy_macd_aggressive.py`；它不复用主 session，也不重扫全量历史。
+8. 主进程基于 round brief 和真实 diff 在本地组装 `StrategyCandidate`；`model_summarize` 已移除，不再让模型在落码后重复自我总结。
+9. 主进程校验候选只修改了允许区域。
+10. 先做评估前硬约束检查；如果候选命中 failure wiki 已封死的 exact cut、仍然是同簇低变化近邻、命中锁簇，或根本没有产出真实源码改动，会在同一轮直接强制重生，而不是白跑评估。
+11. 通过前置检查后，先跑少量 `smoke` 窗口；如果运行报错或源码校验失败，会在同一轮进入短生命周期 `repair_worker`，而不是把技术修复噪音塞回主研究 session。
+12. `smoke` 通过后，主进程还会对比候选和当前参考在 smoke 窗口里的行为指纹；如果收益、交易数、信号统计、退出原因和交易摘要完全一致，不会立刻结束本轮，而是把 smoke 摘要回灌给 `planner`，在同一轮里强制重生候选。
+13. 只有连续重生后仍然无法改变 smoke 行为，才会正式记一次 `behavioral_noop`。
+14. 只有 smoke 行为真的变了，才会继续跑整套 `train walk-forward + val`。
+15. 只有 `gate` 通过，且相对当前 `champion` 的 `promotion_delta` 至少高 `0.02`，才刷新当前主参考。
+16. 如果当前还没有 `gate-passed champion`，而现有基线本身又没过 gate，那么第一条过 gate 的候选会直接晋升为新 `champion`。
+17. 刷新 `champion` 之后，研究器会清掉旧 `planner` session / workspace 上下文，并为下一个 stage 准备新 session。
+18. 刷新 `champion` 之后，才会额外跑一次隐藏 `test`；它只做验收，不参与 `champion` 选择，也不会喂给模型。
+19. 每轮结果都会写进 journal，包含 `accepted / rejected / duplicate_skipped / behavioral_noop / exploration_blocked / early_rejected / runtime_failed / generation_invalid`。
+20. 模型调用现在会额外写 `logs/macd_aggressive_research_v2_model_calls.jsonl`，记录 `planner/edit_worker/repair_worker` 的 prompt 大小、是否 resume、耗时和返回大小，方便排查 token 与 provider 问题。
 
 ## 当前评分口径
 
@@ -125,18 +127,21 @@
 
 ## Prompt 现在怎么组织
 
-当前 prompt 现在拆成四层：
+当前 prompt 现在拆成“两层主链 + 一层 worker 指令”：
 
 1. workspace 局部 `AGENTS.md`
-2. runtime prompt
+2. `planner` runtime prompt
 3. `wiki/latest_history_package.md`
 4. `wiki/failure_wiki.md`
+5. 短生命周期 worker prompt（只给 `edit_worker / repair_worker`）
 
 现在的 prompt 有几个重要变化：
 
 - 不再把整份策略源码塞进 prompt。
 - 稳定规则已经从每轮 system prompt 挪到 workspace 局部 `AGENTS.md`，只影响研究器自己的工作区，不会污染仓库根目录环境。
-- runtime prompt 现在只放本轮动态信息，并显式写出“先目标 -> 再现状 -> 再 failure wiki / history package -> 再提出单一假设 -> 再回看 failure wiki 自检”的阅读顺序。
+- `planner` runtime prompt 现在只放本轮动态信息，并显式写出“先目标 -> 再现状 -> 再 failure wiki / history package -> 再提出单一假设 -> 再回看 failure wiki 自检”的阅读顺序。
+- `planner` 现在只产 round brief，不再直接落码；落码和 repair 改由短生命周期 worker 处理。
+- `edit_worker / repair_worker` 不再吃大历史包；它们只接 round brief 或错误上下文，直接改代码后回复 `EDIT_DONE`。
 - `evaluation` 的 prompt 摘要不再平铺全部指标，而是先给 `gate` 主失败项、弱侧、`val` 漏斗堵点和当前风险/成本摘要。
 - `history package` 不再先摆方向风险表，而是先给 `stage` 执行摘要和失败核聚合；相同 gate reason 会先折叠成同一个“坏盆地”。
 - 失败信息新增成独立 `failure wiki`：一份 markdown 给模型读，一份 json 给系统 guard 读；同一 exact cut 连续失败后，会在评估前直接被挡回去重生。
@@ -146,7 +151,7 @@
 - prompt 会明确写出：只有 `gate` 通过且 `promotion_delta > 0.02` 才可能刷新当前 `champion`。
 - 如果候选在 smoke 窗口上的行为完全不变，系统会在同一轮回灌 smoke 摘要并强制重生，而不是直接白白结束整轮。
 - 如果候选在源码校验阶段就因为复杂度预算或复杂度增量超限被拒，系统也会先做同轮 repair；修不动才把这类失败写进当前 `stage` 记忆。
-- runtime prompt 会额外显示当前基底最紧张的 complexity headroom，让模型先看到哪个 family / function 已经贴边。
+- `planner` / `edit_worker` prompt 都会额外显示当前基底最紧张的 complexity headroom，让模型先看到哪个 family / function 已经贴边。
 - `edited_regions` 不再硬卡 `1-3`，也不再要求“至少改到 1 个 ordinary family”；`strategy-only / PARAMS-only` 也允许进入后续流程，是否算有效探索改由真实 diff / smoke / 结果盆地重复 / complexity 共同决定。
 - prompt 里的可编辑区域已经扩成真实存在的命名规则块，允许模型直接动 `sideways / flow / trend_quality / followthrough / long_entry / short_entry / strategy` 这些结构块。
 - 最近轮次摘要仍保留“核心指标表 + 元信息摘要”，但在它前面新增了 `stage` 执行摘要和失败核聚合，逐轮表只作为附录。

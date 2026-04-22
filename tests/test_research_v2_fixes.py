@@ -60,11 +60,13 @@ from research_v2.prompting import (
     build_edit_completion_instructions,
     build_strategy_agents_instructions,
     build_strategy_candidate_summary_prompt,
+    build_strategy_edit_worker_prompt,
     build_strategy_exploration_repair_prompt,
     build_strategy_no_edit_repair_prompt,
     build_strategy_research_prompt,
     build_strategy_runtime_repair_prompt,
     build_strategy_system_prompt,
+    build_strategy_worker_system_prompt,
 )
 from research_v2.strategy_code import (
     REQUIRED_FUNCTIONS,
@@ -1290,8 +1292,9 @@ class JournalPromptFixesTest(unittest.TestCase):
         self.assertIn("形成假设后，必须回看一次", prompt)
         self.assertIn("当前因子模式：默认模式", prompt)
         self.assertIn("本轮硬完成条件", prompt)
-        self.assertIn("EDIT_DONE", prompt)
-        self.assertIn("文件 hash 未变化", prompt)
+        self.assertIn("round brief", prompt)
+        self.assertIn("change_plan", prompt)
+        self.assertIn("novelty_proof", prompt)
 
     def test_build_strategy_agents_instructions_mentions_all_required_symbols(self):
         prompt = build_strategy_agents_instructions()
@@ -1345,6 +1348,31 @@ class JournalPromptFixesTest(unittest.TestCase):
         self.assertIn("已被主进程直接丢弃", prompt)
         self.assertIn("文件 hash 与调用前完全相同", prompt)
         self.assertIn("只回复 `EDIT_DONE`", prompt)
+
+    def test_build_strategy_edit_worker_prompt_mentions_round_brief_and_edit_only(self):
+        prompt = build_strategy_edit_worker_prompt(
+            candidate_id="candidate_1",
+            hypothesis="放宽多头 outer_context，让内层路径真正触达到出单层。",
+            change_plan="在 long_outer_context_ok 和 long_final_veto_clear 上删旧 gate，不新增平行 path。",
+            change_tags=("widen_outer_context", "merge_veto"),
+            expected_effects=("提高多头到来与陪跑捕获",),
+            closest_failed_cluster="participation_cluster",
+            novelty_proof="这次直接改最终可达性，不再停留在内层 helper 微调。",
+            current_complexity_headroom_text="当前基底复杂度余量：trend_quality_family bool_ops 剩 4",
+        )
+
+        self.assertIn("round brief", prompt)
+        self.assertIn("只修改 `src/strategy_macd_aggressive.py`", prompt)
+        self.assertIn("只回复 `EDIT_DONE`", prompt)
+        self.assertIn("复杂度余量提醒", prompt)
+
+    def test_build_strategy_worker_system_prompt_mentions_short_lived_worker_role(self):
+        prompt = build_strategy_worker_system_prompt(worker_kind="repair_worker")
+
+        self.assertIn("短生命周期 `repair_worker`", prompt)
+        self.assertIn("不要重新做全量历史研究", prompt)
+        self.assertIn("只根据当前提示里的 round brief 或 repair 指令", prompt)
+        self.assertIn("完成编辑后只回复 `EDIT_DONE`", prompt)
 
     def test_build_strategy_candidate_summary_prompt_mentions_do_not_edit(self):
         prompt = build_strategy_candidate_summary_prompt(

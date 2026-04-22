@@ -19,7 +19,7 @@ import shutil
 import sys
 import time
 import traceback
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -66,12 +66,13 @@ from research_v2.notifications import build_discord_summary_message, load_discor
 from research_v2.prompting import (
     EDITABLE_REGIONS,
     build_strategy_agents_instructions,
-    build_strategy_candidate_summary_prompt,
+    build_strategy_edit_worker_prompt,
     build_strategy_exploration_repair_prompt,
     build_strategy_no_edit_repair_prompt,
     build_strategy_research_prompt,
     build_strategy_runtime_repair_prompt,
     build_strategy_system_prompt,
+    build_strategy_worker_system_prompt,
 )
 from research_v2.strategy_code import (
     REQUIRED_FUNCTIONS,
@@ -121,6 +122,18 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
+
+
+@dataclass(frozen=True)
+class StrategyRoundBrief:
+    candidate_id: str
+    hypothesis: str
+    change_plan: str
+    closest_failed_cluster: str
+    novelty_proof: str
+    change_tags: tuple[str, ...]
+    expected_effects: tuple[str, ...]
+    core_factors: tuple[StrategyCoreFactor, ...]
 
 
 # ==================== 日志与心跳 ====================
@@ -196,6 +209,18 @@ def _build_model_progress_callback(phase: str, *, repair_attempt: int | None = N
         write_heartbeat("model_waiting", **heartbeat_payload)
 
     return callback
+
+
+def _estimate_prompt_tokens(*parts: str) -> int:
+    total_chars = sum(len(str(part or "")) for part in parts)
+    return max(1, (total_chars + 3) // 4)
+
+
+def _append_model_call_telemetry(payload: dict[str, Any]) -> None:
+    path = RUNTIME.paths.model_call_log_file
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def _session_scope_payload() -> dict[str, Any]:
@@ -1657,6 +1682,7 @@ def _no_edit_failure_candidate(
     base_source: str,
     context_label: str,
     last_response_text: str = "",
+    round_brief: StrategyRoundBrief | None = None,
 ) -> StrategyCandidate:
     strategy_code = (
         normalize_strategy_source(load_strategy_source(workspace_strategy_file))
@@ -1671,16 +1697,44 @@ def _no_edit_failure_candidate(
         if response_excerpt
         else "目标文件 hash 未变化，上一条回复已被丢弃。"
     )
+    candidate_id = (
+        round_brief.candidate_id
+        if round_brief and round_brief.candidate_id
+        else f"no_edit_{_slug_text(context_label)}_{int(time.time())}"
+    )
+    change_tags = round_brief.change_tags if round_brief and round_brief.change_tags else ("no_edit", "edit_required")
+    expected_effects = (
+        round_brief.expected_effects + (expected_effect,)
+        if round_brief and round_brief.expected_effects
+        else (expected_effect,)
+    )
+    novelty_proof = (
+        f"{round_brief.novelty_proof}；但本次失败点是没有真实落码。"
+        if round_brief and round_brief.novelty_proof
+        else "系统只接受真实源码 diff；当前失败原因是目标文件未变化，而不是策略方向未定义。"
+    )
     return StrategyCandidate(
-        candidate_id=f"no_edit_{_slug_text(context_label)}_{int(time.time())}",
-        hypothesis="本轮失败不是策略假设本身，而是模型没有把改动真正落到策略源码。",
-        change_plan="先直接修改 src/strategy_macd_aggressive.py；若文件 hash 不变，本轮不再承认任何说明文本。",
-        closest_failed_cluster="no_edit",
-        novelty_proof="系统只接受真实源码 diff；当前失败原因是目标文件未变化，而不是策略方向未定义。",
-        change_tags=("no_edit", "edit_required"),
+        candidate_id=candidate_id,
+        hypothesis=(
+            round_brief.hypothesis
+            if round_brief and round_brief.hypothesis
+            else "本轮失败不是策略假设本身，而是模型没有把改动真正落到策略源码。"
+        ),
+        change_plan=(
+            round_brief.change_plan
+            if round_brief and round_brief.change_plan
+            else "先直接修改 src/strategy_macd_aggressive.py；若文件 hash 不变，本轮不再承认任何说明文本。"
+        ),
+        closest_failed_cluster=(
+            round_brief.closest_failed_cluster
+            if round_brief and round_brief.closest_failed_cluster
+            else "no_edit"
+        ),
+        novelty_proof=novelty_proof,
+        change_tags=change_tags,
         edited_regions=tuple(),
-        expected_effects=(expected_effect,),
-        core_factors=tuple(),
+        expected_effects=expected_effects,
+        core_factors=round_brief.core_factors if round_brief else tuple(),
         strategy_code=strategy_code,
     )
 
@@ -1705,8 +1759,58 @@ def _core_factors_from_payload(payload: dict[str, Any]) -> tuple[StrategyCoreFac
     return tuple(core_factors)
 
 
-def _candidate_stub_from_payload(
-    payload: dict[str, Any],
+def _round_brief_from_payload(payload: dict[str, Any]) -> StrategyRoundBrief:
+    change_tags = tuple(str(item).strip() for item in payload.get("change_tags", []) if str(item).strip())
+    hypothesis = str(payload.get("hypothesis", "")).strip()
+    change_plan = str(payload.get("change_plan", "")).strip()
+    novelty_proof = str(payload.get("novelty_proof", "")).strip()
+    closest_failed_cluster = str(payload.get("closest_failed_cluster", "")).strip()
+    candidate_id = str(payload.get("candidate_id", "")).strip() or _auto_candidate_id(
+        change_tags=change_tags,
+        edited_regions=tuple(),
+    )
+    if not closest_failed_cluster:
+        closest_failed_cluster = cluster_key_for_components("", change_tags) or "unknown_cluster"
+    return StrategyRoundBrief(
+        candidate_id=candidate_id,
+        hypothesis=hypothesis or "未提供 hypothesis；需要重新围绕单一因果假设生成本轮 brief。",
+        change_plan=change_plan or "未提供 change_plan；需要明确本轮要改的规则块、阈值或最终放行链。",
+        closest_failed_cluster=closest_failed_cluster,
+        novelty_proof=novelty_proof or "未提供 novelty_proof；需要明确说明本轮为何不属于已知失败 cut。",
+        change_tags=change_tags,
+        expected_effects=tuple(str(item).strip() for item in payload.get("expected_effects", []) if str(item).strip()),
+        core_factors=_core_factors_from_payload(payload),
+    )
+
+
+def _round_brief_from_candidate(candidate: StrategyCandidate) -> StrategyRoundBrief:
+    return StrategyRoundBrief(
+        candidate_id=candidate.candidate_id,
+        hypothesis=candidate.hypothesis,
+        change_plan=candidate.change_plan,
+        closest_failed_cluster=candidate.closest_failed_cluster,
+        novelty_proof=candidate.novelty_proof,
+        change_tags=candidate.change_tags,
+        expected_effects=candidate.expected_effects,
+        core_factors=candidate.core_factors,
+    )
+
+
+def _round_brief_task_summary(round_brief: StrategyRoundBrief) -> str:
+    lines = [
+        f"- candidate_id: {round_brief.candidate_id or '-'}",
+        f"- hypothesis: {round_brief.hypothesis or '-'}",
+        f"- change_plan: {round_brief.change_plan or '-'}",
+        f"- change_tags: {', '.join(round_brief.change_tags) or '-'}",
+        f"- expected_effects: {'；'.join(round_brief.expected_effects) or '-'}",
+        f"- closest_failed_cluster: {round_brief.closest_failed_cluster or '-'}",
+        f"- novelty_proof: {round_brief.novelty_proof or '-'}",
+    ]
+    return "\n".join(lines)
+
+
+def _candidate_stub_from_round_brief(
+    round_brief: StrategyRoundBrief,
     *,
     workspace_strategy_file: Path,
     fallback_source: str,
@@ -1716,25 +1820,22 @@ def _candidate_stub_from_payload(
         if workspace_strategy_file.exists()
         else normalize_strategy_source(fallback_source)
     )
-    declared_regions = tuple(str(item).strip() for item in payload.get("edited_regions", []) if str(item).strip())
-    change_tags = tuple(str(item).strip() for item in payload.get("change_tags", []) if str(item).strip())
     return StrategyCandidate(
-        candidate_id=str(payload.get("candidate_id", "")).strip()
-        or _auto_candidate_id(change_tags=change_tags, edited_regions=declared_regions),
-        hypothesis=str(payload.get("hypothesis", "")).strip() or "未提供 hypothesis，等待同轮修复。",
-        change_plan=str(payload.get("change_plan", "")).strip() or "未提供 change_plan，等待同轮修复。",
-        closest_failed_cluster=str(payload.get("closest_failed_cluster", "")).strip() or "unknown_cluster",
-        novelty_proof=str(payload.get("novelty_proof", "")).strip() or "源码校验失败，等待同轮修复。",
-        change_tags=change_tags,
-        edited_regions=declared_regions,
-        expected_effects=tuple(str(item).strip() for item in payload.get("expected_effects", []) if str(item).strip()),
-        core_factors=_core_factors_from_payload(payload),
+        candidate_id=round_brief.candidate_id or _auto_candidate_id(change_tags=round_brief.change_tags, edited_regions=tuple()),
+        hypothesis=round_brief.hypothesis or "未提供 hypothesis，等待同轮修复。",
+        change_plan=round_brief.change_plan or "未提供 change_plan，等待同轮修复。",
+        closest_failed_cluster=round_brief.closest_failed_cluster or "unknown_cluster",
+        novelty_proof=round_brief.novelty_proof or "源码校验失败，等待同轮修复。",
+        change_tags=round_brief.change_tags,
+        edited_regions=tuple(),
+        expected_effects=round_brief.expected_effects,
+        core_factors=round_brief.core_factors,
         strategy_code=strategy_code,
     )
 
 
-def _candidate_from_payload(
-    payload: dict[str, Any],
+def _candidate_from_round_brief(
+    round_brief: StrategyRoundBrief,
     *,
     workspace_strategy_file: Path,
     base_source: str,
@@ -1760,26 +1861,23 @@ def _candidate_from_payload(
         base_source=base_source,
         strategy_code=strategy_code,
     )
-    change_tags = tuple(str(item).strip() for item in payload.get("change_tags", []) if str(item).strip())
+    change_tags = round_brief.change_tags
     if not change_tags:
         change_tags = _auto_change_tags(actual_changed_regions)
-    candidate_id = str(payload.get("candidate_id", "")).strip() or _auto_candidate_id(
+    candidate_id = round_brief.candidate_id or _auto_candidate_id(
         change_tags=change_tags,
         edited_regions=actual_changed_regions,
     )
-    hypothesis = str(payload.get("hypothesis", "")).strip()
-    change_plan = str(payload.get("change_plan", "")).strip()
-    novelty_proof = str(payload.get("novelty_proof", "")).strip()
     candidate = StrategyCandidate(
         candidate_id=candidate_id,
-        hypothesis=hypothesis or "未提供 hypothesis；本轮以真实源码 diff 为准。",
-        change_plan=change_plan or "未提供 change_plan；本轮以真实源码 diff 为准。",
-        closest_failed_cluster=str(payload.get("closest_failed_cluster", "")).strip() or "unknown_cluster",
-        novelty_proof=novelty_proof or "未提供 novelty_proof；系统将以真实源码 diff 判定本轮改动。",
+        hypothesis=round_brief.hypothesis or "未提供 hypothesis；本轮以真实源码 diff 为准。",
+        change_plan=round_brief.change_plan or "未提供 change_plan；本轮以真实源码 diff 为准。",
+        closest_failed_cluster=round_brief.closest_failed_cluster or "unknown_cluster",
+        novelty_proof=round_brief.novelty_proof or "未提供 novelty_proof；系统将以真实源码 diff 判定本轮改动。",
         change_tags=change_tags,
         edited_regions=actual_changed_regions,
-        expected_effects=tuple(str(item).strip() for item in payload.get("expected_effects", []) if str(item).strip()),
-        core_factors=_core_factors_from_payload(payload),
+        expected_effects=round_brief.expected_effects,
+        core_factors=round_brief.core_factors,
         strategy_code=strategy_code,
     )
     if not candidate.edited_regions:
@@ -1791,6 +1889,21 @@ def _candidate_from_payload(
     return candidate
 
 
+def _candidate_from_payload(
+    payload: dict[str, Any],
+    *,
+    workspace_strategy_file: Path,
+    base_source: str,
+    factor_change_mode: str = "default",
+) -> StrategyCandidate:
+    return _candidate_from_round_brief(
+        _round_brief_from_payload(payload),
+        workspace_strategy_file=workspace_strategy_file,
+        base_source=base_source,
+        factor_change_mode=factor_change_mode,
+    )
+
+
 def _run_model_text_request(
     *,
     prompt: str,
@@ -1798,8 +1911,10 @@ def _run_model_text_request(
     phase: str,
     workspace_root: Path,
     repair_attempt: int | None = None,
+    session_kind: str = "planner",
+    use_persistent_session: bool = True,
 ) -> str:
-    session_id = _active_research_session_id()
+    session_id = _active_research_session_id() if use_persistent_session else ""
 
     def _invoke(active_session_id: str | None, metadata: dict[str, Any]) -> str:
         with _temporary_cwd(workspace_root):
@@ -1817,10 +1932,11 @@ def _run_model_text_request(
             )
 
     response_metadata: dict[str, Any] = {}
+    started_at = time.monotonic()
     try:
         raw_text = _invoke(session_id or None, response_metadata)
     except StrategyGenerationSessionError as exc:
-        if not session_id:
+        if not session_id or not use_persistent_session:
             raise
         log_info(f"Codex session 无法恢复，改为新 session 重试: {exc}")
         _clear_research_session_state(remove_workspace=False, reason="invalid provider session")
@@ -1832,11 +1948,31 @@ def _run_model_text_request(
         or str(response_metadata.get("thread_id", "")).strip()
         or session_id
     )
-    if resolved_session_id:
+    if use_persistent_session and resolved_session_id:
         _store_research_session_metadata(
             session_id=resolved_session_id,
             workspace_root=workspace_root,
         )
+    elapsed_seconds = round(max(0.0, time.monotonic() - started_at), 3)
+    _append_model_call_telemetry(
+        {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "iteration": iteration_counter,
+            "phase": phase,
+            "session_kind": session_kind,
+            "persistent_session": bool(use_persistent_session),
+            "requested_resume": bool(session_id),
+            "resolved_session_id": resolved_session_id if use_persistent_session else "",
+            "resumed": bool(response_metadata.get("resumed", False)),
+            "prompt_chars": len(prompt),
+            "system_prompt_chars": len(system_prompt),
+            "estimated_prompt_tokens": _estimate_prompt_tokens(prompt, system_prompt),
+            "response_chars": len(raw_text),
+            "workspace_root": str(workspace_root),
+            "repair_attempt": repair_attempt,
+            "duration_seconds": elapsed_seconds,
+        }
+    )
     return raw_text
 
 
@@ -1847,6 +1983,8 @@ def _run_model_candidate_request(
     phase: str,
     workspace_root: Path,
     repair_attempt: int | None = None,
+    session_kind: str = "planner",
+    use_persistent_session: bool = True,
 ) -> dict[str, Any]:
     raw_text = _run_model_text_request(
         prompt=prompt,
@@ -1854,17 +1992,19 @@ def _run_model_candidate_request(
         phase=phase,
         workspace_root=workspace_root,
         repair_attempt=repair_attempt,
+        session_kind=session_kind,
+        use_persistent_session=use_persistent_session,
     )
     return _parse_model_candidate_payload(raw_text)
 
 
-def _build_model_edit_response(
+def _build_model_round_brief(
     base_source: str,
     journal_entries: list[dict[str, Any]],
     *,
     workspace_root: Path,
     factor_change_mode: str,
-) -> str:
+) -> StrategyRoundBrief:
     report = best_report
     if report is None:
         raise StrategySourceError("reference report is not initialized")
@@ -1895,46 +2035,56 @@ def _build_model_edit_response(
         current_complexity_headroom_text=format_strategy_complexity_headroom(base_source),
         session_mode=session_mode,
     )
-    return _run_model_text_request(
-        prompt=prompt,
-        system_prompt=build_strategy_system_prompt(
-            factor_change_mode=factor_change_mode,
-        ),
-        phase="model_edit",
-        workspace_root=workspace_root,
+    return _round_brief_from_payload(
+        _run_model_candidate_request(
+            prompt=prompt,
+            system_prompt=build_strategy_system_prompt(
+                factor_change_mode=factor_change_mode,
+            ),
+            phase="model_planner",
+            workspace_root=workspace_root,
+            session_kind="planner",
+            use_persistent_session=True,
+        )
     )
 
 
-def _build_model_candidate_summary_payload(
+def _run_edit_worker(
     *,
     base_source: str,
-    edited_source: str,
+    round_brief: StrategyRoundBrief,
     workspace_root: Path,
     factor_change_mode: str,
-) -> dict[str, Any]:
-    try:
-        changed_regions = _actual_changed_regions(
-            base_source=base_source,
-            strategy_code=edited_source,
-        )
-    except StrategySourceError:
-        changed_regions = tuple()
-    summary_prompt = build_strategy_candidate_summary_prompt(
-        diff_summary=build_diff_summary(base_source, edited_source, limit=12),
-        changed_regions=changed_regions,
+    phase: str,
+    repair_attempt: int | None = None,
+) -> str:
+    prompt = build_strategy_edit_worker_prompt(
+        candidate_id=round_brief.candidate_id,
+        hypothesis=round_brief.hypothesis,
+        change_plan=round_brief.change_plan,
+        change_tags=round_brief.change_tags,
+        expected_effects=round_brief.expected_effects,
+        closest_failed_cluster=round_brief.closest_failed_cluster,
+        novelty_proof=round_brief.novelty_proof,
+        current_complexity_headroom_text=format_strategy_complexity_headroom(base_source),
     )
-    return _run_model_candidate_request(
-        prompt=summary_prompt,
-        system_prompt=build_strategy_system_prompt(
+    return _run_model_text_request(
+        prompt=prompt,
+        system_prompt=build_strategy_worker_system_prompt(
             factor_change_mode=factor_change_mode,
+            worker_kind="edit_worker",
         ),
-        phase="model_summarize",
+        phase=phase,
         workspace_root=workspace_root,
+        repair_attempt=repair_attempt,
+        session_kind="edit_worker",
+        use_persistent_session=False,
     )
 
 
 def _repair_no_edit_model_response(
     *,
+    round_brief: StrategyRoundBrief,
     error_message: str,
     no_edit_attempt: int,
     workspace_root: Path,
@@ -1945,27 +2095,30 @@ def _repair_no_edit_model_response(
         no_edit_attempt=no_edit_attempt,
         error_message=error_message,
         last_response_text=last_response_text,
+        task_summary=_round_brief_task_summary(round_brief),
     )
     return _run_model_text_request(
         prompt=prompt,
-        system_prompt=build_strategy_system_prompt(
+        system_prompt=build_strategy_worker_system_prompt(
             factor_change_mode=factor_change_mode,
+            worker_kind="repair_worker",
         ),
         phase="model_no_edit_repair",
         workspace_root=workspace_root,
         repair_attempt=no_edit_attempt,
+        session_kind="repair_worker",
+        use_persistent_session=False,
     )
 
 
-def _repair_model_candidate_payload(
+def _repair_model_candidate_source(
     *,
-    base_source: str,
     failed_candidate: StrategyCandidate,
     error_message: str,
     repair_attempt: int,
     workspace_root: Path,
     factor_change_mode: str,
-) -> dict[str, Any]:
+) -> str:
     prompt = build_strategy_runtime_repair_prompt(
         candidate_id=failed_candidate.candidate_id,
         hypothesis=failed_candidate.hypothesis,
@@ -1978,26 +2131,28 @@ def _repair_model_candidate_payload(
         error_message=error_message,
         repair_attempt=repair_attempt,
     )
-    return _run_model_candidate_request(
+    return _run_model_text_request(
         prompt=prompt,
-        system_prompt=build_strategy_system_prompt(
+        system_prompt=build_strategy_worker_system_prompt(
             factor_change_mode=factor_change_mode,
+            worker_kind="repair_worker",
         ),
         phase="model_repair",
         workspace_root=workspace_root,
         repair_attempt=repair_attempt,
+        session_kind="repair_worker",
+        use_persistent_session=False,
     )
 
 
-def _regenerate_model_candidate_payload(
+def _regenerate_model_round_brief(
     *,
-    base_source: str,
     failed_candidate: StrategyCandidate,
     block_info: dict[str, Any],
     regeneration_attempt: int,
     workspace_root: Path,
     factor_change_mode: str,
-) -> dict[str, Any]:
+) -> StrategyRoundBrief:
     prompt = build_strategy_exploration_repair_prompt(
         candidate_id=failed_candidate.candidate_id,
         hypothesis=failed_candidate.hypothesis,
@@ -2014,20 +2169,24 @@ def _regenerate_model_candidate_payload(
         regeneration_attempt=regeneration_attempt,
         feedback_note=str(block_info.get("feedback_note", "")).strip(),
     )
-    return _run_model_candidate_request(
-        prompt=prompt,
-        system_prompt=build_strategy_system_prompt(
-            factor_change_mode=factor_change_mode,
-        ),
-        phase="model_regenerate",
-        workspace_root=workspace_root,
-        repair_attempt=regeneration_attempt,
+    return _round_brief_from_payload(
+        _run_model_candidate_request(
+            prompt=prompt,
+            system_prompt=build_strategy_system_prompt(
+                factor_change_mode=factor_change_mode,
+            ),
+            phase="model_regenerate",
+            workspace_root=workspace_root,
+            repair_attempt=regeneration_attempt,
+            session_kind="planner",
+            use_persistent_session=True,
+        )
     )
 
 
-def _candidate_from_payload_with_validation_repair(
+def _candidate_from_round_brief_with_validation_repair(
     *,
-    payload: dict[str, Any],
+    round_brief: StrategyRoundBrief,
     base_source: str,
     workspace_root: Path,
     factor_change_mode: str,
@@ -2035,15 +2194,15 @@ def _candidate_from_payload_with_validation_repair(
 ) -> StrategyCandidate:
     workspace_strategy_file = workspace_root / MODEL_WORKSPACE_STRATEGY_PATH
     try:
-        return _candidate_from_payload(
-            payload,
+        return _candidate_from_round_brief(
+            round_brief,
             workspace_strategy_file=workspace_strategy_file,
             base_source=base_source,
             factor_change_mode=factor_change_mode,
         )
     except StrategySourceError as exc:
-        failed_candidate = _candidate_stub_from_payload(
-            payload,
+        failed_candidate = _candidate_stub_from_round_brief(
+            round_brief,
             workspace_strategy_file=workspace_strategy_file,
             fallback_source=base_source,
         )
@@ -2061,40 +2220,25 @@ def _candidate_from_payload_with_validation_repair(
                 f"第 {iteration_counter} 轮{context_label}源码校验失败，尝试同轮修复 "
                 f"{attempt}/{RUNTIME.max_repair_attempts}: {errors[-1]}"
             )
-            repair_payload = _repair_model_candidate_payload(
-                base_source=base_source,
+            _repair_model_candidate_source(
                 failed_candidate=failed_candidate,
                 error_message="\n".join(errors[-3:]),
                 repair_attempt=attempt,
                 workspace_root=workspace_root,
                 factor_change_mode=factor_change_mode,
             )
-            failed_candidate = _candidate_stub_from_payload(
-                repair_payload,
+            failed_candidate = _candidate_stub_from_round_brief(
+                _round_brief_from_candidate(failed_candidate),
                 workspace_strategy_file=workspace_strategy_file,
                 fallback_source=failed_candidate.strategy_code,
             )
             try:
-                repaired = _candidate_from_payload(
-                    repair_payload,
+                return _candidate_from_round_brief(
+                    round_brief,
                     workspace_strategy_file=workspace_strategy_file,
                     base_source=base_source,
                     factor_change_mode=factor_change_mode,
                 )
-                if not repaired.candidate_id:
-                    repaired = StrategyCandidate(
-                        candidate_id=failed_candidate.candidate_id,
-                        hypothesis=repaired.hypothesis,
-                        change_plan=repaired.change_plan,
-                        closest_failed_cluster=repaired.closest_failed_cluster,
-                        novelty_proof=repaired.novelty_proof,
-                        change_tags=repaired.change_tags,
-                        edited_regions=repaired.edited_regions,
-                        expected_effects=repaired.expected_effects,
-                        core_factors=repaired.core_factors,
-                        strategy_code=repaired.strategy_code,
-                    )
-                return repaired
             except StrategySourceError as repair_exc:
                 errors.append(str(repair_exc))
         raise CandidateRepairExhausted(
@@ -2112,16 +2256,22 @@ def _build_model_candidate(
     factor_change_mode: str,
 ) -> StrategyCandidate:
     workspace_strategy_file = workspace_root / MODEL_WORKSPACE_STRATEGY_PATH
-    last_response_text = _build_model_edit_response(
+    round_brief = _build_model_round_brief(
         base_source,
         journal_entries,
         workspace_root=workspace_root,
         factor_change_mode=factor_change_mode,
     )
+    last_response_text = _run_edit_worker(
+        base_source=base_source,
+        round_brief=round_brief,
+        workspace_root=workspace_root,
+        factor_change_mode=factor_change_mode,
+        phase="model_edit_worker",
+    )
     no_edit_errors: list[str] = []
-    edited_source = ""
     try:
-        edited_source = _workspace_strategy_changed_source_or_raise(
+        _workspace_strategy_changed_source_or_raise(
             workspace_strategy_file=workspace_strategy_file,
             base_source=base_source,
         )
@@ -2134,6 +2284,7 @@ def _build_model_candidate(
             base_source=base_source,
             context_label="initial_candidate",
             last_response_text=last_response_text,
+            round_brief=round_brief,
         )
         for attempt in range(1, max(0, RUNTIME.max_no_edit_repair_attempts) + 1):
             write_heartbeat(
@@ -2149,6 +2300,7 @@ def _build_model_candidate(
                 f"{attempt}/{RUNTIME.max_no_edit_repair_attempts}: {no_edit_errors[-1]}"
             )
             last_response_text = _repair_no_edit_model_response(
+                round_brief=round_brief,
                 error_message="\n".join(no_edit_errors[-3:]),
                 no_edit_attempt=attempt,
                 workspace_root=workspace_root,
@@ -2170,6 +2322,7 @@ def _build_model_candidate(
                     base_source=base_source,
                     context_label=f"no_edit_repair_{attempt}",
                     last_response_text=last_response_text,
+                    round_brief=round_brief,
                 )
         else:
             raise CandidateRepairExhausted(
@@ -2178,14 +2331,8 @@ def _build_model_candidate(
                 failure_stage="candidate_no_edit",
             ) from exc
 
-    payload = _build_model_candidate_summary_payload(
-        base_source=base_source,
-        edited_source=edited_source,
-        workspace_root=workspace_root,
-        factor_change_mode=factor_change_mode,
-    )
-    return _candidate_from_payload_with_validation_repair(
-        payload=payload,
+    return _candidate_from_round_brief_with_validation_repair(
+        round_brief=round_brief,
         base_source=base_source,
         workspace_root=workspace_root,
         factor_change_mode=factor_change_mode,
@@ -2212,16 +2359,23 @@ def _regenerate_model_candidate(
         workspace_root=workspace_root,
         base_source=base_source,
     )
-    payload = _regenerate_model_candidate_payload(
-        base_source=base_source,
+    round_brief = _regenerate_model_round_brief(
         failed_candidate=failed_candidate,
         block_info=block_info,
         regeneration_attempt=regeneration_attempt,
         workspace_root=workspace_root,
         factor_change_mode=factor_change_mode,
     )
-    return _candidate_from_payload_with_validation_repair(
-        payload=payload,
+    _run_edit_worker(
+        base_source=base_source,
+        round_brief=round_brief,
+        workspace_root=workspace_root,
+        factor_change_mode=factor_change_mode,
+        phase="model_regenerate_edit_worker",
+        repair_attempt=regeneration_attempt,
+    )
+    return _candidate_from_round_brief_with_validation_repair(
+        round_brief=round_brief,
         base_source=base_source,
         workspace_root=workspace_root,
         factor_change_mode=factor_change_mode,
@@ -2238,16 +2392,15 @@ def _repair_model_candidate(
     workspace_root: Path,
     factor_change_mode: str,
 ) -> StrategyCandidate:
-    payload = _repair_model_candidate_payload(
-        base_source=base_source,
+    _repair_model_candidate_source(
         failed_candidate=failed_candidate,
         error_message=error_message,
         repair_attempt=repair_attempt,
         workspace_root=workspace_root,
         factor_change_mode=factor_change_mode,
     )
-    return _candidate_from_payload_with_validation_repair(
-        payload=payload,
+    return _candidate_from_round_brief_with_validation_repair(
+        round_brief=_round_brief_from_candidate(failed_candidate),
         base_source=base_source,
         workspace_root=workspace_root,
         factor_change_mode=factor_change_mode,

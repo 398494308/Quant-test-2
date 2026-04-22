@@ -103,11 +103,11 @@ test 验收：
 
 ## 当前 prompt 结构
 
-当前 prompt / session 已改成 `4` 层：
+当前 prompt / session 已改成 `planner 主链 + worker 落码`：
 
 1. workspace 局部 `AGENTS.md`
-   - 只放稳定项目上下文：项目目标、文件职责、允许修改边界、输出规则、复杂度预算、持久 session 规则
-2. `runtime prompt`
+   - 只放稳定项目上下文：项目目标、文件职责、允许修改边界、输出规则、复杂度预算、planner/worker 分工
+2. `planner runtime prompt`
    - 只放本轮动态信息，但顺序改成：刷新条件与目标 -> 本轮阅读顺序 -> 当前诊断摘要 -> 本轮执行框架
 3. `history package`
    - 当前 `stage` 执行摘要
@@ -119,14 +119,20 @@ test 验收：
 4. `failure wiki`
    - markdown 给模型读
    - json 给系统 guard 读
+5. `worker prompt`
+   - 只给 `edit_worker / repair_worker`
+   - 只放 round brief 或 repair 错误上下文，不再塞长历史
 
 当前 prompt 的关键点：
 
 - 不再内嵌完整策略源码
 - 稳定规则已经从每轮 system prompt 挪到 workspace 局部 `AGENTS.md`，只作用于 `state/research_macd_aggressive_v2_agent_workspace/`
-- 当前 `baseline/champion stage` 内会复用同一个 Codex session；只有在刷新 `champion` 或重建 `baseline` 时，才会清掉旧 session 并新开一个
-- `runtime prompt` 不再重复塞大量稳定约束，注意力更集中在本轮目标、当前诊断和真实 choke point
-- `runtime prompt` 明确要求先看刷新条件和当前诊断，再看 `wiki/latest_history_package.md` 与 `wiki/failure_wiki.md` 的前部摘要
+- 当前 `baseline/champion stage` 内只复用同一个 `planner` Codex session；`edit_worker / repair_worker` 每次都是短 session
+- `planner runtime prompt` 不再重复塞大量稳定约束，注意力更集中在本轮目标、当前诊断和真实 choke point
+- `planner runtime prompt` 明确要求先看刷新条件和当前诊断，再看 `wiki/latest_history_package.md` 与 `wiki/failure_wiki.md` 的前部摘要
+- `planner` 现在只产 round brief，不再直接改代码；真实落码和技术修复已从主 session 拆出去
+- `edit_worker / repair_worker` 不再读取整包历史；它们只根据 round brief 或 repair 错误上下文直接改 `src/strategy_macd_aggressive.py`
+- `model_summarize` 已去掉；候选元信息改由主进程基于 round brief 和真实 diff 本地组装
 - 形成假设后必须回看一次 `failure wiki` 自检；命中相同或高度相似的失败 cut 时，要求在同一轮内改写
 - “未执行代码改动 / blocked / no_edit / no_change / sandbox_blocked” 这类占位结果现在被显式判定为非法提交；辅助记忆缺失时也必须退化为直接修改当前策略源码
 - 默认因子模式下，prompt 明确禁止新增 `PARAMS` 键；顶层常量和顶层 helper 只允许少量新增，用来做结构化抽离，不能借机堆新因子
@@ -136,7 +142,7 @@ test 验收：
 - prompt/history 不再展示“最近动态核心因子 / 全局高频核心因子”，只保留方向簇、失败标签、改动区域和真实结果；原始 `core_factors` 仍保留在 raw archive
 - 当多空捕获明显失衡时，prompt 会追加“软偏置”提示，优先把探索预算投向更弱的一侧，而不是硬性锁死只看单边
 - `test` 完全不可见
-- `runtime prompt` 现在会附带当前基底最紧张的 complexity headroom，明确显示哪个 family / function 还剩多少 `lines / bool_ops / ifs`
+- `planner` / `edit_worker` prompt 现在都会附带当前基底最紧张的 complexity headroom，明确显示哪个 family / function 还剩多少 `lines / bool_ops / ifs`
 - 当前 `stage` 只在 prompt 中展示最近有限条表格和元信息，但它们现在后置到摘要之后；完整 `stage` 已另存到 memory 目录
 - journal 里新增 `方向冷却表（系统硬约束）`
 - 防重复规则只保留一份，不再多处复写
@@ -173,6 +179,7 @@ Discord 现在只保留：
 ## 当前运行保护
 
 - `smoke` 默认先跑 `5` 个窗口，当前会取早 train / val / 中前段 train / 中段 train / 尾段 train
+- `planner`、`edit_worker`、`repair_worker` 的调用会额外写入 `logs/macd_aggressive_research_v2_model_calls.jsonl`，用于排查 token、resume 和 provider 延迟
 - `smoke` 通过后，还会比对候选和当前参考在 smoke 窗口里的行为指纹
 - 如果收益、交易数、信号统计、退出原因和交易摘要完全一致，不会立刻结束本轮，而是把 smoke 摘要回灌给模型，在同一轮强制重生候选
 - 只有连续重生后仍然无法改变 smoke 行为，才会正式记一次 `behavioral_noop`
@@ -190,9 +197,10 @@ Discord 现在只保留：
 - 当前 stage session 会额外维护：
   - `state/research_macd_aggressive_v2_session.json`
   - `state/research_macd_aggressive_v2_agent_workspace/`
+- 代码架构切换后建议手工重置一次上述 session/workspace，让新的 planner/worker 规则从干净 session 开始生效
 - `best_state` 现在会持久化 `reference_stage_started_at/reference_stage_iteration`，重启后不会把当前 stage 切乱
 - 当前基底策略里，研究器被显式引导优先检查外层总闸门和最终 veto 链，而不是继续把注意力浪费在未触达真实出单层的局部 helper 上
-- 候选报错时会在同一轮 repair
+- 候选报错时会在同一轮进入短生命周期 `repair_worker`
 - 如果候选命中 failure wiki 已封死的 exact cut，会在完整评估前直接被拦回去同轮重生
 - 同簇低变化近邻会在评估前被系统拦截，不再白跑 `smoke/full eval`
 - 连续 `behavioral_noop`、重复结果盆地和复杂度连撞都会被当成 stall，后续若继续沿同簇近邻试错，会更早触发放宽或拦截

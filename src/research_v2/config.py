@@ -48,6 +48,7 @@ class ResearchPaths:
     strategy_file: Path
     backtest_file: Path
     log_file: Path
+    model_call_log_file: Path
     journal_file: Path
     memory_dir: Path
     session_state_file: Path
@@ -123,6 +124,7 @@ def load_research_runtime_config(repo_root: Path) -> ResearchRuntimeConfig:
         strategy_file=repo_root / "src/strategy_macd_aggressive.py",
         backtest_file=repo_root / "src/backtest_macd_aggressive.py",
         log_file=repo_root / "logs/macd_aggressive_research_v2.log",
+        model_call_log_file=repo_root / "logs/macd_aggressive_research_v2_model_calls.jsonl",
         journal_file=repo_root / "state/research_macd_aggressive_v2_journal.jsonl",
         memory_dir=repo_root / "state/research_macd_aggressive_v2_memory",
         session_state_file=repo_root / "state/research_macd_aggressive_v2_session.json",
