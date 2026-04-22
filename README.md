@@ -1,4 +1,4 @@
-# Quant Test 3
+# Quant AI Research
 
 `OKX BTC-USDT-SWAP` 激进趋势策略研究仓库。
 
