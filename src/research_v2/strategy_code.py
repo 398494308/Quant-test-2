@@ -6,10 +6,12 @@ import ast
 import builtins
 import hashlib
 import json
+import math
 import re
 import symtable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 # ==================== 数据结构 ====================
@@ -187,6 +189,14 @@ COMPLEXITY_FAMILY_DEFAULT_GROWTH_LIMITS: dict[str, int] = {
     "bool_ops": 20,
     "ifs": 4,
 }
+COMPLEXITY_HEADROOM_WARNING_THRESHOLDS: dict[str, dict[str, int]] = {
+    "warning_1": {"lines": 20, "bool_ops": 8, "ifs": 3},
+    "warning_2": {"lines": 8, "bool_ops": 2, "ifs": 1},
+}
+COMPLEXITY_GROWTH_WARNING_RATIOS: dict[str, float] = {
+    "warning_1": 0.60,
+    "warning_2": 0.85,
+}
 COMPLEXITY_SNAPSHOT_FUNCTIONS = frozenset(
     {
         *COMPLEXITY_MONITORED_FUNCTIONS,
@@ -228,6 +238,27 @@ def factor_change_mode_prompt_hint(mode: str | None) -> str:
         f"{DEFAULT_MODE_MAX_NEW_TOP_LEVEL_HELPERS} 个顶层 helper，用于结构化抽离现有逻辑；"
         "不允许借这个口子堆新因子或复制旧规则。"
     )
+
+
+def complexity_pressure_label(level: str) -> str:
+    normalized = str(level or "normal").strip().lower()
+    if normalized == "warning_1":
+        return "warning_1（开始拥挤，优先删旧合并）"
+    if normalized == "warning_2":
+        return "warning_2（接近危险区，优先先压缩再新增）"
+    if normalized == "hard_cap":
+        return "hard_cap（超出绝对复杂度帽，直接拒收）"
+    return "normal（空间正常）"
+
+
+def complexity_growth_warning_thresholds() -> dict[str, dict[str, int]]:
+    thresholds: dict[str, dict[str, int]] = {}
+    for level, ratio in COMPLEXITY_GROWTH_WARNING_RATIOS.items():
+        thresholds[level] = {
+            metric_name: max(1, int(math.ceil(limit * ratio)))
+            for metric_name, limit in COMPLEXITY_DEFAULT_GROWTH_LIMITS.items()
+        }
+    return thresholds
 
 def load_strategy_source(path: Path) -> str:
     return path.read_text()
@@ -683,8 +714,79 @@ def build_strategy_complexity_headroom(source: str) -> dict[str, dict[str, dict[
     }
 
 
+def build_strategy_complexity_pressure(
+    source: str,
+    *,
+    base_source: str | None = None,
+) -> dict[str, Any]:
+    headroom = build_strategy_complexity_headroom(source)
+    headroom_level = "normal"
+    headroom_items: list[str] = []
+
+    def _update_level(current_level: str, next_level: str) -> str:
+        order = {"normal": 0, "warning_1": 1, "warning_2": 2, "hard_cap": 3}
+        return next_level if order.get(next_level, 0) > order.get(current_level, 0) else current_level
+
+    for group_name, group_metrics in (
+        ("family", headroom["families"]),
+        ("function", headroom["functions"]),
+    ):
+        for item_name, metrics in group_metrics.items():
+            for metric_name in ("lines", "bool_ops", "ifs"):
+                remaining_value = int(metrics.get(f"remaining_{metric_name}", 0))
+                if remaining_value < 0:
+                    headroom_level = "hard_cap"
+                    headroom_items.append(f"{group_name} `{item_name}` 的 {metric_name} 已超帽 {abs(remaining_value)}")
+                    continue
+                if remaining_value <= COMPLEXITY_HEADROOM_WARNING_THRESHOLDS["warning_2"][metric_name]:
+                    headroom_level = _update_level(headroom_level, "warning_2")
+                    headroom_items.append(f"{group_name} `{item_name}` 的 {metric_name} 余量仅剩 {remaining_value}")
+                    continue
+                if remaining_value <= COMPLEXITY_HEADROOM_WARNING_THRESHOLDS["warning_1"][metric_name]:
+                    headroom_level = _update_level(headroom_level, "warning_1")
+                    headroom_items.append(f"{group_name} `{item_name}` 的 {metric_name} 余量仅剩 {remaining_value}")
+
+    growth_level = "normal"
+    growth_items: list[str] = []
+    if base_source is not None:
+        complexity_delta = build_strategy_complexity_delta(base_source, source)
+        growth_thresholds = complexity_growth_warning_thresholds()
+        for group_name, delta_group in (
+            ("family", complexity_delta["families"]),
+            ("function", complexity_delta["functions"]),
+        ):
+            for item_name, metrics in delta_group.items():
+                for metric_name in ("lines", "bool_ops", "ifs"):
+                    delta_value = int(metrics.get(f"delta_{metric_name}", 0))
+                    if delta_value <= 0:
+                        continue
+                    if delta_value >= growth_thresholds["warning_2"][metric_name]:
+                        growth_level = _update_level(growth_level, "warning_2")
+                        growth_items.append(f"{group_name} `{item_name}` 的 {metric_name} 单轮增加 {delta_value}")
+                        continue
+                    if delta_value >= growth_thresholds["warning_1"][metric_name]:
+                        growth_level = _update_level(growth_level, "warning_1")
+                        growth_items.append(f"{group_name} `{item_name}` 的 {metric_name} 单轮增加 {delta_value}")
+
+    level = _update_level(headroom_level, growth_level)
+    summary_parts = [f"overall={level}", f"headroom={headroom_level}", f"growth={growth_level}"]
+    if headroom_items:
+        summary_parts.append(f"headroom_risk={'；'.join(headroom_items[:3])}")
+    if growth_items:
+        summary_parts.append(f"growth_risk={'；'.join(growth_items[:3])}")
+    return {
+        "level": level,
+        "headroom_level": headroom_level,
+        "growth_level": growth_level,
+        "headroom_items": tuple(headroom_items),
+        "growth_items": tuple(growth_items),
+        "summary": " | ".join(summary_parts),
+    }
+
+
 def format_strategy_complexity_headroom(source: str, *, limit: int = 4) -> str:
     headroom = build_strategy_complexity_headroom(source)
+    pressure = build_strategy_complexity_pressure(source)
 
     def _risk_tuple(item: tuple[str, dict[str, int]]) -> tuple[int, int, int, str]:
         name, metrics = item
@@ -697,7 +799,11 @@ def format_strategy_complexity_headroom(source: str, *, limit: int = 4) -> str:
 
     family_items = sorted(headroom["families"].items(), key=_risk_tuple)[: max(1, limit)]
     function_items = sorted(headroom["functions"].items(), key=_risk_tuple)[: max(1, limit)]
-    lines = ["当前基底复杂度余量（剩余越小越容易再次撞复杂度）:"]
+    lines = [
+        f"当前基底复杂度状态：{complexity_pressure_label(str(pressure.get('level', 'normal')))}",
+        "- warning_1 只是提醒开始偏胖；warning_2 表示下一步应优先压缩；只有 hard_cap 才会直接拒收。",
+        "当前基底复杂度余量（剩余越小越容易再次撞复杂度）:",
+    ]
 
     for name, metrics in family_items:
         lines.append(
@@ -711,6 +817,8 @@ def format_strategy_complexity_headroom(source: str, *, limit: int = 4) -> str:
             f"bool_ops 剩 {metrics['remaining_bool_ops']}, ifs 剩 {metrics['remaining_ifs']}"
         )
 
+    if pressure["headroom_items"]:
+        lines.append(f"- 当前最紧张位置：{'；'.join(pressure['headroom_items'][:3])}")
     lines.append("- 若要继续改最紧张的 family/function，先删旧条件或合并旧分支，再考虑新增判断。")
     return "\n".join(lines)
 
@@ -752,34 +860,9 @@ def _validate_complexity_budget(
 
     if base_source is None or normalize_factor_change_mode(factor_change_mode) != "default":
         return
-
-    complexity_delta = build_strategy_complexity_delta(base_source, source)
-    for function_name, metrics in complexity_delta["functions"].items():
-        if int(metrics["delta_lines"]) > COMPLEXITY_DEFAULT_GROWTH_LIMITS["lines"]:
-            raise StrategySourceError(
-                f"default mode complexity growth too large: {function_name}.lines +{metrics['delta_lines']}"
-            )
-        if int(metrics["delta_bool_ops"]) > COMPLEXITY_DEFAULT_GROWTH_LIMITS["bool_ops"]:
-            raise StrategySourceError(
-                f"default mode complexity growth too large: {function_name}.bool_ops +{metrics['delta_bool_ops']}"
-            )
-        if int(metrics["delta_ifs"]) > COMPLEXITY_DEFAULT_GROWTH_LIMITS["ifs"]:
-            raise StrategySourceError(
-                f"default mode complexity growth too large: {function_name}.ifs +{metrics['delta_ifs']}"
-            )
-    for family_name, metrics in complexity_delta["families"].items():
-        if int(metrics["delta_lines"]) > COMPLEXITY_FAMILY_DEFAULT_GROWTH_LIMITS["lines"]:
-            raise StrategySourceError(
-                f"default mode complexity family growth too large: {family_name}.lines +{metrics['delta_lines']}"
-            )
-        if int(metrics["delta_bool_ops"]) > COMPLEXITY_FAMILY_DEFAULT_GROWTH_LIMITS["bool_ops"]:
-            raise StrategySourceError(
-                f"default mode complexity family growth too large: {family_name}.bool_ops +{metrics['delta_bool_ops']}"
-            )
-        if int(metrics["delta_ifs"]) > COMPLEXITY_FAMILY_DEFAULT_GROWTH_LIMITS["ifs"]:
-            raise StrategySourceError(
-                f"default mode complexity family growth too large: {family_name}.ifs +{metrics['delta_ifs']}"
-            )
+    # 默认模式仍会记录单轮复杂度增量，但这里只保留绝对复杂度硬帽拒收。
+    # 软增量限制改为 prompt/journal 预警，避免把可尝试但偏胖的候选过早拦死。
+    _ = build_strategy_complexity_delta(base_source, source)
 
 
 def _undefined_function_reference_errors(source: str, tree: ast.Module) -> list[str]:

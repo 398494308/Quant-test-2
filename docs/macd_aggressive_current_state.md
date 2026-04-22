@@ -131,6 +131,13 @@
 - [state/research_macd_aggressive_v2_session.json](../state/research_macd_aggressive_v2_session.json)
 - [state/research_macd_aggressive_v2_agent_workspace/AGENTS.md](../state/research_macd_aggressive_v2_agent_workspace/AGENTS.md)
 
+当前方向引导口径：
+
+- 人工方向卡和 champion 缺陷提示现在只指定“主目标”，不再把多头弱直接收窄成固定补法。
+- 弱侧是 `long` 时，研究器仍优先补多头，但要持续监控空头是否被破坏。
+- 若某个多头补法已经在当前 stage 反复失败，下一轮应继续围绕补多头，但优先换机制层、换 choke point 或换最终路由。
+- `factor_admission` 不再在短 stall 后立刻自动开启；当前节奏是连续 `5` 轮 stall 先提醒、`7` 轮强提醒、`10` 轮才强制切入，且单个 stage 最多连开 `4` 轮。
+
 ## 当前运行保护
 
 当前有效的运行保护包括：
@@ -141,7 +148,9 @@
 - `smoke` 行为完全不变时会先同轮重生，连续不变才记 `behavioral_noop`
 - 命中 failure wiki 的 exact cut 会在评估前被挡回
 - 重复 source、重复 hash、空 diff、非法输出会隔离成技术空转，不让它们污染真正的研究记忆
-- 复杂度超限会优先走同轮 repair，不再立刻浪费下一轮
+- 复杂度现在采用两档预警加绝对硬帽：`warning_1` 提醒开始偏胖，`warning_2` 提醒优先先压缩，只有超过绝对复杂度帽才会直接拒收
+- 复杂度硬帽仍会优先走同轮 repair，不再立刻浪费下一轮
+- 当前 stage 内如果同一 `cluster + target + ordinary family` 的 rejected 反复出现且没有正向 delta，也会被视为研究停滞证据，用来触发换挡；这不是跨 stage 永久封锁。
 
 ## 当前目录与状态文件
 

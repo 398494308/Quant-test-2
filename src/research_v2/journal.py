@@ -1693,7 +1693,7 @@ def _exploration_trigger_lines(entries: list[dict[str, Any]], limit: int) -> lis
             f"最近 {LOW_CHANGE_STREAK} 轮反复落回同一结果盆地：分数、命中率、弱侧捕获和 gate 原因几乎一致，不应继续把它们当成独立新证据。",
             f"- 结果盆地原因：{'；'.join(reasons[:limit]) or '-'}",
             f"- 近期近邻方向簇：{', '.join(clusters[:limit]) or '-'}；标签：{', '.join(tags[:limit]) or '-'}；高频区域：{', '.join(regions[:limit]) or '-'}",
-            "- 下一轮必须优先切不同方向簇；若仍留在同簇，必须切不同 choke point 或不同最终放行链，而不是继续换候选名、tag 或措辞。",
+            "- 下一轮必须优先切不同方向簇；若仍留在同簇，必须切不同 choke point、不同机制层或不同最终放行链，而不是继续换候选名、tag 或措辞。",
         ]
 
     tail = _low_change_tail(entries)
@@ -2092,8 +2092,8 @@ def _stage_executive_summary_lines(
 
     weak_side = _weak_side_from_reference_metrics(reference_metrics)
     target_text = {
-        "long": "当前弱侧是 long；默认优先补多头捕获/命中率，但不是硬锁只看多头。",
-        "short": "当前弱侧是 short；默认优先补空头捕获/命中率，但不是硬锁只看空头。",
+        "long": "当前弱侧是 long；主目标是补多头，但要持续监控 short 是否被破坏，优先选能补 long 且不明显伤 short 的方案。",
+        "short": "当前弱侧是 short；主目标是补空头，但要持续监控 long 是否被破坏，优先选能补 short 且不明显伤 long 的方案。",
     }.get(weak_side, "当前多空没有明显弱侧，默认先看最影响 gate 的主短板。")
 
     accepted_count = sum(1 for entry in entries if str(entry.get("outcome", "")).strip() == "accepted")
@@ -2134,6 +2134,14 @@ def _stage_executive_summary_lines(
         f"ordinary family={_top_counter_labels(family_counter, 2)}；"
         f"标签={_top_counter_labels(tag_counter, 4)}"
     )
+    if weak_side == "long":
+        lines.append(
+            "- 当前阅读提醒: `weak side = long` 只说明主目标是补多头，不等于根因一定在 `long_outer_context_ok` / `widen_outer_context`；若同一种补法已反复失败，应继续补 long，但切到别的机制层。"
+        )
+    elif weak_side == "short":
+        lines.append(
+            "- 当前阅读提醒: `weak side = short` 只说明主目标是补空头，不等于根因一定在 `short_outer_context_ok` / `widen_outer_context`；若同一种补法已反复失败，应继续补 short，但切到别的机制层。"
+        )
     lines.append("- 阅读建议: 先看这里和失败核聚合，再把下面的风险表、逐轮表格当附录。")
     return lines
 

@@ -69,6 +69,7 @@ from research_v2.prompting import (
     build_strategy_edit_worker_prompt,
     build_strategy_exploration_repair_prompt,
     build_strategy_no_edit_repair_prompt,
+    build_strategy_round_brief_repair_prompt,
     build_strategy_research_prompt,
     build_strategy_runtime_repair_prompt,
     build_strategy_system_prompt,
@@ -80,6 +81,7 @@ from research_v2.strategy_code import (
     StrategyCoreFactor,
     StrategySourceError,
     build_diff_summary,
+    build_strategy_complexity_pressure,
     build_system_edit_signature,
     build_strategy_complexity_delta,
     format_strategy_complexity_headroom,
@@ -106,8 +108,12 @@ VALIDATION_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "valida
 TEST_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "test")
 SCORE_REGIME = "trend_capture_v6"
 MODEL_WORKSPACE_STRATEGY_PATH = Path("src/strategy_macd_aggressive.py")
-FACTOR_ADMISSION_TRIGGER_STALLS = 3
-FACTOR_ADMISSION_MAX_BURST = 2
+FACTOR_ADMISSION_REMINDER_STALLS = 5
+FACTOR_ADMISSION_SUGGEST_STALLS = 7
+FACTOR_ADMISSION_FORCE_STALLS = 10
+FACTOR_ADMISSION_MAX_BURST = 4
+PLANNER_BRIEF_REQUIRED_FIELDS = ("hypothesis", "change_plan", "novelty_proof", "change_tags")
+MAX_PLANNER_BRIEF_REPAIR_ATTEMPTS = 1
 
 best_source = ""
 best_report: EvaluationReport | None = None
@@ -134,6 +140,16 @@ class StrategyRoundBrief:
     change_tags: tuple[str, ...]
     expected_effects: tuple[str, ...]
     core_factors: tuple[StrategyCoreFactor, ...]
+
+
+@dataclass(frozen=True)
+class PlannerBriefInvalid(Exception):
+    candidate: StrategyCandidate
+    block_info: dict[str, Any]
+    errors: tuple[str, ...]
+
+    def __str__(self) -> str:
+        return self.errors[-1] if self.errors else "planner round brief invalid"
 
 
 # ==================== 日志与心跳 ====================
@@ -293,6 +309,7 @@ def _store_research_session_metadata(
     *,
     session_id: str,
     workspace_root: Path,
+    factor_change_mode: str = "",
 ) -> None:
     if not session_id:
         return
@@ -302,6 +319,12 @@ def _store_research_session_metadata(
         **_session_scope_payload(),
         "session_id": session_id,
         "workspace_root": str(workspace_root),
+        "factor_change_mode": normalize_factor_change_mode(
+            str(factor_change_mode).strip()
+            or str(previous.get("factor_change_mode", "")).strip()
+            or str(RUNTIME.base_factor_change_mode or "default").strip()
+            or "default"
+        ),
         "created_at": str(previous.get("created_at", "")).strip() or now,
         "updated_at": now,
     }
@@ -315,6 +338,28 @@ def _align_research_session_scope(*, force_reset: bool = False) -> None:
         return
     if state and not _session_state_matches_current_stage(state):
         _clear_research_session_state(remove_workspace=True, reason="reference scope changed")
+
+
+def _maybe_reset_research_session_for_factor_mode(factor_change_mode: str) -> None:
+    state = _load_research_session_state()
+    if not _session_state_matches_current_stage(state):
+        return
+    previous_mode = normalize_factor_change_mode(
+        str(state.get("factor_change_mode", "")).strip()
+        or str(RUNTIME.base_factor_change_mode or "default").strip()
+        or "default"
+    )
+    current_mode = normalize_factor_change_mode(
+        str(factor_change_mode).strip()
+        or str(RUNTIME.base_factor_change_mode or "default").strip()
+        or "default"
+    )
+    if previous_mode == current_mode:
+        return
+    _clear_research_session_state(
+        remove_workspace=False,
+        reason=f"factor mode changed: {previous_mode} -> {current_mode}",
+    )
 
 
 def _refresh_prompt_memory_snapshots() -> str:
@@ -567,6 +612,7 @@ def _entry_is_factor_stall(
     entry: dict[str, Any],
     *,
     basin_counts: dict[str, int] | None = None,
+    direction_counts: dict[str, int] | None = None,
 ) -> bool:
     outcome = str(entry.get("outcome", "")).strip()
     if outcome in {"behavioral_noop", "exploration_blocked", "duplicate_skipped", "generation_invalid"}:
@@ -584,10 +630,59 @@ def _entry_is_factor_stall(
     basin_key = result_basin_key_for_entry(entry)
     if basin_key and basin_counts and basin_counts.get(basin_key, 0) >= 2:
         return True
+    direction_key = _stage_direction_key_for_entry(entry)
+    if direction_key and direction_counts and direction_counts.get(direction_key, 0) >= 3 and promotion_delta <= 0.0:
+        return True
     return False
 
 
-def _resolve_iteration_factor_change_mode(journal_entries: list[dict[str, Any]]) -> tuple[str, str]:
+def _stage_direction_key_for_entry(entry: dict[str, Any]) -> str:
+    cluster = str(entry.get("cluster_key", "")).strip()
+    target = str(entry.get("target_family", "")).strip()
+    families = entry.get("system_ordinary_region_families", []) or entry.get("system_region_families", []) or []
+    normalized_families = sorted({str(item).strip() for item in families if str(item).strip()})
+    if not cluster or not target or not normalized_families:
+        return ""
+    return json.dumps(
+        {
+            "cluster": cluster,
+            "target": target,
+            "families": normalized_families,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def _factor_change_status_text(state: dict[str, Any]) -> str:
+    trailing_stalls = int(state.get("trailing_stalls", 0) or 0)
+    factor_admission_rounds = int(state.get("factor_admission_rounds", 0) or 0)
+    level = str(state.get("guidance_level", "normal")).strip() or "normal"
+    if level == "forced":
+        return (
+            f"当前 stage 已连续 {trailing_stalls} 轮 stall，系统本轮强制切到 factor_admission；"
+            f"当前已使用 {factor_admission_rounds}/{FACTOR_ADMISSION_MAX_BURST} 轮。"
+        )
+    if level == "suggest":
+        return (
+            f"当前 stage 已连续 {trailing_stalls} 轮 stall，已到 factor_admission 强提醒区；"
+            f"若继续无效，{FACTOR_ADMISSION_FORCE_STALLS} 轮会自动切入。当前已用 {factor_admission_rounds}/{FACTOR_ADMISSION_MAX_BURST} 轮。"
+        )
+    if level == "reminder":
+        return (
+            f"当前 stage 已连续 {trailing_stalls} 轮 stall，进入 factor_admission 提醒区；"
+            "优先先做删旧、换机制层、换 choke point。"
+        )
+    if level == "exhausted":
+        return (
+            f"当前 stage 已连续 {trailing_stalls} 轮 stall，但 factor_admission 已用满 "
+            f"{FACTOR_ADMISSION_MAX_BURST}/{FACTOR_ADMISSION_MAX_BURST} 轮；"
+            "本轮回到默认模式，优先压缩和换机制。"
+        )
+    return "当前 stage 尚未进入 factor_admission 提醒区，保持默认删减/替换优先。"
+
+
+def _resolve_iteration_factor_change_state(journal_entries: list[dict[str, Any]]) -> dict[str, Any]:
     base_mode = normalize_factor_change_mode(str(RUNTIME.base_factor_change_mode or "default").strip() or "default")
     stage_entries = _current_stage_journal_entries(journal_entries)
     stage_tail: list[dict[str, Any]] = []
@@ -601,29 +696,64 @@ def _resolve_iteration_factor_change_mode(journal_entries: list[dict[str, Any]])
             factor_admission_rounds += 1
 
     basin_counts: dict[str, int] = {}
+    direction_counts: dict[str, int] = {}
     for entry in stage_tail:
         basin_key = result_basin_key_for_entry(entry)
         if basin_key:
             basin_counts[basin_key] = basin_counts.get(basin_key, 0) + 1
+        direction_key = _stage_direction_key_for_entry(entry)
+        if direction_key:
+            direction_counts[direction_key] = direction_counts.get(direction_key, 0) + 1
 
     trailing_stalls = 0
     for entry in stage_tail:
-        if _entry_is_factor_stall(entry, basin_counts=basin_counts):
+        if _entry_is_factor_stall(entry, basin_counts=basin_counts, direction_counts=direction_counts):
             trailing_stalls += 1
             continue
         break
-    if (
-        trailing_stalls >= FACTOR_ADMISSION_TRIGGER_STALLS
-        and factor_admission_rounds < FACTOR_ADMISSION_MAX_BURST
-    ):
-        return (
-            "factor_admission",
-            (
+
+    guidance_level = "normal"
+    mode = base_mode
+    reason = f"当前stage未触发提醒，维持 {base_mode}"
+    if trailing_stalls >= FACTOR_ADMISSION_FORCE_STALLS:
+        if factor_admission_rounds < FACTOR_ADMISSION_MAX_BURST:
+            guidance_level = "forced"
+            mode = "factor_admission"
+            reason = (
                 f"当前stage已连续 {trailing_stalls} 轮 behavioral_noop/exploration_blocked/重复结果盆地/复杂度连撞，"
-                f"临时开启 factor_admission 第 {factor_admission_rounds + 1}/{FACTOR_ADMISSION_MAX_BURST} 轮"
-            ),
+                f"达到强制放宽阈值，临时开启 factor_admission 第 {factor_admission_rounds + 1}/{FACTOR_ADMISSION_MAX_BURST} 轮"
+            )
+        else:
+            guidance_level = "exhausted"
+            reason = (
+                f"当前stage已连续 {trailing_stalls} 轮 stall，但 factor_admission 已用满 "
+                f"{FACTOR_ADMISSION_MAX_BURST}/{FACTOR_ADMISSION_MAX_BURST} 轮，维持 {base_mode}"
+            )
+    elif trailing_stalls >= FACTOR_ADMISSION_SUGGEST_STALLS:
+        guidance_level = "suggest"
+        reason = (
+            f"当前stage已连续 {trailing_stalls} 轮 stall，进入 factor_admission 强提醒区；"
+            f"若达到 {FACTOR_ADMISSION_FORCE_STALLS} 轮仍无改善，将自动切入 factor_admission。"
         )
-    return (base_mode, f"当前stage未触发自动放宽，维持 {base_mode}")
+    elif trailing_stalls >= FACTOR_ADMISSION_REMINDER_STALLS:
+        guidance_level = "reminder"
+        reason = (
+            f"当前stage已连续 {trailing_stalls} 轮 stall，进入 factor_admission 提醒区；"
+            "本轮先优先删旧、换机制层或换 choke point。"
+        )
+
+    return {
+        "mode": mode,
+        "reason": reason,
+        "guidance_level": guidance_level,
+        "trailing_stalls": trailing_stalls,
+        "factor_admission_rounds": factor_admission_rounds,
+    }
+
+
+def _resolve_iteration_factor_change_mode(journal_entries: list[dict[str, Any]]) -> tuple[str, str]:
+    state = _resolve_iteration_factor_change_state(journal_entries)
+    return str(state.get("mode", "default")).strip() or "default", str(state.get("reason", "")).strip()
 
 
 def _load_saved_reference_state() -> dict[str, Any]:
@@ -1579,15 +1709,18 @@ def _parse_model_candidate_payload(raw_text: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         payload = None
     if isinstance(payload, dict):
-        return payload
+        normalized = dict(payload)
+        normalized["__raw_text__"] = text
+        return normalized
 
     field_lines = _response_field_lines(text)
     if not field_lines:
-        compact = " ".join(line.strip() for line in text.splitlines() if line.strip())
         return {
+            "__raw_text__": text,
+            "__format_error__": "missing_field_contract",
             "candidate_id": "",
-            "hypothesis": compact,
-            "change_plan": compact,
+            "hypothesis": "",
+            "change_plan": "",
             "change_tags": [],
             "expected_effects": [],
             "closest_failed_cluster": "",
@@ -1596,6 +1729,7 @@ def _parse_model_candidate_payload(raw_text: str) -> dict[str, Any]:
         }
 
     return {
+        "__raw_text__": text,
         "candidate_id": _collapse_field_text(field_lines.get("candidate_id", [])),
         "hypothesis": _collapse_field_text(field_lines.get("hypothesis", [])),
         "change_plan": _collapse_field_text(field_lines.get("change_plan", [])),
@@ -1612,6 +1746,44 @@ def _parse_model_candidate_payload(raw_text: str) -> dict[str, Any]:
             for factor in _parse_core_factors_field(field_lines.get("core_factors", []))
         ],
     }
+
+
+def _round_brief_missing_fields(payload: dict[str, Any]) -> tuple[str, ...]:
+    missing: list[str] = []
+    if str(payload.get("__format_error__", "")).strip() == "missing_field_contract":
+        return PLANNER_BRIEF_REQUIRED_FIELDS
+
+    hypothesis = str(payload.get("hypothesis", "")).strip()
+    change_plan = str(payload.get("change_plan", "")).strip()
+    novelty_proof = str(payload.get("novelty_proof", "")).strip()
+    change_tags = tuple(str(item).strip() for item in payload.get("change_tags", []) if str(item).strip())
+
+    if not hypothesis:
+        missing.append("hypothesis")
+    if not change_plan:
+        missing.append("change_plan")
+    if not novelty_proof:
+        missing.append("novelty_proof")
+    if not change_tags:
+        missing.append("change_tags")
+    return tuple(missing)
+
+
+def _validate_round_brief_payload(payload: dict[str, Any]) -> None:
+    missing_fields = _round_brief_missing_fields(payload)
+    if not missing_fields:
+        return
+    raise StrategySourceError(
+        "planner round brief missing required fields: "
+        + ", ".join(missing_fields)
+    )
+
+
+def _raw_response_excerpt(payload: dict[str, Any], *, max_chars: int = 240) -> str:
+    text = " ".join(str(payload.get("__raw_text__", "")).split())
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "..."
 
 
 def _auto_change_tags(edited_regions: tuple[str, ...]) -> tuple[str, ...]:
@@ -1779,10 +1951,10 @@ def _round_brief_from_payload(payload: dict[str, Any]) -> StrategyRoundBrief:
         closest_failed_cluster = cluster_key_for_components("", change_tags) or "unknown_cluster"
     return StrategyRoundBrief(
         candidate_id=candidate_id,
-        hypothesis=hypothesis or "未提供 hypothesis；需要重新围绕单一因果假设生成本轮 brief。",
-        change_plan=change_plan or "未提供 change_plan；需要明确本轮要改的规则块、阈值或最终放行链。",
+        hypothesis=hypothesis,
+        change_plan=change_plan,
         closest_failed_cluster=closest_failed_cluster,
-        novelty_proof=novelty_proof or "未提供 novelty_proof；需要明确说明本轮为何不属于已知失败 cut。",
+        novelty_proof=novelty_proof,
         change_tags=change_tags,
         expected_effects=tuple(str(item).strip() for item in payload.get("expected_effects", []) if str(item).strip()),
         core_factors=_core_factors_from_payload(payload),
@@ -1919,6 +2091,7 @@ def _run_model_text_request(
     repair_attempt: int | None = None,
     session_kind: str = "planner",
     use_persistent_session: bool = True,
+    session_factor_change_mode: str = "",
 ) -> str:
     session_id = _active_research_session_id() if use_persistent_session else ""
 
@@ -1958,6 +2131,7 @@ def _run_model_text_request(
         _store_research_session_metadata(
             session_id=resolved_session_id,
             workspace_root=workspace_root,
+            factor_change_mode=session_factor_change_mode,
         )
     elapsed_seconds = round(max(0.0, time.monotonic() - started_at), 3)
     _append_model_call_telemetry(
@@ -1991,6 +2165,7 @@ def _run_model_candidate_request(
     repair_attempt: int | None = None,
     session_kind: str = "planner",
     use_persistent_session: bool = True,
+    session_factor_change_mode: str = "",
 ) -> dict[str, Any]:
     raw_text = _run_model_text_request(
         prompt=prompt,
@@ -2000,8 +2175,151 @@ def _run_model_candidate_request(
         repair_attempt=repair_attempt,
         session_kind=session_kind,
         use_persistent_session=use_persistent_session,
+        session_factor_change_mode=session_factor_change_mode,
     )
     return _parse_model_candidate_payload(raw_text)
+
+
+def _candidate_from_invalid_round_brief_payload(
+    *,
+    payload: dict[str, Any],
+    base_source: str,
+) -> StrategyCandidate:
+    change_tags = tuple(str(item).strip() for item in payload.get("change_tags", []) if str(item).strip()) or ("invalid_brief",)
+    closest_failed_cluster = (
+        str(payload.get("closest_failed_cluster", "")).strip()
+        or cluster_key_for_components("", change_tags)
+        or "invalid_brief"
+    )
+    return StrategyCandidate(
+        candidate_id=(
+            str(payload.get("candidate_id", "")).strip()
+            or f"invalid_brief_{int(time.time())}"
+        ),
+        hypothesis=(
+            str(payload.get("hypothesis", "")).strip()
+            or "planner 未按字段契约返回有效 round brief。"
+        ),
+        change_plan=(
+            str(payload.get("change_plan", "")).strip()
+            or "重新按字段契约返回 hypothesis、change_plan、novelty_proof、change_tags。"
+        ),
+        closest_failed_cluster=closest_failed_cluster,
+        novelty_proof=(
+            str(payload.get("novelty_proof", "")).strip()
+            or "上一条 planner 回复缺少核心字段，未形成可执行 brief。"
+        ),
+        change_tags=change_tags,
+        edited_regions=tuple(),
+        expected_effects=tuple(str(item).strip() for item in payload.get("expected_effects", []) if str(item).strip()),
+        core_factors=_core_factors_from_payload(payload),
+        strategy_code=base_source,
+    )
+
+
+def _invalid_round_brief_block_info(
+    *,
+    payload: dict[str, Any],
+    errors: list[str],
+) -> dict[str, Any]:
+    missing_fields = _round_brief_missing_fields(payload)
+    blocked_cluster = (
+        str(payload.get("closest_failed_cluster", "")).strip()
+        or cluster_key_for_components("", tuple(str(item).strip() for item in payload.get("change_tags", []) if str(item).strip()))
+        or "-"
+    )
+    raw_excerpt = _raw_response_excerpt(payload)
+    error_text = errors[-1] if errors else "planner round brief invalid"
+    feedback_lines = [
+        "planner 输出的 round brief 不合法，当前轮次没有拿到可执行的策略摘要。",
+        f"- 无效原因: {error_text}",
+        f"- 缺失或无效字段: {', '.join(missing_fields) or '-'}",
+        f"- 原始回复摘录: {raw_excerpt or '-'}",
+        "- 你的任务不是写随笔，而是返回可执行的 round brief。",
+        "- 至少保证 `hypothesis`、`change_plan`、`novelty_proof`、`change_tags` 非空。",
+        "- 继续只返回纯文本字段，不要 JSON，不要 markdown，不要解释。",
+    ]
+    return {
+        "block_kind": "invalid_round_brief",
+        "stop_stage": "blocked_invalid_generation",
+        "blocked_cluster": blocked_cluster,
+        "blocked_reason": error_text,
+        "current_locks": tuple(),
+        "invalid_reasons": tuple(errors),
+        "feedback_note": "\n".join(feedback_lines),
+    }
+
+
+def _request_validated_round_brief(
+    *,
+    base_source: str,
+    prompt: str,
+    system_prompt: str,
+    phase: str,
+    workspace_root: Path,
+    factor_change_mode: str,
+    retry_phase: str,
+) -> StrategyRoundBrief:
+    payload = _run_model_candidate_request(
+        prompt=prompt,
+        system_prompt=system_prompt,
+        phase=phase,
+        workspace_root=workspace_root,
+        session_kind="planner",
+        use_persistent_session=True,
+        session_factor_change_mode=factor_change_mode,
+    )
+    errors: list[str] = []
+    current_payload = payload
+    for attempt in range(MAX_PLANNER_BRIEF_REPAIR_ATTEMPTS + 1):
+        try:
+            _validate_round_brief_payload(current_payload)
+            return _round_brief_from_payload(current_payload)
+        except StrategySourceError as exc:
+            errors.append(str(exc))
+            if attempt >= MAX_PLANNER_BRIEF_REPAIR_ATTEMPTS:
+                raise PlannerBriefInvalid(
+                    candidate=_candidate_from_invalid_round_brief_payload(
+                        payload=current_payload,
+                        base_source=base_source,
+                    ),
+                    block_info=_invalid_round_brief_block_info(
+                        payload=current_payload,
+                        errors=errors,
+                    ),
+                    errors=tuple(errors),
+                ) from exc
+
+            retry_attempt = attempt + 1
+            log_info(
+                f"第 {iteration_counter} 轮 planner brief 非法，尝试同轮补正 "
+                f"{retry_attempt}/{MAX_PLANNER_BRIEF_REPAIR_ATTEMPTS}: {errors[-1]}"
+            )
+            write_heartbeat(
+                "planner_brief_repairing",
+                message=f"iteration {iteration_counter} repairing planner brief",
+                repair_attempt=retry_attempt,
+                max_repair_attempts=MAX_PLANNER_BRIEF_REPAIR_ATTEMPTS,
+                error=errors[-1],
+            )
+            repair_prompt = build_strategy_round_brief_repair_prompt(
+                retry_attempt=retry_attempt,
+                invalid_reason=errors[-1],
+                missing_fields=_round_brief_missing_fields(current_payload),
+                raw_response_excerpt=_raw_response_excerpt(current_payload),
+            )
+            current_payload = _run_model_candidate_request(
+                prompt=repair_prompt,
+                system_prompt=system_prompt,
+                phase=retry_phase,
+                workspace_root=workspace_root,
+                repair_attempt=retry_attempt,
+                session_kind="planner",
+                use_persistent_session=True,
+                session_factor_change_mode=factor_change_mode,
+            )
+
+    raise StrategySourceError("planner round brief validation loop exhausted")
 
 
 def _build_model_round_brief(
@@ -2019,6 +2337,7 @@ def _build_model_round_brief(
         raise StrategySourceError("reference benchmark is not initialized")
 
     session_mode = "resume" if _active_research_session_id() else "bootstrap"
+    factor_mode_state = _resolve_iteration_factor_change_state(journal_entries)
     prompt = build_strategy_research_prompt(
         evaluation_summary=report.prompt_summary_text,
         journal_summary=build_journal_prompt_summary(
@@ -2038,22 +2357,22 @@ def _build_model_round_brief(
         score_regime=SCORE_REGIME,
         promotion_min_delta=RUNTIME.promotion_min_delta,
         factor_change_mode=factor_change_mode,
+        factor_mode_status_text=_factor_change_status_text(factor_mode_state),
         current_complexity_headroom_text=format_strategy_complexity_headroom(base_source),
         session_mode=session_mode,
         operator_focus_text=_load_operator_focus_text(),
         operator_focus_path="config/research_v2_operator_focus.md",
     )
-    return _round_brief_from_payload(
-        _run_model_candidate_request(
-            prompt=prompt,
-            system_prompt=build_strategy_system_prompt(
-                factor_change_mode=factor_change_mode,
-            ),
-            phase="model_planner",
-            workspace_root=workspace_root,
-            session_kind="planner",
-            use_persistent_session=True,
-        )
+    return _request_validated_round_brief(
+        base_source=base_source,
+        prompt=prompt,
+        system_prompt=build_strategy_system_prompt(
+            factor_change_mode=factor_change_mode,
+        ),
+        phase="model_planner",
+        workspace_root=workspace_root,
+        factor_change_mode=factor_change_mode,
+        retry_phase="model_planner_brief_repair",
     )
 
 
@@ -2155,6 +2474,7 @@ def _repair_model_candidate_source(
 
 def _regenerate_model_round_brief(
     *,
+    base_source: str,
     failed_candidate: StrategyCandidate,
     block_info: dict[str, Any],
     regeneration_attempt: int,
@@ -2177,18 +2497,16 @@ def _regenerate_model_round_brief(
         regeneration_attempt=regeneration_attempt,
         feedback_note=str(block_info.get("feedback_note", "")).strip(),
     )
-    return _round_brief_from_payload(
-        _run_model_candidate_request(
-            prompt=prompt,
-            system_prompt=build_strategy_system_prompt(
-                factor_change_mode=factor_change_mode,
-            ),
-            phase="model_regenerate",
-            workspace_root=workspace_root,
-            repair_attempt=regeneration_attempt,
-            session_kind="planner",
-            use_persistent_session=True,
-        )
+    return _request_validated_round_brief(
+        base_source=base_source,
+        prompt=prompt,
+        system_prompt=build_strategy_system_prompt(
+            factor_change_mode=factor_change_mode,
+        ),
+        phase="model_regenerate",
+        workspace_root=workspace_root,
+        factor_change_mode=factor_change_mode,
+        retry_phase="model_regenerate_brief_repair",
     )
 
 
@@ -2368,6 +2686,7 @@ def _regenerate_model_candidate(
         base_source=base_source,
     )
     round_brief = _regenerate_model_round_brief(
+        base_source=base_source,
         failed_candidate=failed_candidate,
         block_info=block_info,
         regeneration_attempt=regeneration_attempt,
@@ -2583,6 +2902,7 @@ def _build_journal_entry(
     base_source: str,
     candidate_report: EvaluationReport | None,
     factor_change_mode: str,
+    factor_mode_context: dict[str, Any] | None = None,
     outcome: str,
     stop_stage: str,
     gate_reason: str | None = None,
@@ -2611,6 +2931,11 @@ def _build_journal_entry(
     actual_param_families = sorted(candidate_signature["param_families"])
     actual_structural_tokens = sorted(candidate_signature["structural_tokens"])
     complexity_delta = build_strategy_complexity_delta(base_source, candidate.strategy_code)
+    base_complexity_pressure = build_strategy_complexity_pressure(base_source)
+    candidate_complexity_pressure = build_strategy_complexity_pressure(
+        candidate.strategy_code,
+        base_source=base_source,
+    )
     runtime_failure_stage = str((extra_fields or {}).get("runtime_failure_stage", "")).strip()
     smoke_passed = (
         candidate_report is not None
@@ -2673,6 +2998,19 @@ def _build_journal_entry(
         "system_complexity_summary": complexity_delta["summary"],
         "system_complexity_flags": list(complexity_delta["flags"]),
         "system_bloat_flag": bool(complexity_delta["bloat_flag"]),
+        "system_base_complexity_level": str(base_complexity_pressure.get("level", "normal")).strip() or "normal",
+        "system_base_complexity_summary": str(base_complexity_pressure.get("summary", "")).strip(),
+        "system_candidate_complexity_level": str(candidate_complexity_pressure.get("level", "normal")).strip()
+        or "normal",
+        "system_candidate_complexity_headroom_level": str(
+            candidate_complexity_pressure.get("headroom_level", "normal")
+        ).strip()
+        or "normal",
+        "system_candidate_complexity_growth_level": str(
+            candidate_complexity_pressure.get("growth_level", "normal")
+        ).strip()
+        or "normal",
+        "system_candidate_complexity_summary": str(candidate_complexity_pressure.get("summary", "")).strip(),
         "declared_regions_match_system": sorted(candidate.edited_regions) == actual_changed_regions,
         "smoke_passed": smoke_passed,
         "full_eval_reached": full_eval_reached,
@@ -2683,6 +3021,13 @@ def _build_journal_entry(
         ),
         "core_factor_names": sorted(candidate_signature["core_factor_names"]),
         "score_regime": SCORE_REGIME,
+        "factor_change_reason": str((factor_mode_context or {}).get("reason", "")).strip(),
+        "factor_change_guidance_level": str((factor_mode_context or {}).get("guidance_level", "normal")).strip()
+        or "normal",
+        "factor_change_trailing_stalls": int((factor_mode_context or {}).get("trailing_stalls", 0) or 0),
+        "factor_change_stage_factor_admission_rounds": int(
+            (factor_mode_context or {}).get("factor_admission_rounds", 0) or 0
+        ),
     }
     entry["result_basin_key"] = result_basin_key_for_entry(entry)
     if extra_fields:
@@ -2721,6 +3066,7 @@ def _record_duplicate_skip(
     candidate: StrategyCandidate,
     base_source: str,
     factor_change_mode: str,
+    factor_mode_context: dict[str, Any] | None = None,
     stop_stage: str,
     gate_reason: str,
     note: str,
@@ -2732,6 +3078,7 @@ def _record_duplicate_skip(
             base_source=base_source,
             candidate_report=None,
             factor_change_mode=factor_change_mode,
+            factor_mode_context=factor_mode_context,
             outcome="duplicate_skipped",
             stop_stage=stop_stage,
             gate_reason=gate_reason,
@@ -2748,6 +3095,7 @@ def _record_generation_invalid(
     candidate: StrategyCandidate,
     base_source: str,
     factor_change_mode: str,
+    factor_mode_context: dict[str, Any] | None = None,
     block_info: dict[str, Any],
     note: str,
 ) -> None:
@@ -2758,6 +3106,7 @@ def _record_generation_invalid(
             base_source=base_source,
             candidate_report=None,
             factor_change_mode=factor_change_mode,
+            factor_mode_context=factor_mode_context,
             outcome="generation_invalid",
             stop_stage=str(block_info.get("stop_stage", "blocked_invalid_generation")),
             gate_reason=str(block_info.get("blocked_reason", "")).strip() or "候选未产生真实代码改动",
@@ -2781,6 +3130,7 @@ def _record_exploration_block(
     candidate: StrategyCandidate,
     base_source: str,
     factor_change_mode: str,
+    factor_mode_context: dict[str, Any] | None = None,
     block_info: dict[str, Any],
 ) -> None:
     _append_research_journal_entry(
@@ -2790,6 +3140,7 @@ def _record_exploration_block(
             base_source=base_source,
             candidate_report=None,
             factor_change_mode=factor_change_mode,
+            factor_mode_context=factor_mode_context,
             outcome="exploration_blocked",
             stop_stage=str(block_info.get("stop_stage", "blocked_same_cluster")),
             gate_reason=str(block_info.get("blocked_reason", "")).strip() or "探索方向被系统拒收",
@@ -2822,6 +3173,7 @@ def _record_behavioral_noop(
     candidate: StrategyCandidate,
     base_source: str,
     factor_change_mode: str,
+    factor_mode_context: dict[str, Any] | None = None,
     behavior_diff: dict[str, Any],
 ) -> None:
     _append_research_journal_entry(
@@ -2831,6 +3183,7 @@ def _record_behavioral_noop(
             base_source=base_source,
             candidate_report=None,
             factor_change_mode=factor_change_mode,
+            factor_mode_context=factor_mode_context,
             outcome="behavioral_noop",
             stop_stage="behavioral_noop",
             gate_reason="smoke 行为指纹与当前主参考完全一致",
@@ -2850,6 +3203,7 @@ def _record_runtime_failure(
     candidate: StrategyCandidate,
     base_source: str,
     factor_change_mode: str,
+    factor_mode_context: dict[str, Any] | None = None,
     errors: list[str],
     failure_stage: str,
     stop_stage: str,
@@ -2868,6 +3222,7 @@ def _record_runtime_failure(
             base_source=base_source,
             candidate_report=None,
             factor_change_mode=factor_change_mode,
+            factor_mode_context=factor_mode_context,
             outcome="runtime_failed",
             stop_stage=stop_stage,
             gate_reason="运行失败",
@@ -3016,7 +3371,9 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
         return "evaluation_only"
 
     journal_entries = load_journal_entries(RUNTIME.paths.journal_file)
-    current_factor_change_mode, factor_change_reason = _resolve_iteration_factor_change_mode(journal_entries)
+    factor_mode_context = _resolve_iteration_factor_change_state(journal_entries)
+    current_factor_change_mode = str(factor_mode_context.get("mode", "default")).strip() or "default"
+    factor_change_reason = str(factor_mode_context.get("reason", "")).strip()
     log_info(f"第 {iteration_id} 轮因子模式: {current_factor_change_mode} | {factor_change_reason}")
     write_heartbeat(
         "iteration_preparing",
@@ -3025,6 +3382,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
         factor_change_reason=factor_change_reason,
     )
     _align_research_session_scope(force_reset=False)
+    _maybe_reset_research_session_for_factor_mode(current_factor_change_mode)
     workspace_root = _prepare_agent_workspace(
         base_source=best_source,
         factor_change_mode=current_factor_change_mode,
@@ -3038,6 +3396,29 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
             workspace_root=workspace_root,
             factor_change_mode=current_factor_change_mode,
         )
+    except PlannerBriefInvalid as exc:
+        write_strategy_source(RUNTIME.paths.strategy_file, best_source)
+        reload_strategy_module()
+        _record_generation_invalid(
+            iteration_id=iteration_id,
+            candidate=exc.candidate,
+            base_source=best_source,
+            factor_change_mode=current_factor_change_mode,
+            factor_mode_context=factor_mode_context,
+            block_info=exc.block_info,
+            note=(
+                "planner 未按约定返回合法 round brief；系统已在同一 session 内补正一次，"
+                "仍未拿到可执行摘要，因此按 generation_invalid 记账。"
+            ),
+        )
+        log_info(f"第 {iteration_id} 轮 planner brief 作废: {exc}")
+        write_heartbeat(
+            "iteration_generation_invalid",
+            message=f"iteration {iteration_id} planner brief invalid",
+            block_kind=str(exc.block_info.get('block_kind', '')).strip(),
+            blocked_cluster=str(exc.block_info.get('blocked_cluster', '')).strip(),
+        )
+        return "generation_invalid"
     except CandidateRepairExhausted as exc:
         write_strategy_source(RUNTIME.paths.strategy_file, best_source)
         reload_strategy_module()
@@ -3047,6 +3428,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
             candidate=exc.candidate,
             base_source=best_source,
             factor_change_mode=current_factor_change_mode,
+            factor_mode_context=factor_mode_context,
             errors=exc.errors,
             failure_stage=exc.failure_stage or "candidate_validation",
             stop_stage="candidate_validation",
@@ -3078,6 +3460,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
                     candidate=candidate,
                     base_source=best_source,
                     factor_change_mode=current_factor_change_mode,
+                    factor_mode_context=factor_mode_context,
                     block_info=invalid_generation_block,
                     note=(
                         "候选未产出真实代码改动；该轮已按技术性空转记账，"
@@ -3123,6 +3506,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
                 candidate=candidate,
                 base_source=best_source,
                 factor_change_mode=current_factor_change_mode,
+                factor_mode_context=factor_mode_context,
                 stop_stage="duplicate_source",
                 gate_reason="候选源码与当前主参考完全相同",
                 note="模型未产生有效代码改动；本轮按重复探索记入研究历史。",
@@ -3136,6 +3520,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
                 candidate=candidate,
                 base_source=best_source,
                 factor_change_mode=current_factor_change_mode,
+                factor_mode_context=factor_mode_context,
                 stop_stage="duplicate_history",
                 gate_reason="候选源码命中最近研究历史",
                 note="模型重复产出了最近已出现过的候选源码；本轮按重复探索记入研究历史。",
@@ -3151,6 +3536,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
                 candidate=candidate,
                 base_source=best_source,
                 factor_change_mode=current_factor_change_mode,
+                factor_mode_context=factor_mode_context,
                 stop_stage="empty_diff",
                 gate_reason="候选没有产生有效 diff",
                 note="候选虽然通过了解析，但没有形成可验证的有效改动；本轮按重复探索记入研究历史。",
@@ -3183,6 +3569,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
                 candidate=candidate,
                 base_source=best_source,
                 factor_change_mode=current_factor_change_mode,
+                factor_mode_context=factor_mode_context,
                 block_info=block_info,
             )
             log_info(
@@ -3239,6 +3626,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
                             candidate=exc.candidate,
                             base_source=best_source,
                             factor_change_mode=current_factor_change_mode,
+                            factor_mode_context=factor_mode_context,
                             behavior_diff=exc.behavior_diff,
                         )
                         log_info(
@@ -3290,6 +3678,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
                     base_source=best_source,
                     candidate_report=None,
                     factor_change_mode=current_factor_change_mode,
+                    factor_mode_context=factor_mode_context,
                     outcome="early_rejected",
                     stop_stage="early_reject",
                     gate_reason="前段趋势捕获过差",
@@ -3313,6 +3702,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
                 candidate=exc.candidate,
                 base_source=best_source,
                 factor_change_mode=current_factor_change_mode,
+                factor_mode_context=factor_mode_context,
                 errors=exc.errors,
                 failure_stage=exc.failure_stage or "runtime_error",
                 stop_stage="runtime_error",
@@ -3346,6 +3736,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
         base_source=best_source,
         candidate_report=candidate_report,
         factor_change_mode=current_factor_change_mode,
+        factor_mode_context=factor_mode_context,
         outcome="accepted" if accepted else "rejected",
         stop_stage="full_eval",
         gate_reason=decision_reason if not accepted else None,

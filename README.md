@@ -50,7 +50,8 @@
 3. 短生命周期 `edit_worker` 只改策略文件；如果代码报错或复杂度超限，再由 `repair_worker` 做同轮修复。
 4. 候选先过 `smoke`，再跑完整 `train walk-forward + val`。
 5. `behavioral_noop`、重复结果盆地、failure wiki exact cut、空 diff、非法 brief 都会被挡下，不会静默混进有效研究结果。
-6. 只有刷新 champion 时才跑隐藏 `test`，并清掉旧 stage 的 session 上下文。
+6. `factor_admission` 采用 `5/7/10` 梯度提醒，复杂度采用“两档预警 + 绝对硬帽”；真正直接拒收的只剩绝对复杂度超帽。
+7. 只有刷新 champion 时才跑隐藏 `test`，并清掉旧 stage 的 session 上下文。
 
 ## 常用命令
 

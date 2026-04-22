@@ -56,13 +56,12 @@ from research_v2.notifications import build_discord_summary_message
 from research_v2.prompting import (
     EDITABLE_REGIONS,
     build_candidate_response_format_instructions,
-    build_candidate_response_schema,
     build_edit_completion_instructions,
     build_strategy_agents_instructions,
-    build_strategy_candidate_summary_prompt,
     build_strategy_edit_worker_prompt,
     build_strategy_exploration_repair_prompt,
     build_strategy_no_edit_repair_prompt,
+    build_strategy_round_brief_repair_prompt,
     build_strategy_research_prompt,
     build_strategy_runtime_repair_prompt,
     build_strategy_system_prompt,
@@ -73,6 +72,7 @@ from research_v2.strategy_code import (
     StrategyCandidate,
     StrategyCoreFactor,
     StrategySourceError,
+    build_strategy_complexity_pressure,
     build_strategy_complexity_delta,
     build_system_edit_signature,
     format_strategy_complexity_headroom,
@@ -1059,19 +1059,21 @@ def strategy(*args, **kwargs):
             factor_change_mode="factor_admission",
         )
 
-    def test_validate_strategy_source_rejects_default_mode_complexity_growth(self):
+    def test_validate_strategy_source_keeps_default_mode_complexity_growth_as_warning_only(self):
         base_source = self._minimal_validation_source()
         expanded_body = "\n    ".join(
             [*(f"x_{index} = {index}" for index in range(48)), "return None"]
         )
         source = self._minimal_validation_source({"strategy": expanded_body})
 
-        with self.assertRaisesRegex(StrategySourceError, r"complexity growth too large"):
-            validate_strategy_source(
-                source,
-                base_source=base_source,
-                factor_change_mode="default",
-            )
+        validate_strategy_source(
+            source,
+            base_source=base_source,
+            factor_change_mode="default",
+        )
+        pressure = build_strategy_complexity_pressure(source, base_source=base_source)
+
+        self.assertEqual(pressure["growth_level"], "warning_2")
 
     def test_build_strategy_complexity_delta_tracks_growth(self):
         base_source = self._minimal_validation_source()
@@ -1089,6 +1091,7 @@ def strategy(*args, **kwargs):
 
         summary = format_strategy_complexity_headroom(source, limit=2)
 
+        self.assertIn("当前基底复杂度状态", summary)
         self.assertIn("当前基底复杂度余量", summary)
         self.assertIn("family", summary)
         self.assertIn("function", summary)
@@ -1262,11 +1265,6 @@ class JournalPromptFixesTest(unittest.TestCase):
             blocks.append("")
         return "\n".join(blocks)
 
-    def test_candidate_schema_allows_listing_all_touched_regions(self):
-        schema = build_candidate_response_schema()
-
-        self.assertEqual(schema["properties"]["edited_regions"]["maxItems"], len(EDITABLE_REGIONS))
-
     def test_build_strategy_agents_instructions_mentions_15m_single_source_and_flow(self):
         prompt = build_strategy_agents_instructions()
 
@@ -1388,15 +1386,19 @@ class JournalPromptFixesTest(unittest.TestCase):
         self.assertIn("只根据当前提示里的 round brief 或 repair 指令", prompt)
         self.assertIn("完成编辑后只回复 `EDIT_DONE`", prompt)
 
-    def test_build_strategy_candidate_summary_prompt_mentions_do_not_edit(self):
-        prompt = build_strategy_candidate_summary_prompt(
-            diff_summary=["- old", "+ new"],
-            changed_regions=("strategy", "long_final_veto_clear"),
+    def test_build_strategy_round_brief_repair_prompt_mentions_required_fields(self):
+        prompt = build_strategy_round_brief_repair_prompt(
+            retry_attempt=1,
+            invalid_reason="planner round brief missing required fields: novelty_proof, change_tags",
+            missing_fields=("novelty_proof", "change_tags"),
+            raw_response_excerpt="我觉得应该继续优化多头，但先不写字段。",
         )
 
-        self.assertIn("不要再修改任何文件", prompt)
-        self.assertIn("strategy, long_final_veto_clear", prompt)
-        self.assertIn("只描述当前已经落到代码里的改动", prompt)
+        self.assertIn("同轮补正", prompt)
+        self.assertIn("novelty_proof", prompt)
+        self.assertIn("change_tags", prompt)
+        self.assertIn("不要输出随笔", prompt)
+        self.assertIn("纯文本候选摘要", prompt)
 
     def test_build_strategy_prompts_include_precise_complexity_budgets(self):
         system_prompt = build_strategy_agents_instructions()
@@ -1412,9 +1414,9 @@ class JournalPromptFixesTest(unittest.TestCase):
             self.assertIn("`_is_sideways_regime`: lines <= 90 / bool_ops <= 32 / ifs <= 14", prompt)
             self.assertIn("`_trend_followthrough_ok`: lines <= 90 / bool_ops <= 36 / ifs <= 12", prompt)
             self.assertIn("`strategy`: lines <= 360 / bool_ops <= 180 / ifs <= 12", prompt)
-            self.assertIn("任一监控函数: lines <= +40 / bool_ops <= +20 / ifs <= +4", prompt)
+            self.assertIn("warning_1: 任一监控函数或决策链 family 接近 lines +24 / bool_ops +12 / ifs +3", prompt)
             self.assertIn("`long_path_chain`", prompt)
-            self.assertIn("任一决策链 family: lines <= +40 / bool_ops <= +20 / ifs <= +4", prompt)
+            self.assertIn("warning_2: 任一监控函数或决策链 family 接近 lines +34 / bool_ops +17 / ifs +4", prompt)
 
     def test_build_strategy_research_prompt_can_include_current_complexity_headroom(self):
         headroom_text = "当前基底复杂度余量（剩余越小越容易再次撞复杂度）:\n- family `trend_quality_family`: lines 剩 8, bool_ops 剩 0, ifs 剩 3"
@@ -1651,6 +1653,30 @@ core_factors: veto_pressure | 当前长侧最后一层否决过重 | long_final_
         self.assertEqual(payload["change_tags"], ["long", "merge_veto", "strategy"])
         self.assertEqual(len(payload["expected_effects"]), 2)
         self.assertEqual(payload["core_factors"][0]["name"], "veto_pressure")
+        self.assertIn("__raw_text__", payload)
+
+    def test_parse_model_candidate_payload_without_field_contract_no_longer_auto_fills_brief(self):
+        payload = research_script._parse_model_candidate_payload(
+            "我觉得应该继续优化多头 outer_context，但先不按字段格式返回。"
+        )
+
+        self.assertEqual(payload["hypothesis"], "")
+        self.assertEqual(payload["change_plan"], "")
+        self.assertEqual(payload["change_tags"], [])
+        self.assertEqual(payload["novelty_proof"], "")
+
+    def test_validate_round_brief_payload_rejects_missing_core_fields(self):
+        payload = research_script._parse_model_candidate_payload(
+            """
+candidate_id: candidate_bad
+hypothesis: 继续优化多头
+change_plan: 放宽 long_outer_context_ok
+expected_effects: 提高多头上车
+"""
+        )
+
+        with self.assertRaisesRegex(StrategySourceError, "novelty_proof, change_tags"):
+            research_script._validate_round_brief_payload(payload)
 
     def test_candidate_from_payload_uses_system_changed_regions_not_declared_regions(self):
         base_source = self._minimal_strategy_source()
@@ -2637,6 +2663,36 @@ class FreqtradeAdapterFixesTest(unittest.TestCase):
             payload = json.loads(temp_paths.session_state_file.read_text())
             self.assertEqual(payload["session_id"], "session-123")
             self.assertNotIn("invalid_generation_streak", payload)
+            self.assertEqual(payload["factor_change_mode"], "default")
+
+    def test_maybe_reset_research_session_for_factor_mode_clears_session_on_mode_change(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            temp_paths = replace(
+                research_script.RUNTIME.paths,
+                session_state_file=temp_root / "state/session.json",
+            )
+            temp_runtime = replace(research_script.RUNTIME, paths=temp_paths, base_factor_change_mode="default")
+
+            with mock.patch.object(research_script, "RUNTIME", temp_runtime), mock.patch.object(
+                research_script, "best_source", "def strategy(*args, **kwargs):\n    return None\n"
+            ), mock.patch.object(
+                research_script, "best_report", object()
+            ), mock.patch.object(
+                research_script, "champion_report", None
+            ), mock.patch.object(
+                research_script, "reference_stage_started_at", "2026-04-21T00:00:00+00:00"
+            ), mock.patch.object(
+                research_script, "reference_stage_iteration", 7
+            ):
+                research_script._store_research_session_metadata(
+                    session_id="session-123",
+                    workspace_root=temp_root / "workspace",
+                    factor_change_mode="default",
+                )
+                research_script._maybe_reset_research_session_for_factor_mode("factor_admission")
+
+            self.assertFalse(temp_paths.session_state_file.exists())
 
     def test_journal_summary_limits_recent_rows_and_meta_lines_to_requested_limit(self):
         entries = []
@@ -3255,11 +3311,47 @@ class SmokeWindowSelectionTest(unittest.TestCase):
 
 
 class ResearcherAdaptiveModeTest(unittest.TestCase):
-    def test_resolve_iteration_factor_change_mode_triggers_factor_admission_after_stalls(self):
+    def test_resolve_iteration_factor_change_mode_enters_reminder_band_after_five_stalls(self):
         entries = [
             {"iteration": 1, "outcome": "behavioral_noop", "score_regime": research_script.SCORE_REGIME},
             {"iteration": 2, "outcome": "exploration_blocked", "score_regime": research_script.SCORE_REGIME},
             {"iteration": 3, "outcome": "rejected", "promotion_delta": 0.0, "score_regime": research_script.SCORE_REGIME},
+            {"iteration": 4, "outcome": "duplicate_skipped", "promotion_delta": 0.0, "score_regime": research_script.SCORE_REGIME},
+            {"iteration": 5, "outcome": "runtime_failed", "decision_reason": "complexity budget exceeded", "score_regime": research_script.SCORE_REGIME},
+        ]
+
+        with mock.patch.object(
+            research_script,
+            "RUNTIME",
+            replace(research_script.RUNTIME, base_factor_change_mode="default"),
+        ):
+            mode, reason = research_script._resolve_iteration_factor_change_mode(entries)
+
+        self.assertEqual(mode, "default")
+        self.assertIn("连续 5 轮", reason)
+        self.assertIn("提醒区", reason)
+
+    def test_resolve_iteration_factor_change_state_enters_strong_suggestion_band_after_seven_stalls(self):
+        entries = [
+            {"iteration": idx + 1, "outcome": "behavioral_noop", "score_regime": research_script.SCORE_REGIME}
+            for idx in range(7)
+        ]
+
+        with mock.patch.object(
+            research_script,
+            "RUNTIME",
+            replace(research_script.RUNTIME, base_factor_change_mode="default"),
+        ):
+            state = research_script._resolve_iteration_factor_change_state(entries)
+
+        self.assertEqual(state["mode"], "default")
+        self.assertEqual(state["guidance_level"], "suggest")
+        self.assertEqual(state["trailing_stalls"], 7)
+
+    def test_resolve_iteration_factor_change_mode_triggers_factor_admission_after_ten_stalls(self):
+        entries = [
+            {"iteration": idx + 1, "outcome": "behavioral_noop", "score_regime": research_script.SCORE_REGIME}
+            for idx in range(10)
         ]
 
         with mock.patch.object(
@@ -3270,8 +3362,8 @@ class ResearcherAdaptiveModeTest(unittest.TestCase):
             mode, reason = research_script._resolve_iteration_factor_change_mode(entries)
 
         self.assertEqual(mode, "factor_admission")
-        self.assertIn("连续 3 轮", reason)
-        self.assertIn("第 1/2 轮", reason)
+        self.assertIn("连续 10 轮", reason)
+        self.assertIn("第 1/4 轮", reason)
 
     def test_resolve_iteration_factor_change_mode_returns_base_mode_after_positive_delta(self):
         entries = [

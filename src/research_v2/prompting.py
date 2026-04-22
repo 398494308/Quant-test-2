@@ -8,7 +8,7 @@ from research_v2.journal import ORDINARY_REGION_FAMILIES
 from research_v2.strategy_code import (
     COMPLEXITY_ABSOLUTE_BUDGETS,
     COMPLEXITY_FAMILY_ABSOLUTE_BUDGETS,
-    COMPLEXITY_DEFAULT_GROWTH_LIMITS,
+    complexity_growth_warning_thresholds,
     REQUIRED_FUNCTIONS,
     factor_change_mode_label,
     factor_change_mode_prompt_hint,
@@ -71,14 +71,19 @@ def _complexity_budget_text() -> str:
             f"- `{family_name}`: lines <= {limits['lines']} / bool_ops <= {limits['bool_ops']} / ifs <= {limits['ifs']}"
         )
 
-    growth = COMPLEXITY_DEFAULT_GROWTH_LIMITS
-    absolute_lines.append("默认模式单轮增量上限（相对当前基底，超了直接拒收）:")
+    growth_thresholds = complexity_growth_warning_thresholds()
+    warning_1 = growth_thresholds["warning_1"]
+    warning_2 = growth_thresholds["warning_2"]
+    absolute_lines.append("默认模式单轮增量预警线（相对当前基底，不是硬拒收）:")
     absolute_lines.append(
-        f"- 任一监控函数: lines <= +{growth['lines']} / bool_ops <= +{growth['bool_ops']} / ifs <= +{growth['ifs']}"
+        f"- warning_1: 任一监控函数或决策链 family 接近 lines +{warning_1['lines']} / "
+        f"bool_ops +{warning_1['bool_ops']} / ifs +{warning_1['ifs']}"
     )
     absolute_lines.append(
-        f"- 任一决策链 family: lines <= +{growth['lines']} / bool_ops <= +{growth['bool_ops']} / ifs <= +{growth['ifs']}"
+        f"- warning_2: 任一监控函数或决策链 family 接近 lines +{warning_2['lines']} / "
+        f"bool_ops +{warning_2['bool_ops']} / ifs +{warning_2['ifs']}"
     )
+    absolute_lines.append("- warning_1 开始提醒压缩；warning_2 表示下一步应优先删旧/合并；只有绝对硬上限才会直接拒收。")
     absolute_lines.append("- 若想新增条件，必须同步删旧条件、合并旧分支，优先保持净复杂度不增长。")
     return "\n".join(absolute_lines)
 
@@ -129,62 +134,16 @@ def build_edit_completion_instructions() -> str:
 - 不要输出 hypothesis、change_plan、JSON、markdown 或源码；这些会在落码成功后由下一阶段单独收集。"""
 
 
-def build_candidate_response_schema() -> dict[str, Any]:
-    return {
-        "type": "object",
-        "properties": {
-            "candidate_id": {"type": "string"},
-            "hypothesis": {"type": "string"},
-            "change_plan": {"type": "string"},
-            "closest_failed_cluster": {"type": "string"},
-            "novelty_proof": {"type": "string"},
-            "change_tags": {
-                "type": "array",
-                "items": {"type": "string"},
-                "minItems": 1,
-                "maxItems": 6,
-            },
-            "edited_regions": {
-                "type": "array",
-                "items": {"type": "string", "enum": list(EDITABLE_REGIONS)},
-                "minItems": 1,
-                "maxItems": len(EDITABLE_REGIONS),
-            },
-            "expected_effects": {
-                "type": "array",
-                "items": {"type": "string"},
-                "minItems": 1,
-                "maxItems": 5,
-            },
-            "core_factors": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string"},
-                        "thesis": {"type": "string"},
-                        "current_signal": {"type": "string"},
-                    },
-                    "required": ["name", "thesis", "current_signal"],
-                    "additionalProperties": False,
-                },
-                "minItems": 0,
-                "maxItems": 4,
-            },
-        },
-        "required": [
-            "candidate_id",
-            "hypothesis",
-            "change_plan",
-            "closest_failed_cluster",
-            "novelty_proof",
-            "change_tags",
-            "edited_regions",
-            "expected_effects",
-            "core_factors",
-        ],
-        "additionalProperties": False,
-    }
+def _text_only_output_contract() -> str:
+    return "只返回约定字段的纯文本候选摘要，不要输出 JSON、markdown、解释或源码。"
+
+
+def _single_strategy_file_scope_rule() -> str:
+    return "除非当前提示明确允许，否则不要创建、修改或删除 `src/strategy_macd_aggressive.py` 之外的文件。"
+
+
+def _missing_memory_is_not_no_edit_rule() -> str:
+    return "若辅助记忆文件暂时不可用，也必须继续基于当前 `src/strategy_macd_aggressive.py` 做真实改动；禁止把“未读到文件”当成合法终止条件。"
 
 
 # ==================== Prompt 组装 ====================
@@ -233,6 +192,7 @@ def build_strategy_agents_instructions(*, factor_change_mode: str = "default") -
 - 明确要求：不要“堆屎”。很多你想到的过滤、例外、path 或 veto，当前策略里往往已经以别的名字存在；新增前先检查现有规则块、阈值和最终放行链是否已经表达了同一因果。
 - 若现有脚本里已经有近似逻辑，不要换个名字再写一份重复条件；优先删旧、并旧、改旧，禁止把同一因果链在不同 helper / path / veto 里重复实现。
 - 明确允许结构性删减轮：`remove_dead_gate`、`merge_veto`、`widen_outer_context` 都是合法 change_tags；这类轮次的目标是减少死分支、提高 reachability。
+- `factor_admission` 是临时逃生口，不是常态路线；系统会按当前 stage stall 情况给出提醒、强提醒或强制切换。
 - {factor_change_mode_prompt_hint(factor_change_mode)}
 {complexity_budget_text}
 
@@ -261,9 +221,9 @@ def build_strategy_system_prompt(*, factor_change_mode: str = "default") -> str:
 - {factor_change_mode_prompt_hint(factor_change_mode)}
 
 你在一个持久研究 session 中工作；当前用户提示只补充本轮目标、诊断和失败反馈。
-只返回约定字段的纯文本候选摘要，不要输出 JSON、markdown、解释或源码。
-除非当前提示明确允许，否则不要创建、修改或删除 `src/strategy_macd_aggressive.py` 之外的文件。
-若辅助记忆文件暂时不可用，也必须继续基于当前 `src/strategy_macd_aggressive.py` 做真实改动；禁止把“未读到文件”当成合法终止条件。
+{_text_only_output_contract()}
+{_single_strategy_file_scope_rule()}
+{_missing_memory_is_not_no_edit_rule()}
 """
 
 
@@ -280,10 +240,10 @@ def build_strategy_worker_system_prompt(
 你当前是短生命周期 `{worker_kind}`，不是持久研究 planner。
 - 不要重新做全量历史研究，不要重新定义本轮方向。
 - 只根据当前提示里的 round brief 或 repair 指令，直接修改 `src/strategy_macd_aggressive.py`。
-- 除非当前提示明确允许，否则不要创建、修改或删除其他文件。
+- {_single_strategy_file_scope_rule()}
 - 完成编辑后只回复 `EDIT_DONE`。
 - 禁止输出 JSON、markdown、解释、计划或源码。
-- 若辅助记忆文件暂时不可用，也必须继续基于当前 `src/strategy_macd_aggressive.py` 做真实改动；禁止把“未读到文件”当成合法终止条件。
+- {_missing_memory_is_not_no_edit_rule()}
 """
 
 
@@ -307,9 +267,10 @@ def _side_bias_guidance(reference_metrics: dict[str, Any] | None) -> str:
             "多空强化偏置（软引导，不是硬限制）:\n"
             f"- 当前主参考 val 多头/空头捕获 = {bull:.2f} / {bear:.2f}，命中率 = {hit_rate:.0%}。\n"
             "- 这说明空头已有可用基础，但多头仍明显偏弱，继续把主要探索预算投入空头，边际收益大概率更低。\n"
-            "- 本轮默认优先考虑 `long` 或 `mixed` 假设：先补多头的到来、接力、二次启动、陪跑，而不是继续抛光空头。\n"
+            "- 本轮默认优先考虑 `long` 或 `mixed` 假设：优先修多头，但不要在进入思考前就预设根因一定在 `outer_context`、`final_veto` 或某个固定 helper。\n"
             "- 这不是禁止修改空头；只有当某个 mixed 假设能在基本不破坏空头的前提下补多头，或空头出现新的硬伤时，才值得继续动 short。\n"
-            "- 若选择 mixed 方案，`expected_effects` 的第一优先级应是改善多头捕获/命中率，第二优先级才是维持空头不明显恶化。"
+            "- 若选择 mixed 方案，`expected_effects` 的第一优先级应是改善多头捕获/命中率，第二优先级才是维持空头不明显恶化。\n"
+            "- 默认先做“目标导向”判断：多头问题更像卡在到来、陪跑、过早出清、还是最终路由错配；先定目标，再定具体 choke point。"
         )
 
     if bull < 0.05 <= bear:
@@ -317,7 +278,8 @@ def _side_bias_guidance(reference_metrics: dict[str, Any] | None) -> str:
             "多空强化偏置（软引导，不是硬限制）:\n"
             f"- 当前主参考 val 多头/空头捕获 = {bull:.2f} / {bear:.2f}。\n"
             "- 当前更值得优先探索的是多头侧，因为空头至少已经过线，而多头仍接近或低于门槛。\n"
-            "- 默认优先做能补多头捕获的 `long` 或 `mixed` 假设，但不要为了补多头而粗暴破坏空头主框架。"
+            "- 默认优先做能补多头捕获的 `long` 或 `mixed` 假设，但不要为了补多头而粗暴破坏空头主框架。\n"
+            "- 先判断多头是卡在 arrival / escort / turn / routing 哪一段，再决定改哪一层规则；不要把“多头弱”直接翻译成“继续 widen outer_context”。"
         )
 
     return ""
@@ -342,7 +304,7 @@ def _champion_focus_hint(reference_metrics: dict[str, Any] | None) -> str:
     return (
         "当前 champion 缺陷（软诊断，不是硬限制）: "
         + "；".join(signals)
-        + "。优先尝试能补多头延续持有或减少过早出清的假设；若其他方向更能改善 gate，可以跳出这条提示。"
+        + "。优先尝试能补多头延续持有、提高到来质量或减少过早出清的假设；若其他方向更能改善 gate，可以跳出这条提示。"
     )
 
 
@@ -355,6 +317,7 @@ def build_strategy_research_prompt(
     score_regime: str = "trend_capture_v6",
     promotion_min_delta: float = 0.02,
     factor_change_mode: str = "default",
+    factor_mode_status_text: str = "",
     current_complexity_headroom_text: str = "",
     session_mode: str = "resume",
     operator_focus_text: str = "",
@@ -374,6 +337,11 @@ def build_strategy_research_prompt(
             f"- 文件: `{operator_focus_path}`\n"
             f"{operator_focus_text.strip()}\n"
         )
+    factor_mode_status_block = (
+        f"本轮因子准入节奏：\n- {factor_mode_status_text.strip()}\n"
+        if factor_mode_status_text.strip()
+        else ""
+    )
     complexity_headroom_block = (
         f"\n{current_complexity_headroom_text}\n"
         if current_complexity_headroom_text.strip()
@@ -416,19 +384,22 @@ def build_strategy_research_prompt(
 7. 若仍落在同方向簇或同 ordinary family，必须证明这次改的是不同 choke point、不同最终放行链，或不同的真实交易路径层级；`strategy-only` 也可以，但必须说清它改变了哪一层最终路由。
 
 当前因子模式：{factor_change_mode_label(factor_change_mode)}
+{factor_mode_status_block}
 
 {evaluation_summary}
 
 本轮执行框架：
 - 先判断最大短板是在多头、空头、到来、陪跑还是掉头；再提出单一因果假设。
-- 如果目标是补早段 long / short，先看外层总闸门：长侧先看 `long_outer_context_ok`，空侧先看 `short_outer_context_ok`。
+- 先确定“目标侧 + 目标环节”：是补 long arrival、long escort、long turn、short stability，还是修最终 routing；先定目标，再决定具体改哪个 choke point。
+- 如果目标是补早段 long / short，可以检查外层总闸门：长侧先看 `long_outer_context_ok`，空侧先看 `short_outer_context_ok`；但不要把这句话理解成“默认继续 widen outer_context”。
 - 新增 path 不等于新增交易；必须继续检查最终合流与否决链。长侧重点看 `long_signal_path_ok -> long_final_veto_clear -> _trend_followthrough_long()`，空侧重点看 `breakdown_ready -> short_final_veto_clear -> _trend_followthrough_short()`。
 - 如果主要改 `_trend_followthrough_ok()`、`_trend_quality_ok()` 或 `_flow_confirmation_ok()`，必须确认现有 `strategy()` 路径会触达；否则优先改 `strategy()`。
 - 若最近连续出现 `behavioral_noop` 或结果盆地重复，本轮默认必须放大步长：优先切不同方向簇，或切不同 choke point / 最终放行链；不要只换措辞、tag 或近邻阈值。
-- 若漏斗诊断显示一侧长期 0 交易、outer_context 几乎全死，或 path 能过但 final_veto 基本全死，优先做结构性删减轮：`remove_dead_gate` / `merge_veto` / `widen_outer_context`。
-- 默认模式下有复杂度预算：如果你想加一条新条件，必须同步删掉或合并旧条件，避免 `strategy()` 和关键 helper 再次膨胀。
+- 若漏斗诊断显示一侧长期 0 交易、outer_context 几乎全死，或 path 能过但 final_veto 基本全死，可以考虑结构性删减轮：`remove_dead_gate` / `merge_veto` / `widen_outer_context`；但只有在它仍是当前最可能改变真实交易路径的根因时才这样做。
+- 默认模式下复杂度采用提醒档而不是增量硬拒收：如果你想加一条新条件，仍必须同步删掉或合并旧条件，避免 `strategy()` 和关键 helper 再次膨胀。
 - 若 headroom 显示某 family 的 `bool_ops` 已经剩余 `0`，或 `lines` 剩余不超过 `8`，默认把它视为饱和区；除非本轮 `change_plan` 明确先删旧条件，否则不要再把主改动落到该 family。
 - 若你的主要假设是最终路由或最终 veto 错配，允许只改 `strategy()` 或少量结构化 helper；但必须在 `change_plan` 里写清楚它会新增、删除或迁移哪类真实交易。
+- 如果当前 stage 明确显示某个簇或某种补法已经过热，不要只因为“弱侧还是 long”就继续留在同一路线；优先切到能修 long 但机制不同的方案。
 - 读不到 `{duplicate_watchlist_path}`、`{failure_wiki_path}` 或 `{history_package_path}` 不是合法 no-edit 理由；当前源码仍是硬事实源，必须继续改代码。
 {complexity_headroom_block}
 
@@ -535,32 +506,33 @@ def build_strategy_no_edit_repair_prompt(
 """
 
 
-def build_strategy_candidate_summary_prompt(
+def build_strategy_round_brief_repair_prompt(
     *,
-    diff_summary: list[str],
-    changed_regions: tuple[str, ...],
+    retry_attempt: int,
+    invalid_reason: str,
+    missing_fields: tuple[str, ...],
+    raw_response_excerpt: str,
 ) -> str:
-    diff_text = "\n".join(f"- {line}" for line in diff_summary[:12]) or "- 无摘要"
-    changed_regions_text = ", ".join(changed_regions) if changed_regions else "-"
-    return f"""代码修改已完成。现在进入摘要阶段。
+    missing_text = ", ".join(missing_fields) if missing_fields else "-"
+    excerpt_text = raw_response_excerpt or "-"
+    return f"""上一条 planner round brief 无效，这是第 {retry_attempt} 次同轮补正。
 
-注意：
-- 不要再修改任何文件。
-- 不要继续编辑 `src/strategy_macd_aggressive.py`；主进程现在只需要你总结已经落地的改动。
-- 如果你发现代码与原计划不一致，也不要继续改代码，直接按当前实际代码总结。
+任务没有改变：继续当前这一轮的研究方向，但必须把输出修正成合法 round brief。
 
-系统检测到的真实改动区域：
-- {changed_regions_text}
+本次无效原因：
+- {invalid_reason}
+- 缺失或无效的核心字段: {missing_text}
+- 上一条回复摘录: {excerpt_text}
 
-当前 diff 摘要：
-{diff_text}
+补正规则：
+- 不要输出随笔、自然段解释、JSON 或 markdown。
+- 必须输出完整字段头，并确保 `hypothesis`、`change_plan`、`novelty_proof`、`change_tags` 非空。
+- `candidate_id` 可以保留原值或重写；`closest_failed_cluster` 仍可留空让系统回填。
+- `expected_effects` 与 `core_factors` 可以为空，但如果填写，必须和本轮方向一致。
+- 不要把“未读到文件”“blocked”“no_edit”“未执行代码改动”当成 round brief 内容。
 
 输出要求：
 {build_candidate_response_format_instructions()}
-- 只描述当前已经落到代码里的改动，不要描述“本来想改但没改成”的内容。
-- `change_plan` 与 `novelty_proof` 必须明确写出已经新增、删除或迁移了哪类实际交易。
-- `closest_failed_cluster` 必须写最接近的旧失败方向簇。
-- `core_factors` 没有就输出 `none`。
 """
 
 
