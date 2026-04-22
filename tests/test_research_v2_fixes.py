@@ -1272,6 +1272,7 @@ class JournalPromptFixesTest(unittest.TestCase):
 
         self.assertIn("15m` 是唯一事实源", prompt)
         self.assertIn("方向流量代理", prompt)
+        self.assertIn("config/research_v2_operator_focus.md", prompt)
         self.assertIn("wiki/duplicate_watchlist.md", prompt)
         self.assertIn("wiki/failure_wiki.md", prompt)
         self.assertIn("默认模式", prompt)
@@ -1295,6 +1296,19 @@ class JournalPromptFixesTest(unittest.TestCase):
         self.assertIn("round brief", prompt)
         self.assertIn("change_plan", prompt)
         self.assertIn("novelty_proof", prompt)
+
+    def test_build_strategy_runtime_prompt_can_include_operator_focus(self):
+        prompt = build_strategy_research_prompt(
+            evaluation_summary="诊断",
+            journal_summary="记忆",
+            previous_best_score=1.23,
+            operator_focus_text="- 优先检查多头外层 choke point\n- 降权同义 gate 堆叠",
+            operator_focus_path="config/research_v2_operator_focus.md",
+        )
+
+        self.assertIn("人工方向卡（软引导，不是硬限制", prompt)
+        self.assertIn("config/research_v2_operator_focus.md", prompt)
+        self.assertIn("优先检查多头外层 choke point", prompt)
 
     def test_build_strategy_agents_instructions_mentions_all_required_symbols(self):
         prompt = build_strategy_agents_instructions()
@@ -1449,8 +1463,9 @@ class JournalPromptFixesTest(unittest.TestCase):
         )
 
         self.assertIn("blocked_cluster: ownership_cluster", prompt)
+        self.assertIn("近期高频失败/过热方向（软提示）", prompt)
         self.assertIn("ownership_cluster(剩余3轮)", prompt)
-        self.assertIn("必须绕开系统刚刚拒收的近邻方向", prompt)
+        self.assertIn("必须绕开刚被验证失败的近邻方向", prompt)
 
     def test_build_strategy_exploration_repair_prompt_mentions_feedback_note(self):
         prompt = build_strategy_exploration_repair_prompt(
@@ -1815,9 +1830,7 @@ def strategy(*args, **kwargs):
             current_iteration=4,
         )
 
-        self.assertIsNotNone(block)
-        self.assertEqual(block["block_kind"], "same_cluster")
-        self.assertEqual(block["lock_rounds"], 0)
+        self.assertIsNone(block)
 
     def test_evaluate_candidate_exploration_guard_uses_system_changed_regions_over_declared_metadata(self):
         base_source = """
@@ -1921,8 +1934,7 @@ def strategy(*args, **kwargs):
             editable_regions=EDITABLE_REGIONS,
         )
 
-        self.assertIsNotNone(block)
-        self.assertEqual(block["block_kind"], "same_cluster")
+        self.assertIsNone(block)
 
     def test_evaluate_candidate_exploration_guard_applies_lock_on_second_blocked_round(self):
         entries = [
@@ -1950,10 +1962,7 @@ def strategy(*args, **kwargs):
             current_iteration=5,
         )
 
-        self.assertIsNotNone(block)
-        self.assertEqual(block["block_kind"], "same_cluster")
-        self.assertEqual(block["lock_rounds"], 3)
-        self.assertEqual(block["lock_level"], 1)
+        self.assertIsNone(block)
 
     def test_build_exploration_guard_state_avoids_double_count_with_compact(self):
         entries = [
@@ -2013,7 +2022,7 @@ def strategy(*args, **kwargs):
 
         self.assertEqual(state["history_counts"]["ownership_cluster"]["same_cluster_rounds"], 2)
 
-    def test_journal_summary_emits_direction_cooling_board(self):
+    def test_journal_summary_omits_direction_cooling_board(self):
         entries = [
             {
                 "iteration": 4,
@@ -2044,9 +2053,9 @@ def strategy(*args, **kwargs):
             current_iteration=5,
         )
 
-        self.assertIn("方向冷却表", summary)
+        self.assertNotIn("方向冷却表", summary)
         self.assertIn("ownership_cluster", summary)
-        self.assertIn("COOLING", summary)
+        self.assertIn("方向风险表", summary)
 
 
 class FreqtradeAdapterFixesTest(unittest.TestCase):
@@ -2445,11 +2454,7 @@ class FreqtradeAdapterFixesTest(unittest.TestCase):
             current_iteration=4,
         )
 
-        self.assertIsNotNone(block)
-        self.assertEqual(block["block_kind"], "same_cluster")
-        self.assertTrue(
-            any(label in block["blocked_reason"] for label in ("连续行为无变化", "同一结果盆地反复回落"))
-        )
+        self.assertIsNone(block)
 
     def test_failure_wiki_guard_blocks_exact_cut_after_repeated_noop(self):
         entries = []
@@ -2602,7 +2607,7 @@ class FreqtradeAdapterFixesTest(unittest.TestCase):
         self.assertIn("完全相同", "；".join(block["invalid_reasons"]))
         self.assertIn("先确定一个单一策略方向", block["feedback_note"])
         self.assertIn("把这个方向直接落到 `src/strategy_macd_aggressive.py`", block["feedback_note"])
-        self.assertIn("JSON 只描述你已经实际落到代码里的改动", block["feedback_note"])
+        self.assertIn("文本摘要只描述你已经实际落到代码里的改动", block["feedback_note"])
 
     def test_store_research_session_metadata_no_longer_persists_invalid_generation_streak(self):
         with tempfile.TemporaryDirectory() as temp_dir:

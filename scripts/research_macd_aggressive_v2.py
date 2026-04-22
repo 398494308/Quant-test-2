@@ -339,6 +339,16 @@ def _refresh_prompt_memory_snapshots() -> str:
     )
 
 
+def _load_operator_focus_text(*, max_chars: int = 1800) -> str:
+    path = RUNTIME.paths.operator_focus_file
+    if not path.exists():
+        return ""
+    text = path.read_text().strip()
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars].rstrip()}\n\n[operator focus 已按长度截断]"
+
+
 def _ensure_workspace_link(link_path: Path, target_path: Path) -> None:
     link_path.parent.mkdir(parents=True, exist_ok=True)
     if link_path.is_symlink():
@@ -378,6 +388,11 @@ def _prepare_agent_workspace(
     )
 
     _ensure_workspace_link(workspace_root / "src/backtest_macd_aggressive.py", RUNTIME.paths.backtest_file)
+    if RUNTIME.paths.operator_focus_file.exists():
+        _ensure_workspace_link(
+            workspace_root / "config/research_v2_operator_focus.md",
+            RUNTIME.paths.operator_focus_file,
+        )
     if (REPO_ROOT / "data").exists():
         _ensure_workspace_link(workspace_root / "data", REPO_ROOT / "data")
     _ensure_workspace_link(workspace_root / "memory", RUNTIME.paths.memory_dir)
@@ -482,14 +497,6 @@ def _model_client_config():
         sandbox="danger-full-access",
         use_ephemeral=False,
         dangerously_bypass_approvals_and_sandbox=True,
-    )
-
-
-def _cluster_lock_schedule() -> tuple[int, int, int]:
-    return (
-        RUNTIME.cluster_lock_rounds_stage1,
-        RUNTIME.cluster_lock_rounds_stage2,
-        RUNTIME.cluster_lock_rounds_stage3,
     )
 
 
@@ -1329,7 +1336,6 @@ def _behavioral_noop_block_info(
     changed_regions = ", ".join(sorted(candidate_signature["changed_regions"])) or "-"
     ordinary_families = ", ".join(sorted(candidate_signature["ordinary_region_families"])) or "-"
     target_family = str(candidate_signature.get("target_family", "")).strip() or "-"
-    current_locks: tuple[str, ...] = ()
     feedback_lines = [
         f"- smoke窗口: {smoke_windows}",
         (
@@ -1369,11 +1375,11 @@ def _behavioral_noop_block_info(
             "- 空侧最终还要穿过 `breakdown_ready + short_final_veto_clear + _trend_followthrough_short()`；只补局部 confirmation，未必会改变真实 short 集合。"
         )
     if noop_streak >= 2:
-        if cluster_key != "-":
-            current_locks = (f"{cluster_key}(本轮 behavioral_noop 后禁止沿用原叙事)",)
         feedback_lines.append(
-            "- 最近已连续多次 behavior 无变化；这次必须明显加大步长：优先切不同方向簇，"
-            "若留在同簇，允许直接覆盖 2-4 个普通 family，但仍必须围绕一个单一假设，不要只改 strategy/PARAMS 或单个细阈值。"
+            "- 最近已连续多次 behavior 无变化；这次必须明显加大步长：优先切不同方向簇。"
+        )
+        feedback_lines.append(
+            "- 如果仍留在同簇，必须明确更换外层 choke point、最终 veto/followthrough 或目标侧，不要只拨单个细阈值。"
         )
         feedback_lines.append(
             "- 默认把上一版局部 hypothesis / change_plan 视为已被证伪，不要只换候选名、tag 或措辞。"
@@ -1382,7 +1388,7 @@ def _behavioral_noop_block_info(
         "block_kind": "behavioral_noop",
         "blocked_cluster": cluster_key,
         "blocked_reason": "smoke 行为指纹与当前主参考完全一致",
-        "current_locks": current_locks,
+        "current_locks": tuple(),
         "feedback_note": "\n".join(feedback_lines),
     }
 
@@ -2034,6 +2040,8 @@ def _build_model_round_brief(
         factor_change_mode=factor_change_mode,
         current_complexity_headroom_text=format_strategy_complexity_headroom(base_source),
         session_mode=session_mode,
+        operator_focus_text=_load_operator_focus_text(),
+        operator_focus_path="config/research_v2_operator_focus.md",
     )
     return _round_brief_from_payload(
         _run_model_candidate_request(
@@ -3167,7 +3175,6 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
                 current_iteration=iteration_id,
                 base_source=best_source,
                 editable_regions=EDITABLE_REGIONS,
-                lock_schedule=_cluster_lock_schedule(),
                 include_current_round_locks=True,
             )
         if block_info is not None:

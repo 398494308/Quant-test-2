@@ -38,7 +38,7 @@
 研究器每轮会按下面的顺序执行：
 
 1. 读取当前主参考策略。
-2. 进入阶段级持久 workspace：`state/research_macd_aggressive_v2_agent_workspace/`。这里有局部 `AGENTS.md`、可写策略副本、只读 `wiki/` 与 `memory/` 链接。
+2. 进入阶段级持久 workspace：`state/research_macd_aggressive_v2_agent_workspace/`。这里有局部 `AGENTS.md`、人工方向卡、可写策略副本、只读 `wiki/` 与 `memory/` 链接。
 3. 同一 `baseline/champion stage` 内只复用一个 `planner` Codex session；只有当 `champion`、`baseline` 或手工重置 session 时，才会清掉旧 session 并新开一个。
 4. 每轮开始先把当前主参考重新写回 workspace 里的 `src/strategy_macd_aggressive.py`，避免上一轮残留源码污染新一轮。
 5. `planner` 动态 prompt 只补“当前诊断 + 本轮目标 + 本轮失败反馈”；稳定规则放进 workspace 局部 `AGENTS.md`，长历史放进 `wiki/latest_history_package.md` 与 `wiki/failure_wiki.md`。
@@ -46,7 +46,7 @@
 7. 每轮会新开一个短生命周期 `edit_worker` session，只根据 round brief 直接修改 `src/strategy_macd_aggressive.py`；它不复用主 session，也不重扫全量历史。
 8. 主进程基于 round brief 和真实 diff 在本地组装 `StrategyCandidate`；`model_summarize` 已移除，不再让模型在落码后重复自我总结。
 9. 主进程校验候选只修改了允许区域。
-10. 先做评估前硬约束检查；如果候选命中 failure wiki 已封死的 exact cut、仍然是同簇低变化近邻、命中锁簇，或根本没有产出真实源码改动，会在同一轮直接强制重生，而不是白跑评估。
+10. 先做评估前硬约束检查；如果候选命中 failure wiki 已封死的 exact cut，或根本没有产出真实源码改动，会在同一轮直接强制重生，而不是白跑评估。
 11. 通过前置检查后，先跑少量 `smoke` 窗口；如果运行报错或源码校验失败，会在同一轮进入短生命周期 `repair_worker`，而不是把技术修复噪音塞回主研究 session。
 12. `smoke` 通过后，主进程还会对比候选和当前参考在 smoke 窗口里的行为指纹；如果收益、交易数、信号统计、退出原因和交易摘要完全一致，不会立刻结束本轮，而是把 smoke 摘要回灌给 `planner`，在同一轮里强制重生候选。
 13. 只有连续重生后仍然无法改变 smoke 行为，才会正式记一次 `behavioral_noop`。
@@ -127,18 +127,20 @@
 
 ## Prompt 现在怎么组织
 
-当前 prompt 现在拆成“两层主链 + 一层 worker 指令”：
+当前 prompt 现在拆成“两层主链 + 一层人工方向卡 + 一层 worker 指令”：
 
 1. workspace 局部 `AGENTS.md`
-2. `planner` runtime prompt
-3. `wiki/latest_history_package.md`
-4. `wiki/failure_wiki.md`
-5. 短生命周期 worker prompt（只给 `edit_worker / repair_worker`）
+2. `config/research_v2_operator_focus.md`
+3. `planner` runtime prompt
+4. `wiki/latest_history_package.md`
+5. `wiki/failure_wiki.md`
+6. 短生命周期 worker prompt（只给 `edit_worker / repair_worker`）
 
 现在的 prompt 有几个重要变化：
 
 - 不再把整份策略源码塞进 prompt。
 - 稳定规则已经从每轮 system prompt 挪到 workspace 局部 `AGENTS.md`，只影响研究器自己的工作区，不会污染仓库根目录环境。
+- `config/research_v2_operator_focus.md` 用于人工指定当前更值得优先看的方向，但它只是软引导，不会像系统锁一样直接拦候选。
 - `planner` runtime prompt 现在只放本轮动态信息，并显式写出“先目标 -> 再现状 -> 再 failure wiki / history package -> 再提出单一假设 -> 再回看 failure wiki 自检”的阅读顺序。
 - `planner` 现在只产 round brief，不再直接落码；落码和 repair 改由短生命周期 worker 处理。
 - `edit_worker / repair_worker` 不再吃大历史包；它们只接 round brief 或错误上下文，直接改代码后回复 `EDIT_DONE`。
@@ -232,10 +234,8 @@ PY
 
 研究器现在还带了新的防局部最优保护：
 
-- 如果候选只是落在同一方向簇里的低变化近邻，系统会在评估前直接拦截
-- 连续 `behavioral_noop`、重复结果盆地和复杂度连撞都会进入 stall 上下文，后续若仍沿同簇近邻试错，会更快触发放宽或拦截并进入冷却锁
+- 连续 `behavioral_noop`、重复结果盆地和复杂度连撞都会进入 stall 上下文，但现在只作为 prompt 里的软提示，不再用方向冷却硬锁替模型做研究决策
 - 被拦截后不会立刻浪费下一轮，而是会在同一轮里强制重生候选
-- 如果同一方向簇反复触发该问题，会进入短期冷却锁，默认是 `3 -> 6 -> 10` 轮递增
 - 低变化近邻的判定不再主要靠 `closest_failed_cluster / change_tags / edited_regions` 自报，而会同时看真实 diff、参数族变化、AST 派生结构签名和结果盆地重复
 - `smoke` 默认覆盖 `5` 个窗口，当前会取早 train / val / 中前段 train / 中段 train / 尾段 train
 - `smoke` 现在还会比较行为指纹；如果候选和当前参考的 smoke 交易行为完全一致，会先在同一轮回灌 smoke 摘要并强制重生，只有连续重生后仍不变化才记 `behavioral_noop`

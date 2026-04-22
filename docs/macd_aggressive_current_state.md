@@ -103,23 +103,25 @@ test 验收：
 
 ## 当前 prompt 结构
 
-当前 prompt / session 已改成 `planner 主链 + worker 落码`：
+当前 prompt / session 已改成 `planner 主链 + 人工方向卡 + worker 落码`：
 
 1. workspace 局部 `AGENTS.md`
    - 只放稳定项目上下文：项目目标、文件职责、允许修改边界、输出规则、复杂度预算、planner/worker 分工
-2. `planner runtime prompt`
+2. `config/research_v2_operator_focus.md`
+   - 人工可编辑方向卡，只做软引导，不做系统硬限制
+3. `planner runtime prompt`
    - 只放本轮动态信息，但顺序改成：刷新条件与目标 -> 本轮阅读顺序 -> 当前诊断摘要 -> 本轮执行框架
-3. `history package`
+4. `history package`
    - 当前 `stage` 执行摘要
    - 当前 `stage` 失败核聚合
-   - 当前 `stage` 风险/冷却/过热/过拟合附录
+   - 当前 `stage` 风险/过热/过拟合附录
    - 历史 `stage` 压缩摘要
    - 当前评分口径全局统计表
    - 旧评分口径弱参考
-4. `failure wiki`
+5. `failure wiki`
    - markdown 给模型读
    - json 给系统 guard 读
-5. `worker prompt`
+6. `worker prompt`
    - 只给 `edit_worker / repair_worker`
    - 只放 round brief 或 repair 错误上下文，不再塞长历史
 
@@ -127,6 +129,7 @@ test 验收：
 
 - 不再内嵌完整策略源码
 - 稳定规则已经从每轮 system prompt 挪到 workspace 局部 `AGENTS.md`，只作用于 `state/research_macd_aggressive_v2_agent_workspace/`
+- `config/research_v2_operator_focus.md` 现在会直接挂进 workspace，并注入到 `planner runtime prompt`；它是人工方向偏置，不是硬 gate
 - 当前 `baseline/champion stage` 内只复用同一个 `planner` Codex session；`edit_worker / repair_worker` 每次都是短 session
 - `planner runtime prompt` 不再重复塞大量稳定约束，注意力更集中在本轮目标、当前诊断和真实 choke point
 - `planner runtime prompt` 明确要求先看刷新条件和当前诊断，再看 `wiki/latest_history_package.md` 与 `wiki/failure_wiki.md` 的前部摘要
@@ -144,7 +147,7 @@ test 验收：
 - `test` 完全不可见
 - `planner` / `edit_worker` prompt 现在都会附带当前基底最紧张的 complexity headroom，明确显示哪个 family / function 还剩多少 `lines / bool_ops / ifs`
 - 当前 `stage` 只在 prompt 中展示最近有限条表格和元信息，但它们现在后置到摘要之后；完整 `stage` 已另存到 memory 目录
-- journal 里新增 `方向冷却表（系统硬约束）`
+- journal 不再展示 `方向冷却表（系统硬约束）`
 - 防重复规则只保留一份，不再多处复写
 - 如果候选在 smoke 窗口上的行为完全不变，系统会在同一轮回灌 smoke 摘要并强制重生
 - 如果候选在源码校验阶段就因为复杂度预算或复杂度增量超限被拒，系统也会先做同轮 repair；仍修不动才把这轮记进 journal 和记忆包
@@ -202,11 +205,8 @@ Discord 现在只保留：
 - 当前基底策略里，研究器被显式引导优先检查外层总闸门和最终 veto 链，而不是继续把注意力浪费在未触达真实出单层的局部 helper 上
 - 候选报错时会在同一轮进入短生命周期 `repair_worker`
 - 如果候选命中 failure wiki 已封死的 exact cut，会在完整评估前直接被拦回去同轮重生
-- 同簇低变化近邻会在评估前被系统拦截，不再白跑 `smoke/full eval`
-- 连续 `behavioral_noop`、重复结果盆地和复杂度连撞都会被当成 stall，后续若继续沿同簇近邻试错，会更早触发放宽或拦截
+- 连续 `behavioral_noop`、重复结果盆地和复杂度连撞都会被当成 stall，并以 prompt 软提示的方式提醒模型放大步长
 - 被探索硬约束拦截后，会在同一轮里强制重生候选方向
-- 同一方向簇再次触发该机制后，会进入短期冷却锁
-- 冷却锁采用 `3 -> 6 -> 10` 轮递增
 - 低变化近邻判定会同时看真实 diff、参数族变化和 AST 派生结构签名，不再优先相信模型自报的最近失败簇
 - `duplicate source / duplicate hash / empty diff / behavioral_noop / duplicate result basin` 都会写入 journal
 - 其中 `duplicate source / empty diff / blocked_invalid_generation / generation_invalid` 这类技术空转会单独隔离：保留在 raw history，但不会进入 failure wiki exact cut、方向风险表、结果盆地和过热统计

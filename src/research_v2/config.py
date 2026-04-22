@@ -47,6 +47,7 @@ class ResearchPaths:
     repo_root: Path
     strategy_file: Path
     backtest_file: Path
+    operator_focus_file: Path
     log_file: Path
     model_call_log_file: Path
     journal_file: Path
@@ -107,9 +108,6 @@ class ResearchRuntimeConfig:
     max_no_edit_repair_attempts: int
     max_exploration_regen_attempts: int
     max_consecutive_no_edit_failures_before_stop: int
-    cluster_lock_rounds_stage1: int
-    cluster_lock_rounds_stage2: int
-    cluster_lock_rounds_stage3: int
     promotion_min_delta: float
 
 
@@ -123,6 +121,7 @@ def load_research_runtime_config(repo_root: Path) -> ResearchRuntimeConfig:
         repo_root=repo_root,
         strategy_file=repo_root / "src/strategy_macd_aggressive.py",
         backtest_file=repo_root / "src/backtest_macd_aggressive.py",
+        operator_focus_file=repo_root / "config/research_v2_operator_focus.md",
         log_file=repo_root / "logs/macd_aggressive_research_v2.log",
         model_call_log_file=repo_root / "logs/macd_aggressive_research_v2_model_calls.jsonl",
         journal_file=repo_root / "state/research_macd_aggressive_v2_journal.jsonl",
@@ -183,8 +182,5 @@ def load_research_runtime_config(repo_root: Path) -> ResearchRuntimeConfig:
             "MACD_V2_MAX_CONSECUTIVE_NO_EDIT_FAILURES_BEFORE_STOP",
             3,
         ),
-        cluster_lock_rounds_stage1=_env_int("MACD_V2_CLUSTER_LOCK_ROUNDS_STAGE1", 3),
-        cluster_lock_rounds_stage2=_env_int("MACD_V2_CLUSTER_LOCK_ROUNDS_STAGE2", 6),
-        cluster_lock_rounds_stage3=_env_int("MACD_V2_CLUSTER_LOCK_ROUNDS_STAGE3", 10),
         promotion_min_delta=_env_float("MACD_V2_PROMOTION_MIN_DELTA", 0.02),
     )

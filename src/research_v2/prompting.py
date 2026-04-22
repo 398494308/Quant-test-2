@@ -214,6 +214,7 @@ def build_strategy_agents_instructions(*, factor_change_mode: str = "default") -
 工作区文件职责：
 - `src/strategy_macd_aggressive.py`：唯一允许修改的策略文件。
 - `src/backtest_macd_aggressive.py`：回测、成交路径与指标口径定义，只读参考。
+- `config/research_v2_operator_focus.md`：人工方向卡，只是软引导，不是系统硬限制。
 - `wiki/duplicate_watchlist.md`：最近高频重复源码黑名单摘要；先扫它，避免把同一份补丁再交一次。
 - `wiki/failure_wiki.md`：当前评分口径下的失败 wiki；先看它，避免重走已知坏 cut。
 - `wiki/latest_history_package.md`：当前 stage 历史摘要包；先看前部执行摘要与失败核，再决定是否下钻表格。
@@ -356,6 +357,8 @@ def build_strategy_research_prompt(
     factor_change_mode: str = "default",
     current_complexity_headroom_text: str = "",
     session_mode: str = "resume",
+    operator_focus_text: str = "",
+    operator_focus_path: str = "config/research_v2_operator_focus.md",
     history_package_path: str = "wiki/latest_history_package.md",
     failure_wiki_path: str = "wiki/failure_wiki.md",
     duplicate_watchlist_path: str = "wiki/duplicate_watchlist.md",
@@ -364,6 +367,13 @@ def build_strategy_research_prompt(
     side_bias_block = f"\n{side_bias_guidance}\n" if side_bias_guidance else ""
     champion_focus_hint = _champion_focus_hint(reference_metrics)
     champion_focus_block = f"{champion_focus_hint}\n" if champion_focus_hint else ""
+    operator_focus_block = ""
+    if operator_focus_text.strip():
+        operator_focus_block = (
+            "人工方向卡（软引导，不是硬限制，优先服从当前有效诊断）:\n"
+            f"- 文件: `{operator_focus_path}`\n"
+            f"{operator_focus_text.strip()}\n"
+        )
     complexity_headroom_block = (
         f"\n{current_complexity_headroom_text}\n"
         if current_complexity_headroom_text.strip()
@@ -388,6 +398,7 @@ def build_strategy_research_prompt(
 当前 champion 参考晋级分：{previous_best_score:.2f}
 {side_bias_block}
 {champion_focus_block}
+{operator_focus_block}
 本轮本地只读记忆文件：
 - 重复黑名单：`{duplicate_watchlist_path}`
 - 失败 wiki：`{failure_wiki_path}`
@@ -627,11 +638,11 @@ def build_strategy_exploration_repair_prompt(
     regeneration_attempt: int,
     feedback_note: str = "",
 ) -> str:
-    locked_cluster_text = "；".join(locked_clusters) if locked_clusters else "无"
+    hot_cluster_text = "；".join(locked_clusters) if locked_clusters else "无"
     feedback_block = f"\n附加反馈（本次必须处理）:\n{feedback_note}\n" if feedback_note else "\n"
     return f"""你正在同一轮里重生候选方向，不是开始新一轮研究。
 
-这是第 {regeneration_attempt} 次同轮重生。目标是：保持本轮要解决的策略短板大方向不变，但必须绕开系统刚刚拒收的近邻方向，改成一个可进入评估的新方向；如果上一版被 `behavioral_noop` 拒收，默认说明上一版局部因果链已失效，可以直接重写局部 hypothesis / change_plan。
+这是第 {regeneration_attempt} 次同轮重生。目标是：保持本轮要解决的策略短板大方向不变，但必须绕开刚被验证失败的近邻方向，改成一个可进入评估的新方向；如果上一版被 `behavioral_noop` 拒收，默认说明上一版局部因果链已失效，可以直接重写局部 hypothesis / change_plan。
 
 原候选元信息：
 - candidate_id: {candidate_id}
@@ -647,7 +658,7 @@ def build_strategy_exploration_repair_prompt(
 - block_kind: {block_kind}
 - blocked_cluster: {blocked_cluster}
 - blocked_reason: {blocked_reason}
-- 当前处于冷却锁定的方向簇: {locked_cluster_text}
+- 近期高频失败/过热方向（软提示）: {hot_cluster_text}
 {feedback_block}
 
 工作区说明：
@@ -662,9 +673,8 @@ def build_strategy_exploration_repair_prompt(
 
 重生规则：
 - 这不是代码修错；不要只做微小阈值近邻调整然后原样留在被拒簇。
-- 若 `blocked_cluster` 正处于系统冷却中，本轮禁止继续使用该簇。
 - 优先切到不同方向簇。
-- 若确实留在同簇，至少切换普通 family、最终放行链或 long-short target 中的一项；`strategy-only` 结构性改路由是允许的，但必须明确说明为什么这次会触达不同交易路径。
+- 若确实留在同簇，必须明确切换外层 choke point、最终放行链、目标侧或核心规则块中的至少一项；`strategy-only` 结构性改路由是允许的，但必须明确说明为什么这次会触达不同交易路径。
 - 不要只换 tag、只换措辞、或只补一两条很像的条件。
 - 若上一版是 `behavioral_noop`，不要沿用原 hypothesis / change_plan 只换表述；应默认把那条局部路径假设视为已被证伪，并改成新的可触达交易路径。
 - 重生后的候选必须预计改变 smoke 窗口实际交易路径；如果上一版只是 helper / followthrough 变化但没有触发新交易，优先改 `strategy()` 的最终入场路径。
@@ -682,5 +692,5 @@ def build_strategy_exploration_repair_prompt(
 
 输出要求：
 - 返回格式仍然使用同一组纯文本字段，不要 JSON。
-- `novelty_proof` 必须明确说明这次相对刚才被拒方向，具体换了哪一个方向簇/普通 family/long-short target/核心因子家族。
+- `novelty_proof` 必须明确说明这次相对刚才被拒方向，具体换了哪一个 choke point / 最终放行链 / 目标侧 / 关键规则块。
 """

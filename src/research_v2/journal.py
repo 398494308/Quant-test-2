@@ -1451,108 +1451,9 @@ def evaluate_candidate_exploration_guard(
     lock_schedule: tuple[int, ...] = DEFAULT_CLUSTER_LOCK_STEPS,
     include_current_round_locks: bool = False,
 ) -> dict[str, Any] | None:
-    candidate_signature = exploration_signature_for_candidate(
-        candidate,
-        base_source=base_source,
-        editable_regions=editable_regions,
-    )
-    candidate_cluster = str(candidate_signature["cluster_key"]).strip()
-    if not candidate_cluster:
-        return None
-
-    state = build_exploration_guard_state(
-        entries,
-        journal_path=journal_path,
-        score_regime=score_regime,
-        current_iteration=current_iteration,
-        include_current_round_locks=include_current_round_locks,
-    )
-    active_locks = state["active_locks"]
-    if candidate_cluster in active_locks:
-        lock = active_locks[candidate_cluster]
-        return {
-            "block_kind": "locked_cluster",
-            "stop_stage": "blocked_locked_cluster",
-            "blocked_cluster": candidate_cluster,
-            "blocked_reason": (
-                f"命中系统锁簇：`{candidate_cluster}` 仍在冷却中，"
-                f"剩余 {lock['remaining_rounds']} 轮。"
-            ),
-            "lock_applied": False,
-            "lock_rounds": 0,
-            "lock_level": int(lock.get("trigger_count", 0) or 0),
-            "lock_trigger_iteration": int(lock.get("lock_trigger_iteration", 0) or 0),
-            "lock_expires_before_iteration": int(lock.get("lock_expires_before_iteration", 0) or 0),
-            "current_locks": tuple(
-                f"{cluster}(剩余{payload['remaining_rounds']}轮)"
-                for cluster, payload in sorted(
-                    active_locks.items(),
-                    key=lambda item: (-item[1]["remaining_rounds"], item[0]),
-                )
-            ),
-        }
-
-    low_change_context = state["low_change_context"]
-    if low_change_context is None or candidate_cluster != low_change_context["cluster"]:
-        return None
-    if _candidate_has_structural_novelty(candidate_signature, low_change_context):
-        return None
-
-    history_counts = state["history_counts"]
-    same_cluster_rounds = int(history_counts.get(candidate_cluster, {}).get("same_cluster_rounds", 0))
-    lock_trigger_rounds = int(history_counts.get(candidate_cluster, {}).get("lock_trigger_rounds", 0))
-    current_round_count = same_cluster_rounds + 1
-    lock_applied = current_round_count >= 2
-    lock_level = lock_trigger_rounds + 1 if lock_applied else lock_trigger_rounds
-    source_kind = str(low_change_context.get("source_kind", "")).strip()
-    if source_kind == "noop":
-        source_label = "连续行为无变化"
-    elif source_kind == "repeated_basin":
-        source_label = "同一结果盆地反复回落"
-    else:
-        source_label = "低变化打转"
-    if lock_applied:
-        schedule_index = min(max(lock_level - 1, 0), max(len(lock_schedule) - 1, 0))
-        lock_rounds = int(lock_schedule[schedule_index])
-        lock_expires_before_iteration = current_iteration + lock_rounds + 1
-        blocked_reason = (
-            f"同簇低变化近邻：`{candidate_cluster}` 最近持续{source_label}，"
-            f"当前候选未切出新交易路径；该簇将冷却 {lock_rounds} 轮。"
-        )
-    else:
-        lock_rounds = 0
-        lock_expires_before_iteration = 0
-        blocked_reason = (
-            f"同簇低变化近邻：`{candidate_cluster}` 最近持续{source_label}，"
-            "当前候选未切换方向簇，也没有形成足够明确的结构性换方向。"
-        )
-
-    return {
-        "block_kind": "same_cluster",
-        "stop_stage": "blocked_same_cluster",
-        "blocked_cluster": candidate_cluster,
-        "blocked_reason": blocked_reason,
-        "lock_applied": lock_applied,
-        "lock_rounds": lock_rounds,
-        "lock_level": lock_level,
-        "lock_trigger_iteration": current_iteration if lock_applied else 0,
-        "lock_expires_before_iteration": lock_expires_before_iteration,
-        "low_change_cluster": candidate_cluster,
-        "low_change_tags": tuple(sorted(low_change_context["tag_union"])),
-        "low_change_regions": tuple(sorted(low_change_context["ordinary_region_families"])),
-        "low_change_changed_regions": tuple(sorted(low_change_context["ordinary_changed_regions"])),
-        "low_change_targets": tuple(sorted(low_change_context["target_families"])),
-        "low_change_factors": tuple(sorted(low_change_context["core_factor_names"])),
-        "low_change_param_families": tuple(sorted(low_change_context["param_families"])),
-        "low_change_structural_tokens": tuple(sorted(low_change_context["structural_tokens"])),
-        "current_locks": tuple(
-            f"{cluster}(剩余{payload['remaining_rounds']}轮)"
-            for cluster, payload in sorted(
-                active_locks.items(),
-                key=lambda item: (-item[1]["remaining_rounds"], item[0]),
-            )
-        ),
-    }
+    # 方向冷却锁和同簇低变化近邻不再作为评估前硬拦截。
+    # 相关统计仍保留给历史摘要、wiki 和人工诊断使用。
+    return None
 
 
 def _direction_risk_board(entries: list[dict[str, Any]], limit: int) -> list[str]:
@@ -1623,43 +1524,6 @@ def _direction_risk_board(entries: list[dict[str, Any]], limit: int) -> list[str
         lines.append(
             f"| {cluster} | {stats['attempts']} | {stats['failures']} | {stats['zero_delta']} | "
             f"{stats['runtime_errors']} | {stats['best_delta']:.2f} | {label} | {tags} |"
-        )
-    return lines
-
-
-def _direction_cooling_board(
-    entries: list[dict[str, Any]],
-    limit: int,
-    *,
-    journal_path: Path | None,
-    score_regime: str,
-    current_iteration: int,
-) -> list[str]:
-    state = build_exploration_guard_state(
-        entries,
-        journal_path=journal_path,
-        score_regime=score_regime,
-        current_iteration=current_iteration,
-        include_current_round_locks=False,
-    )
-    active_locks = state["active_locks"]
-    lines = [
-        "方向冷却表（系统硬约束）:",
-        "| 方向簇 | 状态 | 剩余锁定轮次 | 触发次数 | 最近原因 |",
-        "| --- | --- | --- | --- | --- |",
-    ]
-    if not active_locks:
-        lines.append("| - | OPEN | 0 | 0 | 暂无被系统锁定的方向簇 |")
-        return lines
-
-    ordered = sorted(
-        active_locks.items(),
-        key=lambda item: (-item[1]["remaining_rounds"], -item[1]["trigger_count"], item[0]),
-    )
-    for cluster, payload in ordered[:limit]:
-        lines.append(
-            f"| {cluster} | COOLING | {payload['remaining_rounds']} | "
-            f"{payload['trigger_count']} | {_truncate(payload['reason'], 48) or '-'} |"
         )
     return lines
 
@@ -2874,9 +2738,9 @@ def _display_stage(entry: dict[str, Any]) -> str:
     if stage == "candidate_validation":
         return "源码校验"
     if stage == "blocked_same_cluster":
-        return "同簇近邻"
+        return "探索拦截"
     if stage == "blocked_locked_cluster":
-        return "命中锁簇"
+        return "探索拦截"
     if stage == "full_eval":
         return "完整评估"
     if str(entry.get("outcome", "")) in {"accepted", "rejected"}:
@@ -3011,11 +2875,6 @@ def _empty_prompt_tables(stage_title: str = "当前 stage") -> list[str]:
         "| 方向簇 | 最近尝试 | 失败 | 零增益 | 运行报错 | 最佳delta | 标签 | 最近标签 |",
         "| --- | --- | --- | --- | --- | --- | --- | --- |",
         "| - | 0 | 0 | 0 | 0 | 0.00 | OPEN | - |",
-        "",
-        "方向冷却表（系统硬约束）:",
-        "| 方向簇 | 状态 | 剩余锁定轮次 | 触发次数 | 最近原因 |",
-        "| --- | --- | --- | --- | --- |",
-        "| - | OPEN | 0 | 0 | 暂无被系统锁定的方向簇 |",
         "",
         "过拟合风险表（谨慎参考）:",
         "| 轮次 | 结果 | promotion | 风险 | 分数 | top1+ | chain+ | 覆盖 | 多空偏科 | 落差 | 建议 |",
@@ -3231,17 +3090,6 @@ def build_journal_prompt_summary(
                 board_lines = _direction_risk_board(board_entries, limit=min(8, limit))
                 if board_lines:
                     parts.extend(board_lines)
-                    parts.append("")
-
-                cooling_lines = _direction_cooling_board(
-                    board_entries,
-                    limit=min(8, limit),
-                    journal_path=journal_path,
-                    score_regime=active_score_regime,
-                    current_iteration=current_iteration,
-                )
-                if cooling_lines:
-                    parts.extend(cooling_lines)
                     parts.append("")
 
                 overheat_lines = _cluster_overheat_lines(board_entries, limit=min(8, limit))
