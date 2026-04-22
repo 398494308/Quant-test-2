@@ -102,6 +102,40 @@ def make_gate_config(**overrides):
     return GateConfig(**payload)
 
 
+def _minimal_required_strategy_source(*, trend_quality_bool_ops: int = 0) -> str:
+    body_by_function = {
+        "_sideways_release_flags": "return {}",
+        "_is_sideways_regime": "return False",
+        "_flow_signal_metrics": "return {}",
+        "_flow_confirmation_ok": "return True",
+        "_flow_entry_ok": "return True",
+        "_trend_quality_long": "return True",
+        "_trend_quality_short": "return True",
+        "_trend_quality_ok": (
+            "return " + " or ".join(["False"] * (trend_quality_bool_ops + 1))
+            if trend_quality_bool_ops > 0
+            else "return False"
+        ),
+        "_trend_followthrough_long": "return True",
+        "_trend_followthrough_short": "return True",
+        "_trend_followthrough_ok": "return True",
+        "_long_entry_signal": "return None",
+        "_short_entry_signal": "return None",
+        "strategy": "return None",
+    }
+    blocks = [
+        "# PARAMS_START",
+        "PARAMS = {'breakout_volume_ratio_min': 1.0}",
+        "# PARAMS_END",
+        "",
+    ]
+    for function_name in REQUIRED_FUNCTIONS:
+        blocks.append(f"def {function_name}(*args, **kwargs):")
+        blocks.append(f"    {body_by_function[function_name]}")
+        blocks.append("")
+    return "\n".join(blocks)
+
+
 class BacktestFixesTest(unittest.TestCase):
     def test_default_market_data_paths_use_okx_naming(self):
         paths = default_market_data_paths()
@@ -1380,6 +1414,22 @@ class JournalPromptFixesTest(unittest.TestCase):
         self.assertIn("只回复 `EDIT_DONE`", prompt)
         self.assertIn("复杂度余量提醒", prompt)
 
+    def test_build_strategy_edit_worker_prompt_mentions_compaction_lane_when_requested(self):
+        prompt = build_strategy_edit_worker_prompt(
+            candidate_id="candidate_1",
+            hypothesis="压缩多头最终 veto",
+            change_plan="合并重复否决，不新增 path",
+            change_tags=("merge_veto",),
+            expected_effects=("回收复杂度余量",),
+            closest_failed_cluster="veto_cluster",
+            novelty_proof="本轮只做结构性压缩。",
+            iteration_lane="compaction",
+            iteration_lane_status_text="当前 working_base 已到 warning_2，先压缩再研究。",
+        )
+
+        self.assertIn("本轮执行车道：`compaction`", prompt)
+        self.assertIn("不要借压缩名义再新增因子、参数或 path", prompt)
+
     def test_build_strategy_summary_worker_system_prompt_mentions_no_edit_summary_role(self):
         prompt = build_strategy_summary_worker_system_prompt()
 
@@ -1456,6 +1506,21 @@ class JournalPromptFixesTest(unittest.TestCase):
 
         self.assertIn("当前基底复杂度余量", prompt)
         self.assertIn("trend_quality_family", prompt)
+
+    def test_build_strategy_research_prompt_mentions_working_base_compaction_lane(self):
+        prompt = build_strategy_research_prompt(
+            evaluation_summary="诊断",
+            journal_summary="记忆",
+            previous_best_score=1.23,
+            benchmark_label="champion",
+            current_base_role="working_base",
+            iteration_lane="compaction",
+            iteration_lane_status_text="当前基底复杂度 warning_2，允许只更新 working_base。",
+        )
+
+        self.assertIn("当前工作基底角色：`working_base`", prompt)
+        self.assertIn("本轮执行车道：`compaction`", prompt)
+        self.assertIn("保留为新的 working_base", prompt)
 
     def test_build_strategy_runtime_repair_prompt_mentions_complexity_shrink_rule(self):
         prompt = build_strategy_runtime_repair_prompt(
@@ -2794,6 +2859,79 @@ class FreqtradeAdapterFixesTest(unittest.TestCase):
 
             self.assertEqual(active_session_id, "")
 
+    def test_active_research_session_id_returns_empty_on_iteration_lane_scope_mismatch(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            temp_paths = replace(
+                research_script.RUNTIME.paths,
+                session_state_file=temp_root / "state/session.json",
+            )
+            temp_runtime = replace(research_script.RUNTIME, paths=temp_paths, base_factor_change_mode="default")
+
+            with mock.patch.object(research_script, "RUNTIME", temp_runtime), mock.patch.object(
+                research_script, "best_source", "def strategy(*args, **kwargs):\n    return None\n"
+            ), mock.patch.object(
+                research_script, "best_report", object()
+            ), mock.patch.object(
+                research_script, "champion_report", None
+            ), mock.patch.object(
+                research_script, "reference_stage_started_at", "2026-04-21T00:00:00+00:00"
+            ), mock.patch.object(
+                research_script, "reference_stage_iteration", 7
+            ):
+                research_script._store_research_session_metadata(
+                    session_id="session-123",
+                    workspace_root=temp_root / "workspace",
+                    factor_change_mode="default",
+                    iteration_lane="research",
+                )
+                active_session_id = research_script._active_research_session_id(
+                    factor_change_mode="default",
+                    iteration_lane="compaction",
+                )
+
+            self.assertEqual(active_session_id, "")
+
+    def test_working_base_compaction_acceptance_allows_small_metric_slack_when_headroom_improves(self):
+        base_source = _minimal_required_strategy_source(trend_quality_bool_ops=31)
+        candidate_source = _minimal_required_strategy_source(trend_quality_bool_ops=27)
+        baseline_report = EvaluationReport(
+            metrics={
+                "promotion_score": 0.20,
+                "quality_score": 0.18,
+                "validation_trend_capture_score": 0.10,
+                "validation_segment_hit_rate": 0.40,
+            },
+            gate_passed=False,
+            gate_reason="baseline",
+            summary_text="",
+            prompt_summary_text="",
+        )
+        candidate_report = EvaluationReport(
+            metrics={
+                "promotion_score": 0.18,
+                "quality_score": 0.17,
+                "validation_trend_capture_score": 0.08,
+                "validation_segment_hit_rate": 0.37,
+            },
+            gate_passed=False,
+            gate_reason="train/val 分数略回撤",
+            summary_text="",
+            prompt_summary_text="",
+        )
+
+        with mock.patch.object(research_script, "best_report", baseline_report):
+            accepted, reason, compaction_delta = research_script._working_base_compaction_acceptance_decision(
+                candidate_report,
+                base_source=base_source,
+                candidate_source=candidate_source,
+            )
+
+        self.assertTrue(accepted)
+        self.assertTrue(compaction_delta["material"])
+        self.assertEqual(compaction_delta["base_level"], "warning_2")
+        self.assertIn("压缩沉淀通过", reason)
+
     def test_journal_summary_limits_recent_rows_and_meta_lines_to_requested_limit(self):
         entries = []
         for idx in range(5):
@@ -3999,6 +4137,50 @@ class ReferenceStateFixesTest(unittest.TestCase):
         self.assertEqual(payload["reference_stage_started_at"], "2026-04-20T00:00:00+00:00")
         self.assertEqual(payload["reference_stage_iteration"], 7)
 
+    def test_reference_manifest_uses_working_base_role_when_champion_and_base_diverge(self):
+        working_base_source = "def strategy():\n    return 'working'\n"
+        champion_source = "def strategy():\n    return 'champion'\n"
+        working_base_report = EvaluationReport(
+            metrics={"promotion_score": 0.31, "quality_score": 0.22},
+            gate_passed=False,
+            gate_reason="working_base only",
+            summary_text="",
+            prompt_summary_text="",
+        )
+        champion_report = EvaluationReport(
+            metrics={"promotion_score": 0.42, "quality_score": 0.35},
+            gate_passed=True,
+            gate_reason="通过",
+            summary_text="",
+            prompt_summary_text="",
+        )
+        original_best_source = research_script.best_source
+        original_champion_source = research_script.champion_source
+        original_champion_report = research_script.champion_report
+        original_champion_shadow = research_script.champion_shadow_test_metrics
+        try:
+            research_script.best_source = working_base_source
+            research_script.champion_source = champion_source
+            research_script.champion_report = champion_report
+            research_script.champion_shadow_test_metrics = {"shadow_test_score": 1.23}
+            payload = research_script._reference_manifest_payload(
+                working_base_source,
+                working_base_report,
+                stage_started_at="2026-04-20T00:00:00+00:00",
+                stage_iteration=7,
+            )
+        finally:
+            research_script.best_source = original_best_source
+            research_script.champion_source = original_champion_source
+            research_script.champion_report = original_champion_report
+            research_script.champion_shadow_test_metrics = original_champion_shadow
+
+        self.assertEqual(payload["reference_role"], "working_base")
+        self.assertEqual(payload["benchmark_role"], "champion")
+        self.assertEqual(payload["working_base"]["code_hash"], research_script.source_hash(working_base_source))
+        self.assertEqual(payload["champion"]["code_hash"], research_script.source_hash(champion_source))
+        self.assertEqual(payload["champion"]["shadow_test_metrics"]["shadow_test_score"], 1.23)
+
     def test_promotion_acceptance_accepts_first_gate_passed_champion_when_baseline_fails(self):
         baseline_report = EvaluationReport(
             metrics={"promotion_score": 0.40, "quality_score": 0.33},
@@ -4050,6 +4232,7 @@ class ReferenceStateFixesTest(unittest.TestCase):
                 heartbeat_file=temp_root / "state/heartbeat.json",
                 best_state_file=temp_root / "state/best.json",
                 best_strategy_file=temp_root / "backups/best.py",
+                champion_strategy_file=temp_root / "backups/champion.py",
                 stop_file=temp_root / "state/stop",
                 strategy_backup_file=temp_root / "backups/candidate.py",
             )

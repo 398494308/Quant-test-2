@@ -6,10 +6,11 @@
 
 最后核对时间：`2026-04-22 15:48 CST`
 
-当前主参考和 champion 存在这里：
+当前 working base 和 champion 存在这里：
 
 - [src/strategy_macd_aggressive.py](../src/strategy_macd_aggressive.py)
 - [backups/strategy_macd_aggressive_v2_best.py](../backups/strategy_macd_aggressive_v2_best.py)
+- [backups/strategy_macd_aggressive_v2_champion.py](../backups/strategy_macd_aggressive_v2_champion.py)
 - [state/research_macd_aggressive_v2_best.json](../state/research_macd_aggressive_v2_best.json)
 
 当前 best 快照更新时间：`2026-04-22 15:33 CST`
@@ -72,9 +73,10 @@
 
 当前晋升规则：
 
-- 先过 `gate`
+- 正常晋升先过 `gate`
 - 再满足 `promotion_delta > 0.02`
 - 只有刷新 champion 时才额外跑隐藏 `test`
+- 若系统进入 `compaction lane`，也可能只更新 working base，不替换 champion
 
 `test` 只做验收，不参与 prompt，不参与当前轮次的调参。
 
@@ -107,6 +109,12 @@
    负责真实 diff 检查、smoke、完整评估、gate、journal、Discord、memory、failure wiki
 
 当前 planner brief 已经统一成 text-only 契约，核心字段缺失会直接判 `generation_invalid`，不会再自动圆成“看似成功的一轮”。
+当前主状态也已拆成两层：
+
+1. `champion`
+   真正的晋升基准，只在过 gate 且 `promotion_delta` 足够时替换
+2. `working_base`
+   下一轮研究实际分叉的代码基底；复杂度压缩成功时可单独更新，不要求同步替换 champion
 
 ## 当前 prompt 和 session 组织
 
@@ -121,10 +129,10 @@
 
 当前 session 行为：
 
-- 同一个 `baseline / champion stage` 内复用同一个 `planner` session
+- 同一个 `baseline / champion / working_base stage` 内复用同一个 `planner` session
 - `edit_worker / repair_worker` 不复用 planner session
-- `session scope` 现在同时绑定 `stage + factor_change_mode`；如果 `factor_change_mode` 在 `default` 和 `factor_admission` 之间切换，不再沿用旧 planner session
-- 如果 champion 或 baseline 刷新，也会切新 stage 和新 session
+- `session scope` 现在同时绑定 `stage + factor_change_mode + iteration_lane`；如果 `factor_change_mode` 或 `iteration_lane` 变化，不再沿用旧 planner session
+- 如果 champion、baseline 或 working_base 刷新，也会切新 stage 和新 session
 
 当前 session 文件：
 
@@ -147,10 +155,11 @@
 - 候选元信息会在最终代码稳定后按真实 diff 和最终源码回写一次，不再只沿用 planner 的原始 brief
 - `smoke` 先跑，再决定是否值得完整评估
 - `smoke` 行为完全不变时会先同轮重生，连续不变才记 `behavioral_noop`
+- 但若当前轮次是 `compaction lane` 且复杂度确实改善，允许“smoke 不变但继续完整评估”，这样压缩成果可以沉淀到 working base
 - 命中 failure wiki 的 exact cut 会在评估前被挡回
 - 重复 source、重复 hash、空 diff、非法输出会隔离成技术空转，不让它们污染真正的研究记忆
 - 复杂度现在采用两档预警加绝对硬帽：`warning_1` 提醒开始偏胖，`warning_2` 提醒优先先压缩，只有超过绝对复杂度帽才会直接拒收
-- 复杂度硬帽仍会优先走同轮 repair，不再立刻浪费下一轮
+- 复杂度硬帽仍会优先走同轮 repair，不再立刻浪费下一轮；而 `warning_2 + complexity/stall` 会触发系统切到 `compaction lane`
 - 当前 stage 内如果同一 `cluster + target + ordinary family` 的 rejected 反复出现且没有正向 delta，也会被视为研究停滞证据，用来触发换挡；这不是跨 stage 永久封锁。
 
 ## 当前目录与状态文件

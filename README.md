@@ -23,7 +23,9 @@
 - `train`：`2023-07-01` 到 `2024-12-31`
 - `val`：`2025-01-01` 到 `2025-12-31`
 - `test`：`2026-01-01` 到 `2026-03-31`
-- 新候选只有在 `gate` 通过且 `promotion_delta > 0.02` 时，才会替换当前 champion
+- 正常晋升路径只有在 `gate` 通过且 `promotion_delta > 0.02` 时，才会替换当前 champion
+- 当当前 working base 已进入复杂度 `warning_2` 且近期出现 complexity/stall 压力时，研究器会切到 `compaction lane`
+- `compaction lane` 允许在不替换 champion 的前提下，仅因复杂度明显改善且 train/val 未明显恶化而更新 working base
 - `test` 只在新 champion 时运行，不进入 prompt
 
 ## 当前 Champion 快照
@@ -45,14 +47,14 @@
 
 ## 研究器怎么运行
 
-1. 研究器围绕当前 champion 进入一个 stage，并在这个 stage 内复用同一个 `planner` session。
+1. 研究器同时维护 `champion` 和 `working_base` 两层参考；正常研究从 `working_base` 出发，晋升比较基准默认仍是 `champion`。
 2. `planner` 只负责提出本轮假设和改动计划，不直接落码。
 3. 短生命周期 `edit_worker` 只改策略文件；如果代码报错或复杂度超限，再由 `repair_worker` 做同轮修复。
 4. 候选元信息会在最终代码稳定后再按真实 diff 回写一次，避免 planner brief 和最终代码轻微错位。
 5. 候选先过 `smoke`，再跑完整 `train walk-forward + val`。
-6. `behavioral_noop`、重复结果盆地、failure wiki exact cut、空 diff、非法 brief 都会被挡下，不会静默混进有效研究结果。
-7. `factor_admission` 采用 `5/7/10` 梯度提醒，`session scope` 也会绑定当前 factor mode；复杂度采用“两档预警 + 绝对硬帽”。
-8. 只有刷新 champion 时才跑隐藏 `test`，并清掉旧 stage 的 session 上下文。
+6. `behavioral_noop`、重复结果盆地、failure wiki exact cut、空 diff、非法 brief 都会被挡下，不会静默混进有效研究结果；但 `compaction lane` 下如果复杂度确实改善，允许“smoke 不变但继续评估”。
+7. `factor_admission` 采用 `5/7/10` 梯度提醒，`session scope` 会同时绑定 `working_base hash + factor mode + iteration lane`；复杂度采用“两档预警 + 绝对硬帽”。
+8. 只有刷新 champion 时才跑隐藏 `test`；若只是 compaction 成功，则只更新 working base，不跑 `test`。
 
 ## 常用命令
 
@@ -107,6 +109,6 @@ logs/                研究器日志与模型调用日志
 real-money-test/     freqtrade dry-run / live 外壳
 scripts/             下载、研究、管理、分析脚本
 src/                 策略、回测器、研究器依赖模块
-state/               champion、journal、memory、heartbeat、session
+state/               working_base/champion 状态、journal、memory、heartbeat、session
 tests/               研究器相关测试
 ```

@@ -328,10 +328,14 @@ def build_strategy_research_prompt(
     journal_summary: str,
     previous_best_score: float,
     reference_metrics: dict[str, Any] | None = None,
+    benchmark_label: str = "champion",
+    current_base_role: str = "champion",
     score_regime: str = "trend_capture_v6",
     promotion_min_delta: float = 0.02,
     factor_change_mode: str = "default",
     factor_mode_status_text: str = "",
+    iteration_lane: str = "research",
+    iteration_lane_status_text: str = "",
     current_complexity_headroom_text: str = "",
     session_mode: str = "resume",
     operator_focus_text: str = "",
@@ -356,6 +360,11 @@ def build_strategy_research_prompt(
         if factor_mode_status_text.strip()
         else ""
     )
+    iteration_lane_block = (
+        f"本轮执行车道：`{iteration_lane}`\n- {iteration_lane_status_text.strip()}\n"
+        if iteration_lane_status_text.strip()
+        else ""
+    )
     complexity_headroom_block = (
         f"\n{current_complexity_headroom_text}\n"
         if current_complexity_headroom_text.strip()
@@ -374,10 +383,12 @@ def build_strategy_research_prompt(
 - session 状态：`{session_label}`
 - 围绕一个可证伪假设，先产出一个简洁 round brief，交给后续 edit worker 落码。
 - 本轮目标是改变真实交易路径，不是只制造源码 diff；若后续落码后的 smoke 行为完全不变，会被系统按 `behavioral_noop` 拒收。
-- 当前评分口径是 `{score_regime}`；只有在 `gate` 通过，且相对当前 champion 的有效 `promotion_delta > {promotion_min_delta:.2f}` 时，候选才有资格刷新当前主参考。
+- 当前评分口径是 `{score_regime}`；正常晋升路径只有在 `gate` 通过，且相对当前 {benchmark_label} 的有效 `promotion_delta > {promotion_min_delta:.2f}` 时，候选才有资格刷新 champion。
+- 若系统把本轮切到 `compaction` lane，则也可能在不刷新 champion 的前提下，仅因复杂度明显改善且 train/val 未明显恶化而保留为新的 working_base。
 - `train` 看滚动窗口均值/中位数，`val` 看连续 holdout 的 `promotion_score`，`test` 是隐藏验收集。
 
-当前 champion 参考晋级分：{previous_best_score:.2f}
+当前工作基底角色：`{current_base_role}`
+当前 {benchmark_label} 参考晋级分：{previous_best_score:.2f}
 {side_bias_block}
 {champion_focus_block}
 {operator_focus_block}
@@ -399,6 +410,7 @@ def build_strategy_research_prompt(
 
 当前因子模式：{factor_change_mode_label(factor_change_mode)}
 {factor_mode_status_block}
+{iteration_lane_block}
 
 {evaluation_summary}
 
@@ -446,8 +458,15 @@ def build_strategy_edit_worker_prompt(
     expected_effects: tuple[str, ...],
     closest_failed_cluster: str,
     novelty_proof: str,
+    iteration_lane: str = "research",
+    iteration_lane_status_text: str = "",
     current_complexity_headroom_text: str = "",
 ) -> str:
+    iteration_lane_block = (
+        f"\n本轮执行车道：`{iteration_lane}`\n- {iteration_lane_status_text.strip()}\n"
+        if iteration_lane_status_text.strip()
+        else "\n"
+    )
     complexity_block = (
         f"\n当前复杂度余量提醒：\n{current_complexity_headroom_text}\n"
         if current_complexity_headroom_text.strip()
@@ -470,8 +489,10 @@ def build_strategy_edit_worker_prompt(
 - 优先改已经存在的命名规则块、阈值和最终放行链；不要为了造 diff 新写一套近似逻辑。
 - 如果你判断 brief 指向的 choke point 根本不在当前代码路径上，应在同一主题内改成能真实触达交易路径的实现，但不要改写研究方向本身。
 - 保持代码结构化，不要做无关重构、大面积格式化或复制已有因果链。
+- 若本轮是 `compaction` lane，优先删旧条件、合并旧分支、移除死门；不要借压缩名义再新增因子、参数或 path。
 - 只要完成真实落码并保存文件，就回复 `EDIT_DONE`。不要输出解释、计划、JSON、markdown 或源码。
 - 如果辅助记忆文件读不到，不是合法 no-edit 理由；直接以当前 `src/strategy_macd_aggressive.py` 为事实源落码。
+{iteration_lane_block}
 {complexity_block}
 当前阶段唯一完成条件：
 {build_edit_completion_instructions()}

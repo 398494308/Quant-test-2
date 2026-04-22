@@ -119,11 +119,19 @@ MAX_PLANNER_BRIEF_REPAIR_ATTEMPTS = 1
 
 best_source = ""
 best_report: EvaluationReport | None = None
+champion_source = ""
 champion_report: EvaluationReport | None = None
+champion_shadow_test_metrics: dict[str, float] | None = None
 iteration_counter = 0
 reference_stage_started_at = ""
 reference_stage_iteration = 0
 research_session_state: dict[str, Any] = {}
+COMPACTION_TRIGGER_STALLS = 5
+COMPACTION_COMPLEXITY_LOOKBACK = 6
+COMPACTION_PROMOTION_SLACK = 0.03
+COMPACTION_QUALITY_SLACK = 0.03
+COMPACTION_VALIDATION_TREND_SLACK = 0.05
+COMPACTION_VALIDATION_HIT_RATE_SLACK = 0.05
 
 logging.basicConfig(
     filename=RUNTIME.paths.log_file,
@@ -241,7 +249,23 @@ def _append_model_call_telemetry(payload: dict[str, Any]) -> None:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
-def _session_scope_payload(*, factor_change_mode: str = "") -> dict[str, Any]:
+def _current_base_matches_champion() -> bool:
+    if not best_source or not champion_source:
+        return False
+    return source_hash(best_source) == source_hash(champion_source)
+
+
+def _benchmark_role() -> str:
+    return "champion" if champion_report is not None else "baseline"
+
+
+def _reference_role() -> str:
+    if champion_report is None:
+        return "baseline"
+    return "champion" if _current_base_matches_champion() else "working_base"
+
+
+def _session_scope_payload(*, factor_change_mode: str = "", iteration_lane: str = "research") -> dict[str, Any]:
     reference_code_hash = source_hash(best_source) if best_source else ""
     return {
         "score_regime": SCORE_REGIME,
@@ -249,6 +273,7 @@ def _session_scope_payload(*, factor_change_mode: str = "") -> dict[str, Any]:
         "reference_code_hash": reference_code_hash,
         "reference_stage_started_at": reference_stage_started_at,
         "reference_stage_iteration": int(reference_stage_iteration or 0),
+        "iteration_lane": str(iteration_lane or "research").strip() or "research",
         "factor_change_mode": normalize_factor_change_mode(
             str(factor_change_mode).strip()
             or str(RUNTIME.base_factor_change_mode or "default").strip()
@@ -300,18 +325,26 @@ def _session_state_matches_current_stage(
     state: dict[str, Any] | None,
     *,
     factor_change_mode: str = "",
+    iteration_lane: str = "research",
 ) -> bool:
     if not isinstance(state, dict) or not state:
         return False
-    scope = _session_scope_payload(factor_change_mode=factor_change_mode)
+    scope = _session_scope_payload(
+        factor_change_mode=factor_change_mode,
+        iteration_lane=iteration_lane,
+    )
     if not scope["reference_code_hash"]:
         return False
     return all(str(state.get(key, "")).strip() == str(scope.get(key, "")).strip() for key in scope)
 
 
-def _active_research_session_id(*, factor_change_mode: str = "") -> str:
+def _active_research_session_id(*, factor_change_mode: str = "", iteration_lane: str = "research") -> str:
     state = _load_research_session_state()
-    if not _session_state_matches_current_stage(state, factor_change_mode=factor_change_mode):
+    if not _session_state_matches_current_stage(
+        state,
+        factor_change_mode=factor_change_mode,
+        iteration_lane=iteration_lane,
+    ):
         return ""
     return str(state.get("session_id", "")).strip()
 
@@ -321,6 +354,7 @@ def _store_research_session_metadata(
     session_id: str,
     workspace_root: Path,
     factor_change_mode: str = "",
+    iteration_lane: str = "research",
 ) -> None:
     if not session_id:
         return
@@ -333,22 +367,35 @@ def _store_research_session_metadata(
         or "default"
     )
     payload = {
-        **_session_scope_payload(factor_change_mode=resolved_factor_mode),
+        **_session_scope_payload(
+            factor_change_mode=resolved_factor_mode,
+            iteration_lane=iteration_lane,
+        ),
         "session_id": session_id,
         "workspace_root": str(workspace_root),
         "factor_change_mode": resolved_factor_mode,
+        "iteration_lane": str(iteration_lane or "research").strip() or "research",
         "created_at": str(previous.get("created_at", "")).strip() or now,
         "updated_at": now,
     }
     _persist_research_session_state(payload)
 
 
-def _align_research_session_scope(*, force_reset: bool = False, factor_change_mode: str = "") -> None:
+def _align_research_session_scope(
+    *,
+    force_reset: bool = False,
+    factor_change_mode: str = "",
+    iteration_lane: str = "research",
+) -> None:
     state = _load_research_session_state()
     if force_reset:
         _clear_research_session_state(remove_workspace=True, reason="reference scope changed by explicit reset")
         return
-    if state and not _session_state_matches_current_stage(state, factor_change_mode=factor_change_mode):
+    if state and not _session_state_matches_current_stage(
+        state,
+        factor_change_mode=factor_change_mode,
+        iteration_lane=iteration_lane,
+    ):
         _clear_research_session_state(remove_workspace=True, reason="reference scope changed")
 
 
@@ -537,6 +584,169 @@ def _model_client_config():
 
 def _effective_positive_delta_threshold() -> float:
     return max(0.01, float(RUNTIME.promotion_min_delta) * 0.5)
+
+
+def _complexity_level_rank(level: str) -> int:
+    return {
+        "normal": 0,
+        "warning_1": 1,
+        "warning_2": 2,
+        "hard_cap": 3,
+    }.get(str(level or "normal").strip(), 0)
+
+
+def _complexity_compaction_delta(*, base_source: str, candidate_source: str) -> dict[str, Any]:
+    base_pressure = build_strategy_complexity_pressure(base_source)
+    candidate_pressure = build_strategy_complexity_pressure(candidate_source)
+    base_level = str(base_pressure.get("headroom_level", "normal")).strip() or "normal"
+    candidate_level = str(candidate_pressure.get("headroom_level", "normal")).strip() or "normal"
+    base_items = len(tuple(base_pressure.get("headroom_items", ()) or ()))
+    candidate_items = len(tuple(candidate_pressure.get("headroom_items", ()) or ()))
+    material = (
+        _complexity_level_rank(candidate_level) < _complexity_level_rank(base_level)
+        or candidate_items < base_items
+    )
+    return {
+        "base_level": base_level,
+        "candidate_level": candidate_level,
+        "base_item_count": base_items,
+        "candidate_item_count": candidate_items,
+        "material": material,
+        "summary": (
+            f"headroom {base_level}->{candidate_level}, "
+            f"紧张项 {base_items}->{candidate_items}"
+        ),
+    }
+
+
+def _recent_complexity_event_count(entries: list[dict[str, Any]], *, lookback: int = COMPACTION_COMPLEXITY_LOOKBACK) -> int:
+    current_entries = _current_stage_journal_entries(entries)
+    hits = 0
+    checked = 0
+    for entry in reversed(current_entries):
+        if checked >= max(1, lookback):
+            break
+        checked += 1
+        haystack = " | ".join(
+            str(entry.get(key, "")).lower()
+            for key in (
+                "decision_reason",
+                "gate_reason",
+                "eval_gate_reason",
+                "runtime_failure_stage",
+                "note",
+            )
+        )
+        if "complexity" in haystack:
+            hits += 1
+    return hits
+
+
+def _resolve_iteration_lane_state(
+    journal_entries: list[dict[str, Any]],
+    *,
+    factor_mode_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not best_source:
+        return {"lane": "research", "reason": "当前 working_base 尚未初始化，保持常规研究。"}
+
+    pressure = build_strategy_complexity_pressure(best_source)
+    headroom_level = str(pressure.get("headroom_level", "normal")).strip() or "normal"
+    complexity_events = _recent_complexity_event_count(journal_entries)
+    trailing_stalls = int((factor_mode_context or {}).get("trailing_stalls", 0) or 0)
+    factor_admission_rounds = int((factor_mode_context or {}).get("factor_admission_rounds", 0) or 0)
+    if headroom_level in {"warning_2", "hard_cap"} and (
+        complexity_events > 0
+        or trailing_stalls >= COMPACTION_TRIGGER_STALLS
+        or factor_admission_rounds >= FACTOR_ADMISSION_MAX_BURST
+    ):
+        return {
+            "lane": "compaction",
+            "reason": (
+                "本轮切到 working_base compaction lane: "
+                f"当前基底复杂度 {headroom_level}，最近 {COMPACTION_COMPLEXITY_LOOKBACK} 轮出现 "
+                f"{complexity_events} 次 complexity 相关失败，"
+                f"stage stall={trailing_stalls}。目标是先删旧/并旧/降复杂度，"
+                "允许在不刷新 champion 的前提下把压缩后的代码沉淀成新的 working_base。"
+            ),
+            "complexity_pressure": pressure,
+        }
+
+    return {
+        "lane": "research",
+        "reason": (
+            "本轮保持常规研究 lane: "
+            f"当前基底复杂度 {headroom_level}，最近 {COMPACTION_COMPLEXITY_LOOKBACK} 轮 "
+            f"complexity 相关失败={complexity_events}。"
+        ),
+        "complexity_pressure": pressure,
+    }
+
+
+def _working_base_compaction_acceptance_decision(
+    report: EvaluationReport,
+    *,
+    base_source: str,
+    candidate_source: str,
+) -> tuple[bool, str, dict[str, Any]]:
+    if best_report is None:
+        return False, "reference state is not initialized", {}
+
+    compaction_delta = _complexity_compaction_delta(
+        base_source=base_source,
+        candidate_source=candidate_source,
+    )
+    if not compaction_delta["material"]:
+        return False, f"压缩未带来足够复杂度改善({compaction_delta['summary']})", compaction_delta
+
+    promotion_delta_vs_base = float(report.metrics.get("promotion_score", 0.0)) - float(
+        best_report.metrics.get("promotion_score", 0.0)
+    )
+    quality_delta_vs_base = float(report.metrics.get("quality_score", 0.0)) - float(
+        best_report.metrics.get("quality_score", 0.0)
+    )
+    validation_trend_delta = float(report.metrics.get("validation_trend_capture_score", 0.0)) - float(
+        best_report.metrics.get("validation_trend_capture_score", 0.0)
+    )
+    validation_hit_rate_delta = float(report.metrics.get("validation_segment_hit_rate", 0.0)) - float(
+        best_report.metrics.get("validation_segment_hit_rate", 0.0)
+    )
+
+    if promotion_delta_vs_base < -COMPACTION_PROMOTION_SLACK:
+        return (
+            False,
+            f"压缩后 promotion 相对 working_base 回撤过大({promotion_delta_vs_base:.2f} < -{COMPACTION_PROMOTION_SLACK:.2f})",
+            compaction_delta,
+        )
+    if quality_delta_vs_base < -COMPACTION_QUALITY_SLACK:
+        return (
+            False,
+            f"压缩后 quality 相对 working_base 回撤过大({quality_delta_vs_base:.2f} < -{COMPACTION_QUALITY_SLACK:.2f})",
+            compaction_delta,
+        )
+    if validation_trend_delta < -COMPACTION_VALIDATION_TREND_SLACK:
+        return (
+            False,
+            f"压缩后 val 趋势捕获回撤过大({validation_trend_delta:.2f} < -{COMPACTION_VALIDATION_TREND_SLACK:.2f})",
+            compaction_delta,
+        )
+    if validation_hit_rate_delta < -COMPACTION_VALIDATION_HIT_RATE_SLACK:
+        return (
+            False,
+            f"压缩后 val 命中率回撤过大({validation_hit_rate_delta:.2f} < -{COMPACTION_VALIDATION_HIT_RATE_SLACK:.2f})",
+            compaction_delta,
+        )
+
+    return (
+        True,
+        (
+            "压缩沉淀通过("
+            f"{compaction_delta['summary']}；"
+            f"promotion_vs_base={promotion_delta_vs_base:.2f}；"
+            f"quality_vs_base={quality_delta_vs_base:.2f})"
+        ),
+        compaction_delta,
+    )
 
 
 def _current_stage_journal_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -756,10 +966,6 @@ def _load_saved_reference_state() -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _reference_role() -> str:
-    return "champion" if champion_report is not None else "baseline"
-
-
 def _reference_benchmark_report() -> EvaluationReport | None:
     return champion_report or best_report
 
@@ -835,6 +1041,40 @@ def _recover_reference_stage_state(
     return "", (max_iteration + 1) if max_iteration > 0 else 0
 
 
+def _saved_report_payload(
+    source: str,
+    report: EvaluationReport,
+    *,
+    shadow_test_metrics: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    return {
+        "code_hash": source_hash(source),
+        "metrics": report.metrics,
+        "gate_passed": report.gate_passed,
+        "gate_reason": report.gate_reason,
+        "shadow_test_metrics": shadow_test_metrics or {},
+    }
+
+
+def _report_from_saved_payload(payload: dict[str, Any]) -> EvaluationReport | None:
+    if not isinstance(payload, dict):
+        return None
+    metrics = payload.get("metrics")
+    if not isinstance(metrics, dict):
+        return None
+    try:
+        normalized_metrics = {str(key): float(value) for key, value in metrics.items()}
+    except (TypeError, ValueError):
+        return None
+    return EvaluationReport(
+        metrics=normalized_metrics,
+        gate_passed=bool(payload.get("gate_passed", False)),
+        gate_reason=str(payload.get("gate_reason", "")).strip() or "unknown",
+        summary_text="",
+        prompt_summary_text="",
+    )
+
+
 def _reference_manifest_payload(
     source: str,
     report: EvaluationReport,
@@ -843,27 +1083,34 @@ def _reference_manifest_payload(
     stage_started_at: str = "",
     stage_iteration: int = 0,
 ) -> dict[str, Any]:
-    reference_payload = {
-        "code_hash": source_hash(source),
-        "metrics": report.metrics,
-        "gate_passed": report.gate_passed,
-        "gate_reason": report.gate_reason,
-        "shadow_test_metrics": shadow_test_metrics or {},
-    }
+    working_base_payload = _saved_report_payload(
+        source,
+        report,
+        shadow_test_metrics=shadow_test_metrics,
+    )
+    champion_payload = None
+    if champion_report is not None and champion_source:
+        champion_payload = _saved_report_payload(
+            champion_source,
+            champion_report,
+            shadow_test_metrics=champion_shadow_test_metrics,
+        )
     return {
         "updated_at": datetime.now(UTC).isoformat(),
         "score_regime": SCORE_REGIME,
         "reference_role": _reference_role(),
+        "benchmark_role": _benchmark_role(),
         "reference_stage_started_at": stage_started_at,
         "reference_stage_iteration": stage_iteration,
-        "code_hash": reference_payload["code_hash"],
-        "reference": reference_payload,
-        "champion": reference_payload if champion_report is not None else None,
+        "code_hash": working_base_payload["code_hash"],
+        "reference": working_base_payload,
+        "working_base": working_base_payload,
+        "champion": champion_payload,
         # Backward-compatible top-level fields for existing readers.
-        "metrics": reference_payload["metrics"],
-        "gate_passed": reference_payload["gate_passed"],
-        "gate_reason": reference_payload["gate_reason"],
-        "shadow_test_metrics": reference_payload["shadow_test_metrics"],
+        "metrics": working_base_payload["metrics"],
+        "gate_passed": working_base_payload["gate_passed"],
+        "gate_reason": working_base_payload["gate_reason"],
+        "shadow_test_metrics": working_base_payload["shadow_test_metrics"],
     }
 
 
@@ -2013,6 +2260,7 @@ def _rebase_candidate_metadata_to_final_code(
             phase="model_summary_worker",
             workspace_root=workspace_root,
             factor_change_mode=factor_change_mode,
+            iteration_lane="research",
             retry_phase="model_summary_brief_repair",
             session_kind="summary_worker",
             use_persistent_session=False,
@@ -2140,9 +2388,13 @@ def _run_model_text_request(
     session_kind: str = "planner",
     use_persistent_session: bool = True,
     session_factor_change_mode: str = "",
+    session_iteration_lane: str = "research",
 ) -> str:
     session_id = (
-        _active_research_session_id(factor_change_mode=session_factor_change_mode)
+        _active_research_session_id(
+            factor_change_mode=session_factor_change_mode,
+            iteration_lane=session_iteration_lane,
+        )
         if use_persistent_session
         else ""
     )
@@ -2184,6 +2436,7 @@ def _run_model_text_request(
             session_id=resolved_session_id,
             workspace_root=workspace_root,
             factor_change_mode=session_factor_change_mode,
+            iteration_lane=session_iteration_lane,
         )
     elapsed_seconds = round(max(0.0, time.monotonic() - started_at), 3)
     _append_model_call_telemetry(
@@ -2218,6 +2471,7 @@ def _run_model_candidate_request(
     session_kind: str = "planner",
     use_persistent_session: bool = True,
     session_factor_change_mode: str = "",
+    session_iteration_lane: str = "research",
 ) -> dict[str, Any]:
     raw_text = _run_model_text_request(
         prompt=prompt,
@@ -2228,6 +2482,7 @@ def _run_model_candidate_request(
         session_kind=session_kind,
         use_persistent_session=use_persistent_session,
         session_factor_change_mode=session_factor_change_mode,
+        session_iteration_lane=session_iteration_lane,
     )
     return _parse_model_candidate_payload(raw_text)
 
@@ -2310,6 +2565,7 @@ def _request_validated_round_brief(
     phase: str,
     workspace_root: Path,
     factor_change_mode: str,
+    iteration_lane: str,
     retry_phase: str,
     session_kind: str = "planner",
     use_persistent_session: bool = True,
@@ -2322,6 +2578,7 @@ def _request_validated_round_brief(
         session_kind=session_kind,
         use_persistent_session=use_persistent_session,
         session_factor_change_mode=factor_change_mode,
+        session_iteration_lane=iteration_lane,
     )
     errors: list[str] = []
     current_payload = payload
@@ -2371,6 +2628,7 @@ def _request_validated_round_brief(
                 session_kind=session_kind,
                 use_persistent_session=use_persistent_session,
                 session_factor_change_mode=factor_change_mode,
+                session_iteration_lane=iteration_lane,
             )
 
     raise StrategySourceError("planner round brief validation loop exhausted")
@@ -2382,6 +2640,8 @@ def _build_model_round_brief(
     *,
     workspace_root: Path,
     factor_change_mode: str,
+    iteration_lane: str,
+    iteration_lane_reason: str,
 ) -> StrategyRoundBrief:
     report = best_report
     if report is None:
@@ -2390,7 +2650,14 @@ def _build_model_round_brief(
     if benchmark_report is None:
         raise StrategySourceError("reference benchmark is not initialized")
 
-    session_mode = "resume" if _active_research_session_id(factor_change_mode=factor_change_mode) else "bootstrap"
+    session_mode = (
+        "resume"
+        if _active_research_session_id(
+            factor_change_mode=factor_change_mode,
+            iteration_lane=iteration_lane,
+        )
+        else "bootstrap"
+    )
     factor_mode_state = _resolve_iteration_factor_change_state(journal_entries)
     prompt = build_strategy_research_prompt(
         evaluation_summary=report.prompt_summary_text,
@@ -2408,10 +2675,14 @@ def _build_model_round_brief(
         ),
         previous_best_score=benchmark_report.metrics["promotion_score"],
         reference_metrics=benchmark_report.metrics,
+        benchmark_label=_benchmark_role(),
+        current_base_role=_reference_role(),
         score_regime=SCORE_REGIME,
         promotion_min_delta=RUNTIME.promotion_min_delta,
         factor_change_mode=factor_change_mode,
         factor_mode_status_text=_factor_change_status_text(factor_mode_state),
+        iteration_lane=iteration_lane,
+        iteration_lane_status_text=iteration_lane_reason,
         current_complexity_headroom_text=format_strategy_complexity_headroom(base_source),
         session_mode=session_mode,
         operator_focus_text=_load_operator_focus_text(),
@@ -2426,6 +2697,7 @@ def _build_model_round_brief(
         phase="model_planner",
         workspace_root=workspace_root,
         factor_change_mode=factor_change_mode,
+        iteration_lane=iteration_lane,
         retry_phase="model_planner_brief_repair",
     )
 
@@ -2436,6 +2708,8 @@ def _run_edit_worker(
     round_brief: StrategyRoundBrief,
     workspace_root: Path,
     factor_change_mode: str,
+    iteration_lane: str,
+    iteration_lane_reason: str,
     phase: str,
     repair_attempt: int | None = None,
 ) -> str:
@@ -2448,6 +2722,8 @@ def _run_edit_worker(
         closest_failed_cluster=round_brief.closest_failed_cluster,
         novelty_proof=round_brief.novelty_proof,
         current_complexity_headroom_text=format_strategy_complexity_headroom(base_source),
+        iteration_lane=iteration_lane,
+        iteration_lane_status_text=iteration_lane_reason,
     )
     return _run_model_text_request(
         prompt=prompt,
@@ -2534,6 +2810,8 @@ def _regenerate_model_round_brief(
     regeneration_attempt: int,
     workspace_root: Path,
     factor_change_mode: str,
+    iteration_lane: str,
+    iteration_lane_reason: str,
 ) -> StrategyRoundBrief:
     prompt = build_strategy_exploration_repair_prompt(
         candidate_id=failed_candidate.candidate_id,
@@ -2560,6 +2838,7 @@ def _regenerate_model_round_brief(
         phase="model_regenerate",
         workspace_root=workspace_root,
         factor_change_mode=factor_change_mode,
+        iteration_lane=iteration_lane,
         retry_phase="model_regenerate_brief_repair",
     )
 
@@ -2650,6 +2929,8 @@ def _build_model_candidate(
     *,
     workspace_root: Path,
     factor_change_mode: str,
+    iteration_lane: str,
+    iteration_lane_reason: str,
 ) -> StrategyCandidate:
     workspace_strategy_file = workspace_root / MODEL_WORKSPACE_STRATEGY_PATH
     round_brief = _build_model_round_brief(
@@ -2657,12 +2938,16 @@ def _build_model_candidate(
         journal_entries,
         workspace_root=workspace_root,
         factor_change_mode=factor_change_mode,
+        iteration_lane=iteration_lane,
+        iteration_lane_reason=iteration_lane_reason,
     )
     last_response_text = _run_edit_worker(
         base_source=base_source,
         round_brief=round_brief,
         workspace_root=workspace_root,
         factor_change_mode=factor_change_mode,
+        iteration_lane=iteration_lane,
+        iteration_lane_reason=iteration_lane_reason,
         phase="model_edit_worker",
     )
     no_edit_errors: list[str] = []
@@ -2744,6 +3029,8 @@ def _regenerate_model_candidate(
     regeneration_attempt: int,
     workspace_root: Path,
     factor_change_mode: str,
+    iteration_lane: str,
+    iteration_lane_reason: str,
 ) -> StrategyCandidate:
     _persist_last_rejected_candidate_snapshot(
         memory_root=RUNTIME.paths.memory_dir,
@@ -2762,12 +3049,16 @@ def _regenerate_model_candidate(
         regeneration_attempt=regeneration_attempt,
         workspace_root=workspace_root,
         factor_change_mode=factor_change_mode,
+        iteration_lane=iteration_lane,
+        iteration_lane_reason=iteration_lane_reason,
     )
     _run_edit_worker(
         base_source=base_source,
         round_brief=round_brief,
         workspace_root=workspace_root,
         factor_change_mode=factor_change_mode,
+        iteration_lane=iteration_lane,
+        iteration_lane_reason=iteration_lane_reason,
         phase="model_regenerate_edit_worker",
         repair_attempt=regeneration_attempt,
     )
@@ -2811,6 +3102,8 @@ def build_strategy_candidate(
     *,
     workspace_root: Path,
     factor_change_mode: str,
+    iteration_lane: str,
+    iteration_lane_reason: str,
 ) -> StrategyCandidate:
     try:
         return _build_model_candidate(
@@ -2818,6 +3111,8 @@ def build_strategy_candidate(
             journal_entries,
             workspace_root=workspace_root,
             factor_change_mode=factor_change_mode,
+            iteration_lane=iteration_lane,
+            iteration_lane_reason=iteration_lane_reason,
         )
     except StrategyGenerationTransientError:
         raise
@@ -2846,15 +3141,21 @@ def _persist_best_state(
     )
     RUNTIME.paths.best_state_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
     write_strategy_source(RUNTIME.paths.best_strategy_file, source)
+    if champion_source and champion_report is not None:
+        RUNTIME.paths.champion_strategy_file.parent.mkdir(parents=True, exist_ok=True)
+        write_strategy_source(RUNTIME.paths.champion_strategy_file, champion_source)
+    elif RUNTIME.paths.champion_strategy_file.exists():
+        RUNTIME.paths.champion_strategy_file.unlink()
 
 
 def initialize_best_state(force_rebuild: bool = False) -> None:
-    global best_source, best_report, champion_report, reference_stage_started_at, reference_stage_iteration
+    global best_source, best_report, champion_source, champion_report
+    global champion_shadow_test_metrics, reference_stage_started_at, reference_stage_iteration
 
     journal_entries = load_journal_entries(RUNTIME.paths.journal_file)
     saved_state = _load_saved_reference_state()
     saved_regime = str(saved_state.get("score_regime", "")).strip()
-    saved_reference = saved_state.get("reference")
+    saved_reference = saved_state.get("working_base") or saved_state.get("reference")
     can_load_saved_reference = (
         not force_rebuild
         and saved_regime == SCORE_REGIME
@@ -2873,11 +3174,38 @@ def initialize_best_state(force_rebuild: bool = False) -> None:
             write_strategy_source(RUNTIME.paths.strategy_file, best_source)
             reload_strategy_module()
             best_report = evaluate_current_strategy()
-            champion_report = (
-                best_report
-                if best_report.gate_passed and str(saved_state.get("reference_role", "")).strip() == "champion"
-                else None
-            )
+            champion_source = ""
+            champion_report = None
+            champion_shadow_test_metrics = None
+
+            saved_champion = saved_state.get("champion")
+            if (
+                isinstance(saved_champion, dict)
+                and RUNTIME.paths.champion_strategy_file.exists()
+            ):
+                candidate_champion_source = load_strategy_source(RUNTIME.paths.champion_strategy_file)
+                try:
+                    validate_strategy_source(candidate_champion_source)
+                except StrategySourceError as exc:
+                    log_info(f"已保存 champion 无效，忽略该快照并继续使用 working_base: {exc}")
+                else:
+                    reconstructed = _report_from_saved_payload(saved_champion)
+                    if reconstructed is not None:
+                        champion_source = candidate_champion_source
+                        champion_report = reconstructed
+                        champion_shadow_test_metrics = dict(
+                            saved_champion.get("shadow_test_metrics", {}) or {}
+                        )
+
+            if (
+                champion_report is None
+                and best_report.gate_passed
+                and str(saved_state.get("reference_role", "")).strip() == "champion"
+            ):
+                champion_source = best_source
+                champion_report = best_report
+                champion_shadow_test_metrics = dict(saved_state.get("shadow_test_metrics", {}) or {})
+
             reference_stage_started_at, reference_stage_iteration = _recover_reference_stage_state(
                 saved_state,
                 journal_entries,
@@ -2899,6 +3227,7 @@ def initialize_best_state(force_rebuild: bool = False) -> None:
             _align_research_session_scope(
                 force_reset=False,
                 factor_change_mode=RUNTIME.base_factor_change_mode,
+                iteration_lane="research",
             )
             write_heartbeat(
                 "initialized",
@@ -2925,7 +3254,9 @@ def initialize_best_state(force_rebuild: bool = False) -> None:
     validate_strategy_source(best_source)
     reload_strategy_module()
     best_report = evaluate_current_strategy()
+    champion_source = best_source if best_report.gate_passed else ""
     champion_report = best_report if best_report.gate_passed else None
+    champion_shadow_test_metrics = dict(saved_state.get("shadow_test_metrics", {}) or {}) if champion_report else None
     reference_stage_started_at = datetime.now(UTC).isoformat()
     reference_stage_iteration = (
         max((int(entry.get("iteration", 0) or 0) for entry in journal_entries), default=0) + 1
@@ -2946,6 +3277,7 @@ def initialize_best_state(force_rebuild: bool = False) -> None:
     _align_research_session_scope(
         force_reset=force_rebuild,
         factor_change_mode=RUNTIME.base_factor_change_mode,
+        iteration_lane="research",
     )
     write_heartbeat(
         "initialized",
@@ -3380,6 +3712,7 @@ def _candidate_with_repair(
     *,
     workspace_root: Path,
     factor_change_mode: str,
+    iteration_lane: str,
 ) -> tuple[StrategyCandidate, EvaluationReport]:
     current = candidate
     errors: list[str] = []
@@ -3391,8 +3724,18 @@ def _candidate_with_repair(
             _smoke_candidate(current)
             candidate_behavior = _smoke_behavior_profile(heartbeat_phase="candidate_smoke_behavior")
             behavior_diff = _behavior_diff_payload(base_behavior, candidate_behavior)
-            if not behavior_diff["changed"]:
+            compaction_delta = _complexity_compaction_delta(
+                base_source=base_source,
+                candidate_source=current.strategy_code,
+            )
+            allow_behavioral_noop = iteration_lane == "compaction" and bool(compaction_delta["material"])
+            if not behavior_diff["changed"] and not allow_behavioral_noop:
                 raise CandidateBehavioralNoop(current, behavior_diff)
+            if not behavior_diff["changed"] and allow_behavioral_noop:
+                log_info(
+                    f"第 {iteration_counter} 轮 compaction 候选 smoke 未变，但允许继续完整评估: "
+                    f"{compaction_delta['summary']}"
+                )
             report = _evaluate_candidate(current)
             return current, report
         except CandidateRuntimeFailure as exc:
@@ -3427,7 +3770,8 @@ def _candidate_with_repair(
 
 
 def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str:
-    global best_source, best_report, champion_report, reference_stage_started_at, reference_stage_iteration
+    global best_source, best_report, champion_source, champion_report
+    global champion_shadow_test_metrics, reference_stage_started_at, reference_stage_iteration
 
     if best_report is None:
         raise RuntimeError("reference state is not initialized")
@@ -3450,16 +3794,26 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
     factor_mode_context = _resolve_iteration_factor_change_state(journal_entries)
     current_factor_change_mode = str(factor_mode_context.get("mode", "default")).strip() or "default"
     factor_change_reason = str(factor_mode_context.get("reason", "")).strip()
+    iteration_lane_state = _resolve_iteration_lane_state(
+        journal_entries,
+        factor_mode_context=factor_mode_context,
+    )
+    current_iteration_lane = str(iteration_lane_state.get("lane", "research")).strip() or "research"
+    iteration_lane_reason = str(iteration_lane_state.get("reason", "")).strip()
     log_info(f"第 {iteration_id} 轮因子模式: {current_factor_change_mode} | {factor_change_reason}")
+    log_info(f"第 {iteration_id} 轮执行车道: {current_iteration_lane} | {iteration_lane_reason}")
     write_heartbeat(
         "iteration_preparing",
         message=f"iteration {iteration_id} preparing candidate",
         factor_change_mode=current_factor_change_mode,
         factor_change_reason=factor_change_reason,
+        iteration_lane=current_iteration_lane,
+        iteration_lane_reason=iteration_lane_reason,
     )
     _align_research_session_scope(
         force_reset=False,
         factor_change_mode=current_factor_change_mode,
+        iteration_lane=current_iteration_lane,
     )
     workspace_root = _prepare_agent_workspace(
         base_source=best_source,
@@ -3473,6 +3827,8 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
             journal_entries,
             workspace_root=workspace_root,
             factor_change_mode=current_factor_change_mode,
+            iteration_lane=current_iteration_lane,
+            iteration_lane_reason=iteration_lane_reason,
         )
     except PlannerBriefInvalid as exc:
         write_strategy_source(RUNTIME.paths.strategy_file, best_source)
@@ -3573,6 +3929,8 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
                 regeneration_attempt=exploration_regeneration_attempt,
                 workspace_root=workspace_root,
                 factor_change_mode=current_factor_change_mode,
+                iteration_lane=current_iteration_lane,
+                iteration_lane_reason=iteration_lane_reason,
             )
             continue
 
@@ -3681,6 +4039,8 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
                 regeneration_attempt=exploration_regeneration_attempt,
                 workspace_root=workspace_root,
                 factor_change_mode=current_factor_change_mode,
+                iteration_lane=current_iteration_lane,
+                iteration_lane_reason=iteration_lane_reason,
             )
             continue
 
@@ -3692,6 +4052,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
                         candidate,
                         workspace_root=workspace_root,
                         factor_change_mode=current_factor_change_mode,
+                        iteration_lane=current_iteration_lane,
                     )
                     break
                 except CandidateBehavioralNoop as exc:
@@ -3744,6 +4105,8 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
                         regeneration_attempt=behavioral_noop_regeneration_attempt,
                         workspace_root=workspace_root,
                         factor_change_mode=current_factor_change_mode,
+                        iteration_lane=current_iteration_lane,
+                        iteration_lane_reason=iteration_lane_reason,
                     )
                     break
         except EarlyRejection as exc:
@@ -3803,7 +4166,16 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
             continue
         break
 
-    accepted, decision_reason = _promotion_acceptance_decision(candidate_report)
+    champion_accepted, decision_reason = _promotion_acceptance_decision(candidate_report)
+    working_base_accepted = False
+    compaction_delta: dict[str, Any] = {}
+    if not champion_accepted and current_iteration_lane == "compaction":
+        working_base_accepted, decision_reason, compaction_delta = _working_base_compaction_acceptance_decision(
+            candidate_report,
+            base_source=best_source,
+            candidate_source=candidate.strategy_code,
+        )
+    accepted = champion_accepted or working_base_accepted
     entry_note = ""
     if not accepted and candidate_report.gate_passed:
         entry_note = decision_reason
@@ -3819,7 +4191,18 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
         stop_stage="full_eval",
         gate_reason=decision_reason if not accepted else None,
         note=entry_note,
+        extra_fields={
+            "reference_update_kind": (
+                "champion" if champion_accepted else "working_base" if working_base_accepted else "none"
+            ),
+            "iteration_lane": current_iteration_lane,
+            "iteration_lane_reason": iteration_lane_reason,
+            "compaction_summary": str(compaction_delta.get("summary", "")).strip(),
+        },
     )
+    if accepted:
+        entry_base["gate_reason"] = decision_reason
+        entry_base["decision_reason"] = decision_reason
     recent_entries = load_journal_entries(RUNTIME.paths.journal_file)
     if not accepted:
         basin_key = str(entry_base.get("result_basin_key", "")).strip()
@@ -3841,9 +4224,10 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
                 }
             )
 
-    if accepted:
+    if champion_accepted:
         best_source = candidate.strategy_code
         best_report = candidate_report
+        champion_source = candidate.strategy_code
         champion_report = candidate_report
         reference_stage_started_at = datetime.now(UTC).isoformat()
         reference_stage_iteration = iteration_id
@@ -3862,6 +4246,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
         except Exception as exc:
             log_info(f"test评估失败，但本轮 champion 已按 val 保留: {exc}")
             logging.exception("test评估失败(iteration=%s)", iteration_id)
+        champion_shadow_test_metrics = shadow_test_metrics or {}
 
         _persist_best_state(
             best_source,
@@ -3921,6 +4306,38 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
             attachments=attachments,
         )
         return "accepted"
+
+    if working_base_accepted:
+        best_source = candidate.strategy_code
+        best_report = candidate_report
+        reference_stage_started_at = datetime.now(UTC).isoformat()
+        reference_stage_iteration = iteration_id
+        _persist_best_state(
+            best_source,
+            best_report,
+            stage_started_at=reference_stage_started_at,
+            stage_iteration=reference_stage_iteration,
+        )
+        _clear_research_session_state(remove_workspace=True, reason="working base updated by compaction lane")
+        _append_research_journal_entry(entry_base)
+        if maybe_compact(RUNTIME.paths.journal_file):
+            log_info("研究日志已压缩")
+        log_info(
+            f"🧹 第 {iteration_id} 轮更新 working_base: "
+            f"quality={best_report.metrics['quality_score']:.2f}, "
+            f"promotion={best_report.metrics['promotion_score']:.2f}, "
+            f"reason={decision_reason}"
+        )
+        write_heartbeat(
+            "working_base_updated",
+            message=f"iteration {iteration_id} working base updated",
+            reference_role=_reference_role(),
+            benchmark_role=_benchmark_role(),
+            promotion=best_report.metrics["promotion_score"],
+            quality=best_report.metrics["quality_score"],
+            gate=decision_reason,
+        )
+        return "working_base_accepted"
 
     _append_research_journal_entry(entry_base)
     if maybe_compact(RUNTIME.paths.journal_file):
@@ -3994,6 +4411,7 @@ def main() -> int:
     RUNTIME.paths.journal_file.parent.mkdir(parents=True, exist_ok=True)
     RUNTIME.paths.memory_dir.mkdir(parents=True, exist_ok=True)
     RUNTIME.paths.best_strategy_file.parent.mkdir(parents=True, exist_ok=True)
+    RUNTIME.paths.champion_strategy_file.parent.mkdir(parents=True, exist_ok=True)
     _remove_runtime_state()
 
     log_info("启动激进版 MACD 研究器 v2")
@@ -4046,6 +4464,7 @@ def main() -> int:
         if args.once:
             return 0 if outcome in {
                 "accepted",
+                "working_base_accepted",
                 "rejected",
                 "duplicate_skipped",
                 "generation_invalid",
