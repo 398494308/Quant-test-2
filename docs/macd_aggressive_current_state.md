@@ -115,12 +115,21 @@
 6. `wiki/duplicate_watchlist.md`
 7. worker prompt
 
+当前 planner 的顺序约束：
+
+- 先看结构化失败反馈和当前诊断
+- 先复盘上一轮为什么失败、失败更像发生在哪一层交易路径
+- 先决定这轮继续同方向还是转向
+- 最后才写 `hypothesis / change_plan / novelty_proof`
+- `novelty_proof` 现在用于先说明“上一版被什么证据否掉”，再说明“这轮为什么继续或转向”，最后才补“这次和旧 cut 的不同点”
+
 当前 session 规则：
 
 - `planner` 在同一个 stage 内复用同一个 session
 - `edit_worker / repair_worker` 不复用 planner session
 - session scope 只绑定当前 active reference 的 `code_hash + stage`
 - 一旦手工重开 stage，或 champion 刷新，planner session 就会重置
+- 当前不新增额外 planner 子阶段；仍是一轮一个 brief，只是在 prompt 内把“先复盘，再方案”的顺序写得更明确
 
 ## 复杂度与手工瘦身
 

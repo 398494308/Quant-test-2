@@ -1324,6 +1324,8 @@ class JournalPromptFixesTest(unittest.TestCase):
         self.assertIn("本轮阅读顺序（必须执行）", prompt)
         self.assertIn("duplicate_watchlist.md", prompt)
         self.assertIn("failure_wiki.md", prompt)
+        self.assertIn("先复盘最近一条最强结构化失败证据", prompt)
+        self.assertIn("继续还是转向", prompt)
         self.assertIn("形成假设后，必须回看一次", prompt)
         self.assertNotIn("当前因子模式", prompt)
         self.assertIn("本轮硬完成条件", prompt)
@@ -1577,6 +1579,7 @@ class JournalPromptFixesTest(unittest.TestCase):
 
         self.assertIn("附加反馈（本次必须处理）", prompt)
         self.assertIn("最近连续 behavioral_noop: 2", prompt)
+        self.assertIn("先根据 block 原因和附加反馈复盘上一版为什么失败", prompt)
         self.assertIn("wiki/duplicate_watchlist.md", prompt)
         self.assertIn("wiki/failure_wiki.md", prompt)
 
@@ -3362,6 +3365,8 @@ class FreqtradeAdapterFixesTest(unittest.TestCase):
         summary = build_journal_prompt_summary(entries, limit=8, current_score_regime="trend_capture_v4")
 
         self.assertIn("主簇过热（必须先读）", summary)
+        self.assertIn("当前复盘优先级", summary)
+        self.assertIn("当前过热近邻/慎入区", summary)
         self.assertIn("trigger_efficiency_cluster", summary)
         self.assertIn("占比 100%", summary)
         self.assertNotIn("ACTIVE_WINNER", summary)

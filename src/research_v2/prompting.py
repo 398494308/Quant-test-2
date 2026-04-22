@@ -95,6 +95,7 @@ def build_candidate_response_format_instructions() -> str:
   core_factors:
 - `change_tags` 用逗号分隔短 ASCII 标签。
 - `expected_effects` 用 `||` 分隔 1-5 条预期影响。
+- `novelty_proof` 先写最近结构化失败证据否掉了什么，再写本轮为什么继续或转向，最后再补这次相对旧 cut 的不同点。
 - `core_factors` 没有就写 `none`；有则写成 `name | thesis | current_signal || ...`。
 - 不要输出 `edited_regions`；系统会按真实 diff、可编辑区域边界和源码签名自动判定改动区域。"""
 
@@ -138,6 +139,7 @@ def build_strategy_agents_instructions(*, factor_change_mode: str = "default") -
 - 这是一个跨多轮复用的研究 session。不要假设主进程会每轮重复灌完整历史；你需要主动利用本地只读记忆文件。
 - 每轮开始优先快速扫一遍 `wiki/duplicate_watchlist.md`；它只列最近最容易重复提交的少量源码指纹。
 - 再读 `wiki/failure_wiki.md` 的概览；新 session 首轮优先再读 `wiki/latest_history_package.md` 的摘要段。
+- 先复盘，再方案：先判断最近结构化失败证据说明上一轮为什么错、错在交易路径哪一层，再决定本轮继续还是转向；不要一上来替当前方向辩护。
 - 形成单一因果假设后，必须回看一次 `wiki/failure_wiki.md`；若命中相同或高度相似的失败 cut，优先在本轮内改写假设，不要无意义重走旧方向。
 - `memory/raw/rounds/` 与 `memory/raw/full_history.jsonl` 保留未压缩原始历史；需要深挖时去看，但优先先读 wiki 摘要与失败聚合。
 - 若 `wiki/` 或 `memory/` 里的辅助记忆暂时不可用，这不是本轮 `no_edit` 的合法理由；此时应退化为直接读取并修改 `src/strategy_macd_aggressive.py`。
@@ -158,6 +160,7 @@ def build_strategy_agents_instructions(*, factor_change_mode: str = "default") -
 - 先想再写，先看历史再下手。
 - 不要 hard code，不要堆屎。
 - 先阅读并直接修改 `src/strategy_macd_aggressive.py`，必要时再看回测实现或数据文件，不要靠猜测写策略。
+- 最近结构化失败证据优先级高于 `weak side` 或 champion 缺陷提示；先复盘失败点，再决定是否继续同方向。
 - 每轮只验证一个可证伪假设；改动要能映射到真实交易路径变化，而不是只制造源码 diff。
 - 优先保持代码结构化、规则块命名清晰、阈值集中、因果链可解释。
 - 默认先做删减、合并、替换，再考虑新增条件；如果一个新条件只覆盖很窄的历史片段，优先删旧条件或改旧阈值，不要继续叠分叉。
@@ -190,6 +193,7 @@ def build_strategy_system_prompt(*, factor_change_mode: str = "default") -> str:
     return f"""遵守当前工作区本地 `AGENTS.md`，它是本 session 的长期规则。
 
 你在一个持久研究 session 中工作；当前用户提示只补充本轮目标、诊断和失败反馈。
+如果你当前是 `planner`，默认先复盘最近结构化失败证据，再决定 round brief；不要先替当前方向辩护。
 {_text_only_output_contract()}
 {_single_strategy_file_scope_rule()}
 {_missing_memory_is_not_no_edit_rule()}
@@ -339,6 +343,7 @@ def build_strategy_research_prompt(
     session_label = "stage_bootstrap" if session_mode == "bootstrap" else "stage_resume"
     return f"""当前回合任务：
 - session 状态：`{session_label}`
+- 先复盘最近一条最强结构化失败证据，再决定本轮继续还是转向；不要先替当前方向辩护。
 - 围绕一个可证伪假设，先产出一个简洁 round brief，交给后续 edit worker 落码。
 - 本轮目标是改变真实交易路径，不是只制造源码 diff；若后续落码后的 smoke 行为完全不变，会被系统按 `behavioral_noop` 拒收。
 - 当前评分口径是 `{score_regime}`；只有在 `gate` 通过，且相对当前 {benchmark_label} 的有效 `promotion_delta > {promotion_min_delta:.2f}` 时，候选才有资格刷新当前 active reference。
@@ -361,20 +366,24 @@ def build_strategy_research_prompt(
 2. 再看“当前诊断”，先定位当前 gate 主失败项、弱侧和 val 漏斗堵点。
 3. 快速扫一遍 `{duplicate_watchlist_path}`；如果你的假设与其中某条在 cluster / changed_regions / target 上高度相似，先改写，不要再交同一份补丁。
 4. 再看 `{failure_wiki_path}` 与 `{history_package_path}` 的前部摘要；相同失败核或 exact cut 只算一个已知坏盆地，不要逐条重读。若这些辅助文件暂不可用，直接改为核对当前源码继续改，不要停在 no-edit。
-5. 基于上面四步只提出一个单一因果假设，并明确它预计会新增、删除或迁移哪类真实交易。
-6. 形成假设后，必须回看一次 `{duplicate_watchlist_path}` 与 `{failure_wiki_path}` 做自检；若命中相同或高度相似的重复补丁/失败 cut，优先在本轮内改写假设再提交。
-7. 若仍落在同方向簇或同 ordinary family，必须证明这次改的是不同 choke point、不同最终放行链，或不同的真实交易路径层级；`strategy-only` 也可以，但必须说清它改变了哪一层最终路由。
+5. 先用最近一条结构化失败证据做复盘：上一轮为什么失败、失败更像发生在 `outer_context / path / final_veto / routing / followthrough / exit / unknown` 的哪一层。
+6. 再决定本轮继续还是转向；如果你写不清这次相对上一轮到底换了哪个 choke point / 最终放行链 / 目标侧，默认转向，而不是继续在原方向上自辩。
+7. 最后才提出一个单一因果假设，并明确它预计会新增、删除或迁移哪类真实交易。
+8. 形成假设后，必须回看一次 `{duplicate_watchlist_path}` 与 `{failure_wiki_path}` 做自检；若命中相同或高度相似的重复补丁/失败 cut，优先在本轮内改写假设再提交。
+9. 若仍落在同方向簇或同 ordinary family，必须证明这次改的是不同 choke point、不同最终放行链，或不同的真实交易路径层级；`strategy-only` 也可以，但必须说清它改变了哪一层最终路由。
 {iteration_lane_block}
 
 {evaluation_summary}
 
 本轮执行框架：
-- 先判断最大短板是在多头、空头、到来、陪跑还是掉头；再提出单一因果假设。
+- 先看最近结构化失败反馈与当前诊断，先判断上一轮假设为什么没突破；再决定继续同方向还是转向。
+- 再判断最大短板是在多头、空头、到来、陪跑还是掉头；最后才提出单一因果假设。
 - 先确定“目标侧 + 目标环节”：是补 long arrival、long escort、long turn、short stability，还是修最终 routing；先定目标，再决定具体改哪个 choke point。
 - 如果目标是补早段 long / short，可以检查外层总闸门：长侧先看 `long_outer_context_ok`，空侧先看 `short_outer_context_ok`；但不要把这句话理解成“默认继续 widen outer_context”。
 - 新增 path 不等于新增交易；必须继续检查最终合流与否决链。长侧重点看 `long_signal_path_ok -> long_final_veto_clear -> _trend_followthrough_long()`，空侧重点看 `breakdown_ready -> short_final_veto_clear -> _trend_followthrough_short()`。
 - 如果主要改 `_trend_followthrough_ok()`、`_trend_quality_ok()` 或 `_flow_confirmation_ok()`，必须确认现有 `strategy()` 路径会触达；否则优先改 `strategy()`。
 - 若最近连续出现 `behavioral_noop` 或结果盆地重复，本轮默认必须放大步长：优先切不同方向簇，或切不同 choke point / 最终放行链；不要只换措辞、tag 或近邻阈值。
+- 若最近失败已经明确说明某条局部假设没有触达真实行为层，默认先把那条局部假设视为已被证伪；只有你能明确指出新的 choke point 时，才值得继续留在同方向。
 - 若漏斗诊断显示一侧长期 0 交易、outer_context 几乎全死，或 path 能过但 final_veto 基本全死，可以考虑结构性删减轮：`remove_dead_gate` / `merge_veto` / `widen_outer_context`；但只有在它仍是当前最可能改变真实交易路径的根因时才这样做。
 - 如果复杂度诊断显示某块已经很紧，优先先删旧、并旧、改旧，再考虑新增判断。
 - 若你的主要假设是最终路由或最终 veto 错配，允许只改 `strategy()` 或少量结构化 helper；但必须在 `change_plan` 里写清楚它会新增、删除或迁移哪类真实交易。
@@ -396,7 +405,7 @@ def build_strategy_research_prompt(
 - round brief 输出要求：
 {build_candidate_response_format_instructions()}
 - `change_plan` 必须具体到你希望 worker 改哪条规则块、阈值或最终放行链。
-- `novelty_proof` 必须写清这次为什么不属于 failure wiki 里已经失败过的旧 cut。
+- `novelty_proof` 不是自我辩护。先写上一版被什么结构化证据否掉，再写本轮为什么继续或转向，最后再写这次为什么不属于 failure wiki 里已经失败过的旧 cut。
 - 不允许把“未执行代码改动”“blocked”“no_edit”“no_change”这类占位回复当成完成。
 - 如果辅助记忆缺失，就直接基于当前源码做单假设判断，不要停在解释阶段。
 """
@@ -647,6 +656,7 @@ def build_strategy_exploration_repair_prompt(
     return f"""你正在同一轮里重生候选方向，不是开始新一轮研究。
 
 这是第 {regeneration_attempt} 次同轮重生。目标是：保持本轮要解决的策略短板大方向不变，但必须绕开刚被验证失败的近邻方向，改成一个可进入评估的新方向；如果上一版被 `behavioral_noop` 拒收，默认说明上一版局部因果链已失效，可以直接重写局部 hypothesis / change_plan。
+先根据 block 原因和附加反馈复盘上一版为什么失败，再决定继续同方向还是转向；不要先替上一版辩护。
 
 原候选元信息：
 - candidate_id: {candidate_id}
@@ -677,6 +687,7 @@ def build_strategy_exploration_repair_prompt(
 
 重生规则：
 - 这不是代码修错；不要只做微小阈值近邻调整然后原样留在被拒簇。
+- 先复盘上一版错在目标层、choke point 还是步长；先决定继续还是转向，再写新方案。
 - 优先切到不同方向簇。
 - 若确实留在同簇，必须明确切换外层 choke point、最终放行链、目标侧或核心规则块中的至少一项；`strategy-only` 结构性改路由是允许的，但必须明确说明为什么这次会触达不同交易路径。
 - 不要只换 tag、只换措辞、或只补一两条很像的条件。
@@ -696,5 +707,5 @@ def build_strategy_exploration_repair_prompt(
 
 输出要求：
 - 返回格式仍然使用同一组纯文本字段，不要 JSON。
-- `novelty_proof` 必须明确说明这次相对刚才被拒方向，具体换了哪一个 choke point / 最终放行链 / 目标侧 / 关键规则块。
+- `novelty_proof` 先写上一版被什么证据否掉，再写本轮为什么继续或转向，最后再明确说明这次相对刚才被拒方向，具体换了哪一个 choke point / 最终放行链 / 目标侧 / 关键规则块。
 """

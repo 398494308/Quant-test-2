@@ -1398,6 +1398,7 @@ def _behavioral_noop_block_info(
         f"- 当前参考漏斗: {_format_funnel_summary(behavior_diff.get('base', {}) or {})}",
         f"- 候选漏斗: {_format_funnel_summary(behavior_diff.get('candidate', {}) or {})}",
         f"- 最近连续 behavioral_noop: {noop_streak}",
+        "- 先复盘: 上一版局部假设在当前基底上没有触达真实行为层；先判断是目标层选错，还是步长太小，再决定继续同方向还是转向。",
     ]
     if "strategy" not in candidate_signature["region_families"]:
         feedback_lines.append(

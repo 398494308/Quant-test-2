@@ -2130,19 +2130,22 @@ def _stage_executive_summary_lines(
     else:
         lines.append("- 重复失败核: 当前还没有形成 2 轮以上的同核失败。")
     lines.append(
-        f"- 当前近邻热点: 簇={_top_counter_labels(cluster_counter, 2)}；"
+        "- 当前复盘优先级: 最近结构化失败证据 > `weak side` / champion 缺陷提示；先判断上一条路为什么失败，再决定是否继续同方向。"
+    )
+    lines.append(
+        f"- 当前过热近邻/慎入区: 簇={_top_counter_labels(cluster_counter, 2)}；"
         f"ordinary family={_top_counter_labels(family_counter, 2)}；"
         f"标签={_top_counter_labels(tag_counter, 4)}"
     )
     if weak_side == "long":
         lines.append(
-            "- 当前阅读提醒: `weak side = long` 只说明主目标是补多头，不等于根因一定在 `long_outer_context_ok` / `widen_outer_context`；若同一种补法已反复失败，应继续补 long，但切到别的机制层。"
+            "- 当前阅读提醒: `weak side = long` 只说明主目标是补多头，不等于根因一定在 `long_outer_context_ok` / `widen_outer_context`；若同一种补法已反复失败，先复盘失败点，再决定是否继续补 long。"
         )
     elif weak_side == "short":
         lines.append(
-            "- 当前阅读提醒: `weak side = short` 只说明主目标是补空头，不等于根因一定在 `short_outer_context_ok` / `widen_outer_context`；若同一种补法已反复失败，应继续补 short，但切到别的机制层。"
+            "- 当前阅读提醒: `weak side = short` 只说明主目标是补空头，不等于根因一定在 `short_outer_context_ok` / `widen_outer_context`；若同一种补法已反复失败，先复盘失败点，再决定是否继续补 short。"
         )
-    lines.append("- 阅读建议: 先看这里和失败核聚合，再把下面的风险表、逐轮表格当附录。")
+    lines.append("- 阅读建议: 先看这里和失败核聚合，先复盘失败证据，再把下面的风险表、逐轮表格当附录。")
     return lines
 
 

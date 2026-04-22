@@ -58,7 +58,7 @@
 
 1. 运行时只维护一个 active reference。
    在还没有 gate-passed 版本时，它是 `baseline`；一旦出现 gate-passed 版本，它就是 `champion`。
-2. `planner` 用持久 session，只负责提出 round brief。
+2. `planner` 用持久 session，只负责提出 round brief；但顺序上先看结构化失败反馈，先判断上一轮为什么失败、这轮该继续还是转向，再写 brief。
 3. `edit_worker / repair_worker` 是短生命周期 worker，只负责把方向落到 [src/strategy_macd_aggressive.py](src/strategy_macd_aggressive.py)。
 4. 候选必须先形成真实源码 diff，再过 `smoke`，再跑完整 `train walk-forward + val`。
 5. `behavioral_noop`、空 diff、重复源码、重复结果盆地、非法 brief 都会被挡下。
