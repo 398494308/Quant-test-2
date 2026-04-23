@@ -123,9 +123,16 @@ REQUIRED_FUNCTIONS: tuple[str, ...] = (
     "_trend_followthrough_ok",
     "_long_entry_signal",
     "_short_entry_signal",
+    "normalize_entry_signal",
+    "strategy_decision",
     "strategy",
 )
 REQUIRED_FUNCTION_SET = frozenset(REQUIRED_FUNCTIONS)
+REQUIRED_TOP_LEVEL_CONSTANTS: tuple[str, ...] = (
+    "ENTRY_SIGNAL_ALIASES",
+    "ENTRY_PATH_TAGS",
+)
+REQUIRED_TOP_LEVEL_CONSTANT_SET = frozenset(REQUIRED_TOP_LEVEL_CONSTANTS)
 COMPLEXITY_MONITORED_FUNCTIONS: tuple[str, ...] = (
     "_is_sideways_regime",
     "_trend_quality_ok",
@@ -409,12 +416,9 @@ def repair_missing_required_functions(
 ) -> tuple[str, tuple[str, ...]]:
     normalized_candidate = normalize_strategy_source(candidate_source)
     missing = missing_required_functions(normalized_candidate)
-    repairable_missing = tuple(
-        function_name
-        for function_name in missing
-        if function_name in editable_regions
-    )
-    if not repairable_missing:
+    candidate_tree = ast.parse(normalized_candidate)
+    missing_constants = tuple(sorted(REQUIRED_TOP_LEVEL_CONSTANT_SET - _top_level_constant_names(candidate_tree)))
+    if not missing and not missing_constants:
         return normalized_candidate, ()
 
     candidate_regions = _editable_region_source_map(normalized_candidate, editable_regions)
@@ -423,7 +427,7 @@ def repair_missing_required_functions(
         candidate_regions,
         editable_regions,
     )
-    return repaired_source, repairable_missing
+    return repaired_source, tuple(sorted(missing))
 
 
 def _function_node_map(source: str, region_names: tuple[str, ...]) -> dict[str, ast.FunctionDef]:
@@ -1030,6 +1034,10 @@ def validate_strategy_source(
         raise StrategySourceError(f"missing required functions: {sorted(missing_functions)}")
 
     tree = ast.parse(normalized)
+    missing_constants = tuple(sorted(REQUIRED_TOP_LEVEL_CONSTANT_SET - _top_level_constant_names(tree)))
+    if missing_constants:
+        raise StrategySourceError(f"missing required top-level constants: {list(missing_constants)}")
+
     undefined_reference_errors = _undefined_function_reference_errors(normalized, tree)
     if undefined_reference_errors:
         raise StrategySourceError(undefined_reference_errors[0])

@@ -77,6 +77,7 @@ from research_v2.prompting import (
 )
 from research_v2.strategy_code import (
     REQUIRED_FUNCTIONS,
+    REQUIRED_TOP_LEVEL_CONSTANTS,
     StrategyCandidate,
     StrategyCoreFactor,
     StrategySourceError,
@@ -127,12 +128,17 @@ def _minimal_required_strategy_source(*, trend_quality_bool_ops: int = 0) -> str
         "_trend_followthrough_ok": "return True",
         "_long_entry_signal": "return None",
         "_short_entry_signal": "return None",
+        "normalize_entry_signal": "return ''",
+        "strategy_decision": "return None",
         "strategy": "return None",
     }
     blocks = [
         "# PARAMS_START",
         "PARAMS = {'breakout_volume_ratio_min': 1.0}",
         "# PARAMS_END",
+        "",
+        "ENTRY_SIGNAL_ALIASES = {}",
+        "ENTRY_PATH_TAGS = {}",
         "",
     ]
     for function_name in REQUIRED_FUNCTIONS:
@@ -776,6 +782,8 @@ class StrategyValidationFixesTest(unittest.TestCase):
             "_trend_followthrough_ok": "return True",
             "_long_entry_signal": "return False",
             "_short_entry_signal": "return False",
+            "normalize_entry_signal": "return ''",
+            "strategy_decision": "return None",
             "strategy": "return None",
         }
         if overrides:
@@ -786,6 +794,9 @@ class StrategyValidationFixesTest(unittest.TestCase):
             "PARAMS = {'intraday_adx_min': 10}",
             "# PARAMS_END",
             "",
+            "ENTRY_SIGNAL_ALIASES = {}",
+            "ENTRY_PATH_TAGS = {}",
+            "",
         ]
         for function_name in REQUIRED_FUNCTIONS:
             signature = "(*args, **kwargs)"
@@ -795,7 +806,9 @@ class StrategyValidationFixesTest(unittest.TestCase):
                 signature = "(market_state, side)"
             elif function_name == "_trend_followthrough_ok":
                 signature = "(market_state, side, trigger_price, current_close)"
-            elif function_name == "strategy":
+            elif function_name == "normalize_entry_signal":
+                signature = "(signal, fallback_side='')"
+            elif function_name in {"strategy_decision", "strategy"}:
                 signature = "(data, idx, positions, market_state)"
             blocks.append(f"def {function_name}{signature}:")
             blocks.append(f"    {body_by_function[function_name]}")
@@ -811,6 +824,22 @@ class StrategyValidationFixesTest(unittest.TestCase):
         source = (REPO_ROOT / "backups/strategy_macd_aggressive_v2_best.py").read_text()
 
         validate_strategy_source(source)
+
+    def test_validate_strategy_source_rejects_missing_contract_function(self):
+        source = self._minimal_validation_source().replace(
+            "def strategy_decision(data, idx, positions, market_state):\n    return None\n\n",
+            "",
+            1,
+        )
+
+        with self.assertRaisesRegex(StrategySourceError, r"strategy_decision"):
+            validate_strategy_source(source)
+
+    def test_validate_strategy_source_rejects_missing_contract_constant(self):
+        source = self._minimal_validation_source().replace("ENTRY_PATH_TAGS = {}\n", "", 1)
+
+        with self.assertRaisesRegex(StrategySourceError, r"ENTRY_PATH_TAGS"):
+            validate_strategy_source(source)
 
     def test_is_sideways_regime_handles_bull_front_run_path(self):
         market_state = {
@@ -952,6 +981,9 @@ PARAMS = {
 }
 # PARAMS_END
 
+ENTRY_SIGNAL_ALIASES = {}
+ENTRY_PATH_TAGS = {}
+
 def _is_sideways_regime(*args, **kwargs):
     return False
 
@@ -990,6 +1022,12 @@ def _long_entry_signal(*args, **kwargs):
 
 def _short_entry_signal(*args, **kwargs):
     return False
+
+def normalize_entry_signal(signal, fallback_side=''):
+    return ''
+
+def strategy_decision(data, idx, positions, market_state):
+    return None
 
 def strategy(*args, **kwargs):
     return None
@@ -1186,6 +1224,9 @@ def strategy(*args, **kwargs):
 PARAMS = {'intraday_adx_min': 10, 'hourly_adx_min': 10, 'fourh_adx_min': 10, 'breakout_adx_min': 10, 'breakdown_adx_min': 10, 'breakout_lookback': 10, 'breakdown_lookback': 10, 'breakout_rsi_min': 40, 'breakout_rsi_max': 60, 'breakdown_rsi_min': 20, 'breakdown_rsi_max': 60, 'breakout_volume_ratio_min': 1.0, 'breakdown_volume_ratio_min': 1.0, 'breakout_body_ratio_min': 0.3, 'breakdown_body_ratio_min': 0.3, 'breakout_close_pos_min': 0.5, 'breakdown_close_pos_max': 0.5, 'intraday_ema_fast': 9, 'intraday_ema_slow': 20, 'hourly_ema_fast': 10, 'hourly_ema_slow': 20, 'fourh_ema_fast': 10, 'fourh_ema_slow': 20, 'macd_fast': 12, 'macd_slow': 26, 'macd_signal': 9, 'volume_lookback': 10}
 # PARAMS_END
 
+ENTRY_SIGNAL_ALIASES = {}
+ENTRY_PATH_TAGS = {}
+
 def helper():
     return 1
 
@@ -1212,6 +1253,9 @@ def strategy(*args, **kwargs):
 PARAMS = {'intraday_adx_min': 10, 'hourly_adx_min': 10, 'fourh_adx_min': 10, 'breakout_adx_min': 10, 'breakdown_adx_min': 10, 'breakout_lookback': 10, 'breakdown_lookback': 10, 'breakout_rsi_min': 40, 'breakout_rsi_max': 60, 'breakdown_rsi_min': 20, 'breakdown_rsi_max': 60, 'breakout_volume_ratio_min': 1.0, 'breakdown_volume_ratio_min': 1.0, 'breakout_body_ratio_min': 0.3, 'breakdown_body_ratio_min': 0.3, 'breakout_close_pos_min': 0.5, 'breakdown_close_pos_max': 0.5, 'intraday_ema_fast': 9, 'intraday_ema_slow': 20, 'hourly_ema_fast': 10, 'hourly_ema_slow': 20, 'fourh_ema_fast': 10, 'fourh_ema_slow': 20, 'macd_fast': 12, 'macd_slow': 26, 'macd_signal': 9, 'volume_lookback': 10}
 # PARAMS_END
 
+ENTRY_SIGNAL_ALIASES = {}
+ENTRY_PATH_TAGS = {}
+
 def helper():
     return 1
 
@@ -1236,6 +1280,9 @@ def strategy(*args, **kwargs):
 # PARAMS_START
 PARAMS = {'intraday_adx_min': 10}
 # PARAMS_END
+
+ENTRY_SIGNAL_ALIASES = {}
+ENTRY_PATH_TAGS = {}
 
 def helper():
     return 1
@@ -1278,6 +1325,12 @@ def _long_entry_signal(*args, **kwargs):
 
 def _short_entry_signal(*args, **kwargs):
     return False
+
+def normalize_entry_signal(signal, fallback_side=''):
+    return ''
+
+def strategy_decision(data, idx, positions, market_state):
+    return None
 
 def strategy(*args, **kwargs):
     return helper()
@@ -1335,12 +1388,17 @@ class JournalPromptFixesTest(unittest.TestCase):
             "_trend_followthrough_ok": "return True",
             "_long_entry_signal": "return None",
             "_short_entry_signal": "return None",
+            "normalize_entry_signal": "return ''",
+            "strategy_decision": "return None",
             "strategy": "return None",
         }
         blocks = [
             "# PARAMS_START",
             "PARAMS = {'breakout_volume_ratio_min': 1.0}",
             "# PARAMS_END",
+            "",
+            "ENTRY_SIGNAL_ALIASES = {}",
+            "ENTRY_PATH_TAGS = {}",
             "",
         ]
         for function_name in REQUIRED_FUNCTIONS:
@@ -2383,6 +2441,21 @@ class FreqtradeAdapterFixesTest(unittest.TestCase):
         tail = signal_frame.tail(1).iloc[0]
         self.assertFalse(pd.isna(tail["trade_count_ratio_1h"]))
         self.assertFalse(pd.isna(tail["flow_imbalance_4h"]))
+
+    def test_core_signal_decision_falls_back_when_strategy_contract_helpers_are_missing(self):
+        original_core = ft_adapter.core_strategy
+
+        class LegacyCore:
+            strategy = staticmethod(lambda ohlcv, idx, positions, market_state: "long_breakout")
+
+        try:
+            ft_adapter.core_strategy = LegacyCore()
+            signal, path_tag = ft_adapter._core_signal_decision([], 0, {})
+        finally:
+            ft_adapter.core_strategy = original_core
+
+        self.assertEqual(signal, "long_pullback")
+        self.assertEqual(path_tag, "long_pullback")
 
     def test_apply_entry_logic_uses_path_tag_as_enter_tag(self):
         frame = pd.DataFrame(

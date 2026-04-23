@@ -129,15 +129,16 @@ def _resolve_strategy_signal_decision(strategy_func, data, idx, positions, marke
             return "short_breakdown"
         return text
 
-    def _resolve_path_tag(raw_signal, normalized_signal, raw_path_tag=""):
+    def _resolve_path_tag(raw_signal, normalized_signal, raw_path_key="", raw_path_tag=""):
         if raw_path_tag:
             return raw_path_tag
-        tag = str(path_tags.get(str(raw_signal or "").strip(), "")).strip()
-        if tag:
-            return tag
-        tag = str(path_tags.get(normalized_signal, "")).strip()
-        if tag:
-            return tag
+        for candidate in (raw_path_key, raw_signal):
+            text = str(candidate or "").strip()
+            if not text or text == normalized_signal:
+                continue
+            tag = str(path_tags.get(text, "")).strip()
+            if tag:
+                return tag
         return normalized_signal
 
     if callable(decision_hook):
@@ -149,6 +150,7 @@ def _resolve_strategy_signal_decision(strategy_func, data, idx, positions, marke
                 return normalized_signal, _resolve_path_tag(
                     raw_signal,
                     normalized_signal,
+                    str(payload.get("entry_path_key", "")).strip(),
                     str(payload.get("entry_path_tag", "")).strip(),
                 )
 

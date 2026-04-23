@@ -61,6 +61,34 @@ PARAMS = {
 # PARAMS_END
 
 
+ENTRY_SIGNAL_ALIASES = {
+    "long_breakout": "long_pullback",
+    "long_pullback": "long_pullback",
+    "long_reaccel": "long_pullback",
+    "long_relay": "long_pullback",
+    "long_impulse": "long_pullback",
+    "long_retest": "long_pullback",
+    "short_breakdown": "short_breakdown",
+    "short_bounce_fail": "short_breakdown",
+    "short_reaccel": "short_breakdown",
+    "short_impulse": "short_breakdown",
+    "short_retest": "short_breakdown",
+}
+ENTRY_PATH_TAGS = {
+    "long_breakout": "long_impulse",
+    "long_pullback": "long_retest",
+    "long_reaccel": "long_reaccel",
+    "long_relay": "long_relay",
+    "long_impulse": "long_impulse",
+    "long_retest": "long_retest",
+    "short_breakdown": "short_impulse",
+    "short_bounce_fail": "short_retest",
+    "short_reaccel": "short_reaccel",
+    "short_impulse": "short_impulse",
+    "short_retest": "short_retest",
+}
+
+
 FUNNEL_SIDES = ("long", "short")
 FUNNEL_STAGES = ("sideways_pass", "outer_context_pass", "path_pass", "final_veto_pass")
 _FUNNEL_DIAGNOSTICS = {}
@@ -91,6 +119,25 @@ def get_funnel_diagnostics():
 
 
 reset_funnel_diagnostics()
+
+
+def normalize_entry_signal(signal, fallback_side=""):
+    text = str(signal or "").strip()
+    normalized = ENTRY_SIGNAL_ALIASES.get(text, "")
+    if normalized:
+        return normalized
+    side = str(fallback_side or "").strip().lower()
+    if not text:
+        if side == "long":
+            return "long_pullback"
+        if side == "short":
+            return "short_breakdown"
+        return ""
+    if text.startswith("long_"):
+        return "long_pullback"
+    if text.startswith("short_"):
+        return "short_breakdown"
+    return text
 
 
 def _avg(data, start, end, key):
@@ -847,6 +894,7 @@ def _trend_followthrough_ok(market_state, side, trigger_price, current_close):
 
 def long_outer_context_ok(context, market_state, params):
     long_state = _build_long_trend_state(context, market_state, params)
+    context["long_outer_lane"] = ""
     reclaim_ready = (
         context["current"]["close"] > market_state["ema_fast"] > market_state["ema_slow"]
         and market_state["macd_line"] > market_state["signal_line"]
@@ -861,15 +909,43 @@ def long_outer_context_ok(context, market_state, params):
             SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 2.92,
         )
     )
+    context["long_reclaim_ready"] = reclaim_ready
     base_ownership_ready = long_state["fourh_bull_base"] and (
         long_state["intraday_bull"] or reclaim_ready
     )
-    early_rotation_ready = reclaim_ready and long_state["fourh_bull_turn"]
-    return (
+    mature_trend_lane = (
         _trend_quality_long(market_state)
         and long_state["hourly_bull"]
-        and (base_ownership_ready or early_rotation_ready)
+        and base_ownership_ready
     )
+    early_turn_outer_lane = (
+        _trend_quality_long(market_state)
+        and reclaim_ready
+        and long_state["fourh_bull_turn"]
+        and not long_state["hourly_bull"]
+        and context["hourly"]["close"] > context["hourly"]["ema_slow"]
+        and context["hourly"]["ema_fast"] >= context["hourly"]["ema_slow"]
+        and context["hourly"]["macd_line"] > context["hourly"]["signal_line"]
+        and context["hourly"]["trend_spread_pct"] >= max(
+            SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 0.52,
+            context["atr_ratio"] * 0.32,
+        )
+        and context["hourly"]["ema_slow_slope_pct"] >= context["atr_ratio"] * 0.022
+        and context["hourly"]["adx"] >= max(params["hourly_adx_min"] - 2.5, 16.0)
+        and context["hourly_fast_extension_pct"] <= max(
+            context["atr_ratio"] * 0.76,
+            SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 1.68,
+        )
+        and context["hourly_anchor_extension_pct"] <= max(
+            context["atr_ratio"] * 1.06,
+            SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 2.56,
+        )
+    )
+    if mature_trend_lane:
+        context["long_outer_lane"] = "trend"
+    elif early_turn_outer_lane:
+        context["long_outer_lane"] = "early_turn"
+    return mature_trend_lane or early_turn_outer_lane
 
 
 def long_breakout_ok(context, market_state, params):
@@ -1176,7 +1252,7 @@ def _short_entry_signal(data, idx, positions, market_state):
     return signal if signal == "short_breakdown" else None
 
 
-def strategy(data, idx, positions, market_state):
+def strategy_decision(data, idx, positions, market_state):
     p = PARAMS
     if idx < p["min_history"]:
         return None
@@ -1224,7 +1300,19 @@ def strategy(data, idx, positions, market_state):
                 long_ownership_relay,
             ):
                 _record_funnel_pass("long", "final_veto_pass")
-                return "long_pullback"
+                path_key = "long_relay"
+                if long_breakout_path:
+                    path_key = "long_breakout"
+                elif long_pullback_path:
+                    path_key = "long_pullback"
+                elif long_reaccel_path:
+                    path_key = "long_reaccel"
+                return {
+                    "entry_signal": "long_pullback",
+                    "entry_side": "long",
+                    "entry_path_key": path_key,
+                    "entry_path_tag": ENTRY_PATH_TAGS.get(path_key, path_key),
+                }
 
     if short_outer_context_ok(context, market_state, p):
         _record_funnel_pass("short", "outer_context_pass")
@@ -1242,6 +1330,137 @@ def strategy(data, idx, positions, market_state):
                 short_reaccel_path,
             ):
                 _record_funnel_pass("short", "final_veto_pass")
-                return "short_breakdown"
+                path_key = "short_breakdown"
+                if short_bounce_fail_path:
+                    path_key = "short_bounce_fail"
+                elif short_reaccel_path:
+                    path_key = "short_reaccel"
+                return {
+                    "entry_signal": "short_breakdown",
+                    "entry_side": "short",
+                    "entry_path_key": path_key,
+                    "entry_path_tag": ENTRY_PATH_TAGS.get(path_key, path_key),
+                }
 
+    return None
+
+
+def strategy(data, idx, positions, market_state):
+    p = PARAMS
+    if idx < p["min_history"]:
+        return None
+
+    context = _build_signal_context(data, idx, market_state, p)
+    if context is None:
+        return None
+    if _is_sideways_regime(market_state):
+        return None
+
+    _record_funnel_pass("long", "sideways_pass")
+    _record_funnel_pass("short", "sideways_pass")
+
+    if long_outer_context_ok(context, market_state, p):
+        _record_funnel_pass("long", "outer_context_pass")
+        long_breakout_path = long_breakout_ok(context, market_state, p)
+        long_pullback_path = long_pullback_ok(context, market_state, p)
+        long_reaccel_path = long_trend_reaccel_ok(context, market_state, p)
+        early_turn_outer_lane = context.get("long_outer_lane") == "early_turn"
+        long_handoff_ready = (
+            early_turn_outer_lane
+            and not long_signal_path_ok(long_breakout_path, long_pullback_path, long_reaccel_path)
+            and context["long_reclaim_ready"]
+            and context["current"]["high"] >= context["breakout_high"]
+            and context["current"]["close"] >= context["breakout_high"] * (1.0 - context["atr_ratio"] * 0.01)
+            and context["breakout_distance_pct"] <= context["atr_ratio"] * 0.10
+            and context["current"]["close"] >= context["prev"]["close"]
+            and context["current_candle"]["close_pos"] >= max(p["breakout_close_pos_min"] - 0.03, 0.57)
+            and context["volume_ratio"] >= max(p["breakout_volume_ratio_min"] - 0.12, 0.98)
+            and context["current"]["volume"] >= max(context["prev_volume"] * 0.90, context["recent_volume_avg"] * 0.90)
+            and _flow_entry_ok(
+                market_state,
+                context["hourly"],
+                context["fourh"],
+                p,
+                "long",
+                strong=False,
+            )
+        )
+        long_handoff_breakout = (
+            long_handoff_ready
+            and context["current"]["close"] >= context["breakout_high"] * (1.0 + p["breakout_buffer_pct"] * 0.5)
+            and context["current"]["close"] > context["prev"]["high"]
+            and context["current_range"] >= context["recent_range_avg"] * 0.84
+            and context["current_candle"]["body_ratio"] >= max(p["breakout_body_ratio_min"] - 0.06, 0.24)
+        )
+        long_handoff_pullback = (
+            long_handoff_ready
+            and not long_handoff_breakout
+            and context["prev"]["low"] <= context["breakout_high"] * (1.0 + context["atr_ratio"] * 0.12)
+            and context["prev"]["close"] <= context["prev"]["high"] - context["prev_range"] * 0.12
+            and context["current"]["close"] > max(
+                context["prev"]["close"],
+                context["breakout_high"] * (1.0 - context["atr_ratio"] * 0.003),
+            )
+            and context["current_range"] >= max(context["prev_range"] * 0.92, context["recent_range_avg"] * 0.82)
+        )
+        long_breakout_path = long_breakout_path or long_handoff_breakout
+        long_pullback_path = long_pullback_path or long_handoff_pullback
+        long_ownership_relay = (
+            not early_turn_outer_lane
+            and not long_signal_path_ok(long_breakout_path, long_pullback_path, long_reaccel_path)
+            and context["long_reclaim_ready"]
+            and context["current"]["high"] >= context["breakout_high"]
+            and context["current"]["close"] >= context["breakout_high"] * (1.0 + p["breakout_buffer_pct"] * 0.35)
+            and context["breakout_distance_pct"] >= 0.0
+            and context["breakout_distance_pct"] <= context["atr_ratio"] * 0.08
+            and context["current"]["close"] >= context["prev"]["close"]
+            and context["current_candle"]["close_pos"] >= max(p["breakout_close_pos_min"] - 0.02, 0.58)
+            and context["current"]["volume"] >= max(context["prev_volume"] * 0.90, context["recent_volume_avg"] * 0.90)
+            and _flow_entry_ok(
+                market_state,
+                context["hourly"],
+                context["fourh"],
+                p,
+                "long",
+                strong=False,
+            )
+        )
+        if long_signal_path_ok(long_breakout_path, long_pullback_path, long_reaccel_path) or long_ownership_relay:
+            _record_funnel_pass("long", "path_pass")
+            if long_final_veto_clear(
+                context,
+                market_state,
+                p,
+                long_breakout_path,
+                long_pullback_path,
+                long_reaccel_path,
+                long_ownership_relay,
+            ):
+                _record_funnel_pass("long", "final_veto_pass")
+                path_key = "long_relay"
+                if long_breakout_path:
+                    path_key = "long_breakout"
+                elif long_pullback_path:
+                    path_key = "long_pullback"
+                elif long_reaccel_path:
+                    path_key = "long_reaccel"
+                return normalize_entry_signal("long_pullback", fallback_side="long") or None
+
+    if short_outer_context_ok(context, market_state, p):
+        _record_funnel_pass("short", "outer_context_pass")
+        short_breakdown_path = short_breakdown_ok(context, market_state, p)
+        short_bounce_fail_path = short_bounce_fail_ok(context, market_state, p)
+        short_reaccel_path = short_trend_reaccel_ok(context, market_state, p)
+        if long_signal_path_ok(short_breakdown_path, short_bounce_fail_path, short_reaccel_path):
+            _record_funnel_pass("short", "path_pass")
+            if short_final_veto_clear(
+                context,
+                market_state,
+                p,
+                short_breakdown_path,
+                short_bounce_fail_path,
+                short_reaccel_path,
+            ):
+                _record_funnel_pass("short", "final_veto_pass")
+                return normalize_entry_signal("short_breakdown", fallback_side="short") or None
     return None

@@ -27,6 +27,27 @@ DIFF_SAMPLE_LIMIT = 5
 DATA_PATHS = default_market_data_paths()
 
 
+def _normalize_signal(raw_signal, fallback_side=""):
+    normalize_hook = getattr(strat_module, "normalize_entry_signal", None)
+    if callable(normalize_hook):
+        normalized = str(normalize_hook(raw_signal, fallback_side=fallback_side) or "").strip()
+        if normalized:
+            return normalized
+    text = str(raw_signal or "").strip()
+    side = str(fallback_side or "").strip().lower()
+    if not text:
+        if side == "long":
+            return "long_pullback"
+        if side == "short":
+            return "short_breakdown"
+        return ""
+    if text.startswith("long_"):
+        return "long_pullback"
+    if text.startswith("short_"):
+        return "short_breakdown"
+    return text
+
+
 def run_custom_engine():
     """运行自研引擎，返回结果和入场信号列表。"""
     bt_engine.load_ohlcv_data.cache_clear()
@@ -132,12 +153,12 @@ def run_core_signal_check():
         decision_hook = getattr(strat_module, "strategy_decision", None)
         if callable(decision_hook):
             decision = decision_hook(intraday_all, idx, [], market_state)
-            signal = strat_module.normalize_entry_signal(
+            signal = _normalize_signal(
                 (decision or {}).get("entry_signal", ""),
                 fallback_side=(decision or {}).get("entry_side", ""),
             )
         else:
-            signal = strat_module.normalize_entry_signal(strat_module.strategy(intraday_all, idx, [], market_state))
+            signal = _normalize_signal(strat_module.strategy(intraday_all, idx, [], market_state))
         if signal == "long_pullback":
             long_timestamps.append(current_ts)
         elif signal == "short_breakdown":

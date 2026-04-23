@@ -56,6 +56,42 @@ P = core_strategy.PARAMS
 E = backtest_module.EXIT_PARAMS
 
 
+def _normalize_core_signal(raw_signal, fallback_side="") -> str:
+    normalize_hook = getattr(core_strategy, "normalize_entry_signal", None)
+    if callable(normalize_hook):
+        normalized = str(normalize_hook(raw_signal, fallback_side=fallback_side) or "").strip()
+        if normalized:
+            return normalized
+    text = str(raw_signal or "").strip()
+    side = str(fallback_side or "").strip().lower()
+    if not text:
+        if side == "long":
+            return "long_pullback"
+        if side == "short":
+            return "short_breakdown"
+        return ""
+    if text.startswith("long_"):
+        return "long_pullback"
+    if text.startswith("short_"):
+        return "short_breakdown"
+    return text
+
+
+def _resolve_core_path_tag(raw_signal, normalized_signal: str, *, raw_path_key="", raw_path_tag="") -> str:
+    explicit_tag = str(raw_path_tag or "").strip()
+    if explicit_tag:
+        return explicit_tag
+    path_tags = getattr(core_strategy, "ENTRY_PATH_TAGS", {}) or {}
+    for candidate in (raw_path_key, raw_signal):
+        text = str(candidate or "").strip()
+        if not text or text == normalized_signal:
+            continue
+        resolved = str(path_tags.get(text, "")).strip()
+        if resolved:
+            return resolved
+    return str(normalized_signal or "").strip()
+
+
 def _with_timestamp(dataframe: DataFrame) -> DataFrame:
     frame = dataframe.copy()
     if "timestamp" in frame.columns:
@@ -237,24 +273,23 @@ def _core_signal_decision(ohlcv: list[dict], idx: int, market_state: dict) -> tu
     if callable(decision_hook):
         payload = decision_hook(ohlcv, idx, [], market_state)
         if isinstance(payload, dict):
-            signal = core_strategy.normalize_entry_signal(
+            signal = _normalize_core_signal(
                 payload.get("entry_signal", ""),
                 fallback_side=payload.get("entry_side", ""),
             )
             if signal:
-                path_tag = str(payload.get("entry_path_tag", "")).strip()
-                if not path_tag:
-                    path_tag = str(core_strategy.ENTRY_PATH_TAGS.get(signal, signal))
-                return signal, path_tag
+                return signal, _resolve_core_path_tag(
+                    payload.get("entry_signal", ""),
+                    signal,
+                    raw_path_key=payload.get("entry_path_key", ""),
+                    raw_path_tag=payload.get("entry_path_tag", ""),
+                )
 
     raw_signal = core_strategy.strategy(ohlcv, idx, [], market_state)
-    signal = core_strategy.normalize_entry_signal(raw_signal)
+    signal = _normalize_core_signal(raw_signal)
     if not signal:
         return None, None
-    path_tag = str(core_strategy.ENTRY_PATH_TAGS.get(str(raw_signal or "").strip(), "")).strip()
-    if not path_tag:
-        path_tag = str(core_strategy.ENTRY_PATH_TAGS.get(signal, signal))
-    return signal, path_tag
+    return signal, _resolve_core_path_tag(raw_signal, signal)
 
 
 def apply_entry_logic(dataframe: DataFrame) -> DataFrame:
@@ -404,7 +439,7 @@ def build_signal_frame(df_15m: DataFrame, df_1h: DataFrame | None = None, df_4h:
 
 def _trade_entry_tag(trade: Trade) -> str:
     entry_tag = getattr(trade, "enter_tag", None) or getattr(trade, "buy_tag", None)
-    normalized = core_strategy.normalize_entry_signal(
+    normalized = _normalize_core_signal(
         entry_tag,
         fallback_side="short" if getattr(trade, "is_short", False) else "long",
     )

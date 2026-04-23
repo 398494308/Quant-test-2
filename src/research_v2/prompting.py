@@ -7,6 +7,7 @@ from typing import Any
 from research_v2.journal import ORDINARY_REGION_FAMILIES
 from research_v2.strategy_code import (
     REQUIRED_FUNCTIONS,
+    REQUIRED_TOP_LEVEL_CONSTANTS,
 )
 
 # ==================== 编辑边界 ====================
@@ -44,8 +45,9 @@ EDITABLE_REGIONS = (
 
 
 def _required_symbol_text() -> str:
+    constant_symbols = "、".join(f"`{name}`" for name in REQUIRED_TOP_LEVEL_CONSTANTS)
     function_symbols = "、".join(f"`{function_name}()`" for function_name in REQUIRED_FUNCTIONS)
-    return f"`PARAMS`、{function_symbols}"
+    return f"`PARAMS`、{constant_symbols}、{function_symbols}"
 
 
 def _ordinary_family_text() -> str:
