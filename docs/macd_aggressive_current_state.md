@@ -101,6 +101,8 @@
 6. 主进程
    负责 reviewer gating、真实 diff 检查、smoke、完整评估、gate、journal、Discord、memory 和 stage/session 管理
 
+更直观的流程图见 [docs/agent_subagent_workflow.md](./agent_subagent_workflow.md)。
+
 当前不再存在这些自动行为：
 
 - 不再自动切 `factor_admission`

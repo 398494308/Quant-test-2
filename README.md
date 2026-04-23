@@ -65,6 +65,46 @@
 6. `behavioral_noop`、空 diff、重复源码、重复结果盆地、非法 brief、reviewer 连续打回都会被挡下。
 7. complexity 诊断仍会进入 journal、wiki 和 prompt，但不会再自动改研究车道，也不会单独沉淀一条 `working_base`。
 
+## Agent / Subagent 工作流
+
+下面这张图按“竖着看”的方式画，`planner` 的持久主 session 在中轴；其余都是围绕它工作的短生命周期 subagent。
+
+```mermaid
+flowchart TB
+    A[主进程开始第 N 轮] --> B[主 session / planner<br/>读取 reviewer 卡、history package、failure wiki、duplicate watchlist]
+    B --> C[planner 产出 draft round brief]
+
+    C --> D[reviewer 子会话<br/>短生命周期审稿]
+    D --> E{PASS or REVISE}
+
+    E -- REVISE --> F[planner 吸收 reviewer 打回信息<br/>重写 draft round brief]
+    F --> D
+
+    E -- PASS --> G[edit_worker 子会话<br/>把通过审稿的 brief 落到策略源码]
+    G --> H{源码校验 / no-edit / 运行报错?}
+
+    H -- 修错 --> I[repair_worker 子会话<br/>只修当前轮技术问题]
+    I --> H
+
+    H -- 通过 --> J[主进程执行真实 diff 检查<br/>smoke / full eval / gate]
+    J --> K[summary_worker 子会话<br/>按最终真实 diff 回写候选摘要]
+    K --> L[主进程写 journal / wiki / reviewer 卡 / heartbeat]
+    L --> M[更新当前 stage 记忆]
+    M --> B
+```
+
+当前这套工作流的意思是：
+
+- `planner` 仍然负责研究方向，但它先给出的是 `draft brief`，不是直接进入落码的最终指令。
+- `reviewer` 不是第二个 planner。它不能替 `planner` 发明新方向，只能判断这份 draft 当前值不值得试。
+- 如果 `reviewer=REVISE`，本轮不会进入 `edit_worker`。`planner` 必须先吸收打回理由，再重写 draft。
+- 如果 `reviewer=PASS`，才会进入 `edit_worker` 落码。
+- `repair_worker` 只在同轮技术修错时出现，不参与研究方向判断。
+- `summary_worker` 只根据最终真实 diff 回写候选摘要，避免“原 brief”和“最终代码”错位。
+- 每轮结束后，主进程会把结果写回 `journal / wiki / reviewer_summary_card`。下一轮 `planner` 会先读这些前台记忆，再继续研究。
+
+更完整的说明见 [docs/agent_subagent_workflow.md](docs/agent_subagent_workflow.md)。
+
 ## 手工瘦身 SOP
 
 当前复杂度不再由系统自动压缩。推荐人工 SOP：
@@ -119,6 +159,8 @@ python3 scripts/research_macd_aggressive_v2.py --once
   用非工程语言解释当前策略在看什么、怎么开仓、怎么退出。
 - [docs/macd_aggressive_current_state.md](docs/macd_aggressive_current_state.md)
   解释当前评分、gate、session、memory、Discord 播报和运行目录。
+- [docs/agent_subagent_workflow.md](docs/agent_subagent_workflow.md)
+  专门解释 `planner / reviewer / edit_worker / repair_worker / summary_worker / 主进程` 之间怎么配合。
 - [real-money-test/README.md](real-money-test/README.md)
   解释 `freqtrade` dry-run / live 外壳如何接这套策略。
 
