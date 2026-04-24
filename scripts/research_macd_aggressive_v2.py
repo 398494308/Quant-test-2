@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
 import contextlib
 import importlib
 import json
@@ -127,6 +128,8 @@ REVIEWER_REQUIRED_FIELDS = (
 )
 MAX_REVIEWER_REPAIR_ATTEMPTS = 1
 MAX_REVIEWER_REVISE_ATTEMPTS = 2
+PREPARED_BACKTEST_CONTEXT_CACHE_LIMIT = 2
+NON_PERSISTENT_CODEX_TRANSIENT_RETRY_LIMIT = 1
 
 best_source = ""
 best_report: EvaluationReport | None = None
@@ -137,6 +140,9 @@ iteration_counter = 0
 reference_stage_started_at = ""
 reference_stage_iteration = 0
 research_session_state: dict[str, Any] = {}
+prepared_backtest_context_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
+cached_base_behavior_key = ""
+cached_base_behavior_profile: list[dict[str, Any]] | None = None
 
 logging.basicConfig(
     filename=RUNTIME.paths.log_file,
@@ -950,13 +956,82 @@ def _selected_smoke_windows() -> list[Any]:
     return select_smoke_windows(WINDOWS, RUNTIME.smoke_window_count)
 
 
+def _stable_cache_text(payload: Any) -> str:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _file_cache_signature(path: Path | str) -> dict[str, Any]:
+    resolved = Path(path).expanduser()
+    try:
+        stat = resolved.stat()
+    except OSError:
+        return {
+            "path": str(resolved),
+            "exists": False,
+        }
+    try:
+        normalized_path = str(resolved.resolve())
+    except OSError:
+        normalized_path = str(resolved)
+    return {
+        "path": normalized_path,
+        "exists": True,
+        "mtime_ns": stat.st_mtime_ns,
+        "size": stat.st_size,
+    }
+
+
+def _backtest_data_file_signatures() -> dict[str, Any]:
+    return {
+        "intraday": _file_cache_signature(backtest_module.DEFAULT_INTRADAY_FILE),
+        "hourly": _file_cache_signature(backtest_module.DEFAULT_HOURLY_FILE),
+        "sentiment": _file_cache_signature(backtest_module.DEFAULT_SENTIMENT_FILE),
+        "execution": _file_cache_signature(backtest_module.DEFAULT_EXECUTION_FILE),
+        "funding": _file_cache_signature(backtest_module.DEFAULT_FUNDING_FILE),
+    }
+
+
+def _prepared_backtest_context_cache_key(
+    strategy_params: dict[str, Any],
+    *,
+    exit_params: dict[str, Any],
+) -> str:
+    return _stable_cache_text(
+        {
+            "strategy_params": strategy_params,
+            "exit_params": exit_params,
+            "files": _backtest_data_file_signatures(),
+        }
+    )
+
+
 def _prepare_backtest_context() -> dict[str, Any]:
-    return backtest_module.prepare_backtest_context(
+    exit_params = dict(backtest_module.EXIT_PARAMS)
+    cache_key = _prepared_backtest_context_cache_key(
+        strategy_module.PARAMS,
+        exit_params=exit_params,
+    )
+    cached = prepared_backtest_context_cache.pop(cache_key, None)
+    if cached is not None:
+        prepared_backtest_context_cache[cache_key] = cached
+        return cached
+
+    prepared_context = backtest_module.prepare_backtest_context(
         strategy_module.PARAMS,
         intraday_file=backtest_module.DEFAULT_INTRADAY_FILE,
         hourly_file=backtest_module.DEFAULT_HOURLY_FILE,
-        exit_params=backtest_module.EXIT_PARAMS,
+        exit_params=exit_params,
     )
+    prepared_backtest_context_cache[cache_key] = prepared_context
+    while len(prepared_backtest_context_cache) > PREPARED_BACKTEST_CONTEXT_CACHE_LIMIT:
+        prepared_backtest_context_cache.popitem(last=False)
+    return prepared_context
 
 
 def _evaluation_windows() -> list[Any]:
@@ -1305,6 +1380,10 @@ def _smoke_behavior_profile(*, heartbeat_phase: str) -> list[dict[str, Any]]:
         heartbeat_phase=heartbeat_phase,
         prepared_context=prepared_context,
     )
+    return _behavior_profile_from_results(results)
+
+
+def _behavior_profile_from_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         {
             "window": item["window"].label,
@@ -1314,6 +1393,45 @@ def _smoke_behavior_profile(*, heartbeat_phase: str) -> list[dict[str, Any]]:
         }
         for item in results
     ]
+
+
+def _smoke_window_signature() -> str:
+    return _stable_cache_text(
+        [
+            {
+                "group": window.group,
+                "label": window.label,
+                "start_date": window.start_date,
+                "end_date": window.end_date,
+            }
+            for window in _selected_smoke_windows()
+        ]
+    )
+
+
+def _base_behavior_profile_cache_key(base_source: str) -> str:
+    return _stable_cache_text(
+        {
+            "base_source_hash": source_hash(base_source),
+            "smoke_windows": _smoke_window_signature(),
+            "files": _backtest_data_file_signatures(),
+        }
+    )
+
+
+def _base_behavior_profile(base_source: str) -> list[dict[str, Any]]:
+    global cached_base_behavior_key, cached_base_behavior_profile
+
+    cache_key = _base_behavior_profile_cache_key(base_source)
+    if cache_key == cached_base_behavior_key and cached_base_behavior_profile is not None:
+        return cached_base_behavior_profile
+
+    write_strategy_source(RUNTIME.paths.strategy_file, base_source)
+    reload_strategy_module()
+    profile = _smoke_behavior_profile(heartbeat_phase="base_smoke_behavior")
+    cached_base_behavior_key = cache_key
+    cached_base_behavior_profile = profile
+    return profile
 
 
 def _behavior_profile_changed(
@@ -2241,6 +2359,7 @@ def _run_model_text_request(
     use_persistent_session: bool = True,
 ) -> str:
     session_id = _active_research_session_id() if use_persistent_session else ""
+    requested_session_id = session_id
     use_deepseek_planner = _planner_uses_deepseek(session_kind)
     provider_name = "deepseek" if use_deepseek_planner else "codex"
     resolved_system_prompt = (
@@ -2279,15 +2398,34 @@ def _run_model_text_request(
 
     response_metadata: dict[str, Any] = {}
     started_at = time.monotonic()
-    try:
-        raw_text = _invoke(session_id or None, response_metadata)
-    except StrategyGenerationSessionError as exc:
-        if not session_id or not use_persistent_session:
-            raise
-        log_info(f"{provider_name} session 无法恢复，改为新 session 重试: {exc}")
-        _clear_research_session_state(remove_workspace=False, reason="invalid provider session")
-        response_metadata = {}
-        raw_text = _invoke(None, response_metadata)
+    transient_retry_limit = (
+        NON_PERSISTENT_CODEX_TRANSIENT_RETRY_LIMIT
+        if provider_name == "codex" and not use_persistent_session
+        else 0
+    )
+    transient_retry_attempt = 0
+
+    while True:
+        try:
+            raw_text = _invoke(session_id or None, response_metadata)
+            break
+        except StrategyGenerationSessionError as exc:
+            if not session_id or not use_persistent_session:
+                raise
+            log_info(f"{provider_name} session 无法恢复，改为新 session 重试: {exc}")
+            _clear_research_session_state(remove_workspace=False, reason="invalid provider session")
+            response_metadata = {}
+            session_id = ""
+        except StrategyGenerationTransientError as exc:
+            if transient_retry_attempt >= transient_retry_limit:
+                raise
+            transient_retry_attempt += 1
+            response_metadata = {}
+            log_info(
+                f"{provider_name} {phase} 短重试 "
+                f"{transient_retry_attempt}/{transient_retry_limit}: "
+                f"{str(exc).splitlines()[0]}"
+            )
 
     resolved_session_id = (
         str(response_metadata.get("session_id", "")).strip()
@@ -2308,7 +2446,7 @@ def _run_model_text_request(
             "provider_name": provider_name,
             "session_kind": session_kind,
             "persistent_session": bool(use_persistent_session),
-            "requested_resume": bool(session_id),
+            "requested_resume": bool(requested_session_id),
             "resolved_session_id": resolved_session_id if use_persistent_session else "",
             "resumed": bool(response_metadata.get("resumed", False)),
             "prompt_chars": len(prompt),
@@ -3773,10 +3911,16 @@ def _activate_candidate(candidate: StrategyCandidate) -> None:
     reload_strategy_module()
 
 
-def _smoke_candidate(candidate: StrategyCandidate) -> None:
+def _smoke_candidate(candidate: StrategyCandidate) -> list[dict[str, Any]]:
     _activate_candidate(candidate)
     try:
-        smoke_test_current_strategy()
+        prepared_context = _prepare_backtest_context()
+        return _run_base_backtests(
+            windows=_selected_smoke_windows(),
+            include_diagnostics=True,
+            heartbeat_phase="smoke_test",
+            prepared_context=prepared_context,
+        )
     except Exception as exc:
         raise CandidateRuntimeFailure("smoke_test", exc) from exc
 
@@ -3801,11 +3945,8 @@ def _candidate_with_repair(
     errors: list[str] = []
     for attempt in range(0, max(0, RUNTIME.max_repair_attempts) + 1):
         try:
-            write_strategy_source(RUNTIME.paths.strategy_file, base_source)
-            reload_strategy_module()
-            base_behavior = _smoke_behavior_profile(heartbeat_phase="base_smoke_behavior")
-            _smoke_candidate(current)
-            candidate_behavior = _smoke_behavior_profile(heartbeat_phase="candidate_smoke_behavior")
+            base_behavior = _base_behavior_profile(base_source)
+            candidate_behavior = _behavior_profile_from_results(_smoke_candidate(current))
             behavior_diff = _behavior_diff_payload(base_behavior, candidate_behavior)
             if not behavior_diff["changed"]:
                 raise CandidateBehavioralNoop(current, behavior_diff)

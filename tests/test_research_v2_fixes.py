@@ -4743,6 +4743,139 @@ class ReferenceStateFixesTest(unittest.TestCase):
             self.assertFalse(payload.get("suppress_initialize_saved_reference_discord_once", False))
 
 
+class ResearchRuntimeOptimizationsTest(unittest.TestCase):
+    def test_prepare_backtest_context_reuses_cached_context_for_same_signature(self):
+        original_cache = research_script.prepared_backtest_context_cache
+        research_script.prepared_backtest_context_cache = research_script.OrderedDict()
+        try:
+            with mock.patch.object(
+                research_script,
+                "_file_cache_signature",
+                return_value={"path": "fixture.csv", "exists": True, "mtime_ns": 1, "size": 1},
+            ):
+                with mock.patch.object(research_script.strategy_module, "PARAMS", {"alpha": 1}):
+                    with mock.patch.object(research_script.backtest_module, "EXIT_PARAMS", {"beta": 2}):
+                        with mock.patch.object(
+                            research_script.backtest_module,
+                            "prepare_backtest_context",
+                            return_value={"prepared": "context"},
+                        ) as prepare_mock:
+                            first = research_script._prepare_backtest_context()
+                            second = research_script._prepare_backtest_context()
+        finally:
+            research_script.prepared_backtest_context_cache = original_cache
+
+        self.assertIs(first, second)
+        self.assertEqual(prepare_mock.call_count, 1)
+
+    def test_prepare_backtest_context_invalidates_cache_when_params_change(self):
+        original_cache = research_script.prepared_backtest_context_cache
+        research_script.prepared_backtest_context_cache = research_script.OrderedDict()
+        try:
+            with mock.patch.object(
+                research_script,
+                "_file_cache_signature",
+                return_value={"path": "fixture.csv", "exists": True, "mtime_ns": 1, "size": 1},
+            ):
+                with mock.patch.object(research_script.backtest_module, "EXIT_PARAMS", {"beta": 2}):
+                    with mock.patch.object(
+                        research_script.backtest_module,
+                        "prepare_backtest_context",
+                        side_effect=[{"prepared": "ctx_1"}, {"prepared": "ctx_2"}],
+                    ) as prepare_mock:
+                        with mock.patch.object(research_script.strategy_module, "PARAMS", {"alpha": 1}):
+                            first = research_script._prepare_backtest_context()
+                        with mock.patch.object(research_script.strategy_module, "PARAMS", {"alpha": 2}):
+                            second = research_script._prepare_backtest_context()
+        finally:
+            research_script.prepared_backtest_context_cache = original_cache
+
+        self.assertEqual(first, {"prepared": "ctx_1"})
+        self.assertEqual(second, {"prepared": "ctx_2"})
+        self.assertEqual(prepare_mock.call_count, 2)
+
+    def test_run_model_text_request_retries_nonpersistent_codex_transient_once(self):
+        call_count = 0
+
+        def fake_generate_text_response(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise StrategyGenerationTransientError("codex exec failed with exit code 1: timeout")
+            return "retry_ok"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_root = Path(temp_dir)
+            with mock.patch.object(research_script, "_planner_uses_deepseek", return_value=False):
+                with mock.patch.object(research_script, "generate_text_response", side_effect=fake_generate_text_response):
+                    with mock.patch.object(research_script, "_append_model_call_telemetry") as telemetry_mock:
+                        with mock.patch.object(research_script, "_store_research_session_metadata") as store_session_mock:
+                            with mock.patch.object(research_script, "log_info") as log_mock:
+                                result = research_script._run_model_text_request(
+                                    prompt="test prompt",
+                                    system_prompt="test system",
+                                    phase="edit_worker",
+                                    workspace_root=workspace_root,
+                                    session_kind="edit_worker",
+                                    use_persistent_session=False,
+                                )
+
+        self.assertEqual(result, "retry_ok")
+        self.assertEqual(call_count, 2)
+        telemetry_mock.assert_called_once()
+        store_session_mock.assert_not_called()
+        self.assertTrue(any("短重试" in str(call.args[0]) for call in log_mock.call_args_list))
+
+    def test_candidate_with_repair_uses_single_candidate_smoke_pass(self):
+        candidate = StrategyCandidate(
+            candidate_id="candidate_opt_test",
+            hypothesis="test",
+            change_plan="test",
+            primary_direction="structure | test",
+            closest_failed_cluster="test_cluster",
+            novelty_proof="test",
+            change_tags=("structure",),
+            edited_regions=("strategy",),
+            expected_effects=(),
+            core_factors=(),
+            strategy_code="def strategy():\n    return None\n",
+        )
+        report = EvaluationReport(
+            metrics={"promotion_score": 0.1, "quality_score": 0.1},
+            gate_passed=False,
+            gate_reason="test",
+            summary_text="test",
+            prompt_summary_text="test",
+        )
+
+        with mock.patch.object(research_script, "_base_behavior_profile", return_value=[{"window": "base"}]) as base_mock:
+            with mock.patch.object(research_script, "_smoke_candidate", return_value=[{"window": "candidate"}]) as smoke_mock:
+                with mock.patch.object(
+                    research_script,
+                    "_behavior_profile_from_results",
+                    return_value=[{"window": "candidate", "fingerprint": {"return": 1.0}}],
+                ) as profile_mock:
+                    with mock.patch.object(
+                        research_script,
+                        "_behavior_diff_payload",
+                        return_value={"changed": True},
+                    ) as diff_mock:
+                        with mock.patch.object(research_script, "_evaluate_candidate", return_value=report) as eval_mock:
+                            returned_candidate, returned_report = research_script._candidate_with_repair(
+                                "base source\n",
+                                candidate,
+                                workspace_root=REPO_ROOT,
+                            )
+
+        self.assertIs(returned_candidate, candidate)
+        self.assertIs(returned_report, report)
+        base_mock.assert_called_once_with("base source\n")
+        smoke_mock.assert_called_once_with(candidate)
+        profile_mock.assert_called_once_with([{"window": "candidate"}])
+        diff_mock.assert_called_once()
+        eval_mock.assert_called_once_with(candidate)
+
+
 class DiscordSummaryFormattingTest(unittest.TestCase):
     def test_discord_summary_uses_comparable_eval_validation_rows(self):
         report = EvaluationReport(

@@ -62,6 +62,16 @@ DeepSeek 没有直接复用 Codex 的 session 机制。
 
 这个 trace 只用于观测，不会把旧的 `reasoning_content` 再喂回模型，因此不会改变原有研究流程。
 
+## 运行层补充
+
+这份实验 clone 近期还补了 3 个和 `planner` 接法正交的轻优化，目标只是减重，不改原有研究结构：
+
+- 回测 `prepared context` 增加进程内小缓存，避免同参数重复准备
+- active reference 的 base smoke 行为增加单份缓存，同时把 candidate 的 smoke 与行为采样合并成一次
+- 非持久 `Codex` 文本 phase 遇到瞬态失败时，先立刻短重试 `1` 次，再回到原来的外层恢复逻辑
+
+这些改动不会改变 `planner-only` DeepSeek 实验的 session 作用域、prompt 结构或评分口径。
+
 ## 推荐启动前动作
 
 因为这是从主仓拷出来的实验 clone，建议首次启动前先做一次 stage reset：

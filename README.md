@@ -94,6 +94,14 @@
 
 complexity 诊断仍会进入 journal 和 wiki，但只作为人工监控指标；研究器不再自动切模式，也不会单独沉淀一条 `working_base`。
 
+## 运行层轻优化
+
+这轮只加了 3 个不改 `SOP / prompt / 评分` 的轻优化：
+
+- `prepared_backtest_context` 现在会按 `策略参数 + exit 参数 + 数据文件签名` 做进程内小缓存，重复 smoke / eval 不再反复准备同一份回测上下文
+- active reference 的 base smoke 行为现在会按 `reference code hash + smoke windows + 数据文件签名` 做单份缓存；candidate 端的 smoke 和行为采样合并成一次
+- 只有非持久 `Codex` 文本 phase 才会在瞬态报错时立刻短重试 `1` 次；`planner` 持久 session 和外层 provider 恢复退避语义保持不变
+
 ## Agent / Subagent 工作流
 
 下面这张图按“竖着看”的方式画，`planner` 的持久主 session 在中轴；其余都是围绕它工作的短生命周期 subagent。
