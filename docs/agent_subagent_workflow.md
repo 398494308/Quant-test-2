@@ -24,11 +24,17 @@ flowchart TB
     H -- 是 --> J[主进程跑 diff / smoke / full eval / gate]
     J --> K[summary_worker 回写最终摘要]
     K --> L{新 champion?}
-    L -- 是 --> M[更新 champion<br/>重置 stage 和 planner session]
+    L -- 是 --> M[更新 champion<br/>仅此时跑 test 验收<br/>重置 stage 和 planner session]
     M --> B
-    L -- 否 --> N[写 journal / wiki / reviewer 卡]
+    L -- 否 --> N[写 journal / wiki / reviewer 卡 / direction_board]
     N --> B
 ```
+
+## Prompt 边界
+
+- `planner / reviewer / edit_worker / repair_worker / summary_worker` 各自都有独立的 system prompt。
+- 仓库级 `AGENTS.md` 和 workspace 局部 `AGENTS.md` 只提供共享长期规则，不替代各角色自己的 system prompt。
+- 真正进入每个角色的运行时上下文，是“该角色自己的 system prompt + 当前轮 runtime prompt + 当前 stage 前台记忆”，不是所有角色共用一份大 prompt。
 
 ## 各角色职责
 
@@ -37,6 +43,7 @@ flowchart TB
 - 这是唯一的持久主 session。
 - 它负责读当前 stage 的前台记忆，然后提出本轮 `draft round brief`。
 - 它负责研究方向，但它现在没有“直接落码”的权力。
+- 它读取 wiki 时先看顶部摘要；只有方向高热、证据冲突或需要确认失败层时，才下钻更长表格。
 - 如果 `reviewer` 打回，它必须先吸收打回理由，再重写 draft。
 
 一句话：
@@ -56,6 +63,7 @@ flowchart TB
 - 这份 draft 是否仍落在最近重复失败核附近
 - 这份 draft 是否只是换了措辞、tag 或近邻阈值
 - 这份 draft 虽然还是做 `long`，但是否已经换了机制层、关键 choke point 或真实交易路径层级
+- 这份 draft 是否说明预计新增、删除或迁移哪类真实交易
 
 一句话：
 `reviewer` 负责“拦坏 draft”，不是“代替 planner”。
@@ -65,6 +73,7 @@ flowchart TB
 - 只接收 reviewer 放行后的 brief。
 - 它不做研究方向判断，只负责把 brief 落到 `src/strategy_macd_aggressive.py`。
 - 它是短生命周期 worker，不继承 planner 的长历史。
+- 它只额外接收当前 gate、最弱维度和 val 多/空捕获/命中率的紧凑诊断，用来辅助落码幅度判断。
 
 一句话：
 `edit_worker` 负责“把通过审稿的方向真正写进代码”。
@@ -100,7 +109,7 @@ flowchart TB
   - 跑 `smoke`
   - 跑完整评估
   - 执行 `gate`
-  - 写 `journal / wiki / heartbeat / reviewer_summary_card`
+  - 写 `journal / wiki / heartbeat / reviewer_summary_card / direction_board`
 
 一句话：
 主进程负责“调度和判卷”。
@@ -138,8 +147,8 @@ flowchart TB
 6. 若代码有技术错误，进入 `repair_worker`
 7. 通过后由主进程做 `smoke / full eval / gate`
 8. `summary_worker` 回写最终候选摘要
-9. 若刷新 `champion`，主进程更新 active reference，并开启新的 stage / planner session
-10. 若没有刷新 `champion`，主进程写回 `journal / wiki / reviewer_summary_card`
+9. 若刷新 `champion`，主进程更新 active reference，只在这时额外跑 `test`，并开启新的 stage / planner session
+10. 若没有刷新 `champion`，主进程写回 `journal / wiki / reviewer_summary_card / direction_board`
 11. 下一轮 `planner` 再先读这些前台记忆
 
 ## 和旧流程相比，最大的变化
@@ -160,7 +169,7 @@ flowchart TB
 ## 现在前台记忆里最关键的文件
 
 - `wiki/reviewer_summary_card.md`
-  上一轮 reviewer 为什么放行或打回
+  上一轮最后一次 reviewer 为什么放行或打回
 - `wiki/latest_history_package.md`
   当前 stage 的执行摘要、失败核、过热簇和最近轮次
 - `wiki/direction_board.md`
@@ -183,7 +192,9 @@ flowchart TB
 说明：
 
 - `latest_history_package.md` 现在只保留精简前台记忆，重点给 planner 看执行摘要、失败核、方向账本摘要和最近轮次元信息。
+- `reviewer_summary_card.md` 只保留当前轮最后一次 reviewer 判定；如果同轮先 `REVISE` 后重写再 `PASS`，最终卡记录最后一次 `PASS`。
 - 全量历史表格仍写入 `memory/raw/*` 和对应 json 归档，但不再反复塞进主研究 prompt。
+- 如果进程随后只是为了承接刚刷新的 `champion` 而重启，启动时那条 `📌 已加载 champion 参考` Discord 播报会静默一次；真正的 `🚀 新 champion` 播报仍然保留。
 
 ## 一句话总结
 

@@ -41,7 +41,7 @@ def _bootstrap_journal_excerpt(journal_summary: str, *, max_lines: int = 20, max
 
 
 def build_candidate_response_format_instructions() -> str:
-    return """- 只返回一个纯文本候选摘要，不要 JSON，不要 markdown，不要贴源码。
+    return f"""- 只返回一个纯文本候选摘要，不要 JSON，不要 markdown，不要贴源码。
 - 按以下字段顺序逐行输出，字段名保持英文小写并使用英文冒号：
   candidate_id:
   primary_direction:
@@ -54,7 +54,7 @@ def build_candidate_response_format_instructions() -> str:
 - `primary_direction` 必填，格式固定为 `domain | label`；`domain` 只能是 `long` / `short` / `mixed` / `structure`。
 - `change_tags` 用逗号分隔短 ASCII 标签。
 - `expected_effects` 用 `||` 分隔 1-5 条预期影响。
-- `novelty_proof` 先写上一版失败点，再写本轮为什么继续或转向，最后再写这次相对最近失败样本换了哪一层。
+- `novelty_proof` {_novelty_proof_rule()}
 - `core_factors` 没有就写 `none`；有则写成 `name | thesis | current_signal || ...`。
 - 不要输出 `edited_regions`；系统会按真实 diff 和源码签名自动判定改动区域。"""
 
@@ -91,6 +91,10 @@ def _single_strategy_file_scope_rule() -> str:
 
 def _missing_memory_is_not_no_edit_rule() -> str:
     return "若辅助记忆文件暂时不可用，也必须继续基于当前 `src/strategy_macd_aggressive.py` 做真实改动；禁止把“未读到文件”当成合法终止条件。"
+
+
+def _novelty_proof_rule() -> str:
+    return "先写上一版被什么证据否掉，再写本轮为什么继续或转向，最后写这次换了哪一层真实触达路径或关键规则链。"
 
 
 # ==================== Prompt 组装 ====================
@@ -227,10 +231,17 @@ def _side_bias_guidance(reference_metrics: dict[str, Any] | None) -> str:
     gap = bear - bull
 
     if bear >= 0.20 and gap >= 0.12:
+        if hit_rate < 0.35:
+            return (
+                "多空强化偏置（软引导，不是硬限制）:\n"
+                f"- 当前主参考 val 多头/空头捕获 = {bull:.2f} / {bear:.2f}，命中率 = {hit_rate:.0%}。\n"
+                "- 多头捕获明显更弱，但整体命中率也偏低；先判断瓶颈是在弱侧捕获、信号质量还是最终路由，不要自动锁定为单纯补 long。\n"
+                "- 若选择 `long` 或 `mixed` 假设，必须说明它预计新增、删除或迁移哪类真实交易，并尽量不破坏已有空头触达路径。"
+            )
         return (
             "多空强化偏置（软引导，不是硬限制）:\n"
             f"- 当前主参考 val 多头/空头捕获 = {bull:.2f} / {bear:.2f}，命中率 = {hit_rate:.0%}。\n"
-            "- 这说明空头已有可用基础，但多头仍明显偏弱，继续把主要探索预算投入空头，边际收益大概率更低。\n"
+            "- 这说明空头捕获相对更强，但多头仍明显偏弱，继续把主要探索预算投入空头，边际收益大概率更低。\n"
             "- 本轮默认优先考虑 `long` 或 `mixed` 假设：优先修多头，但不要在进入思考前就预设根因一定在 `outer_context`、`final_veto` 或某个固定 helper。\n"
             "- 这不是禁止修改空头；只有当某个 mixed 假设能在基本不破坏空头的前提下补多头，或空头出现新的硬伤时，才值得继续动 short。\n"
             "- 若选择 mixed 方案，`expected_effects` 的第一优先级应是改善多头捕获/命中率，第二优先级才是维持空头不明显恶化。\n"
@@ -280,8 +291,7 @@ def build_strategy_research_prompt(
     reference_metrics: dict[str, Any] | None = None,
     benchmark_label: str = "champion",
     current_base_role: str = "champion",
-    score_regime: str = "trend_capture_v6",
-    promotion_min_delta: float = 0.02,
+    score_regime: str = "trend_capture_v8",
     current_complexity_headroom_text: str = "",
     session_mode: str = "resume",
     operator_focus_text: str = "",
@@ -329,8 +339,9 @@ def build_strategy_research_prompt(
 - 先复盘最近一条最强结构化失败证据，再决定本轮继续还是转向；不要先替当前方向辩护。
 - 围绕一个可证伪假设，先产出一个简洁 round brief，交给后续 edit worker 落码。
 - 本轮目标是改变真实交易路径，不是只制造源码 diff；若后续落码后的 smoke 行为完全不变，会被系统按 `behavioral_noop` 拒收。
-- 当前评分口径是 `{score_regime}`；只有在 `gate` 通过，且相对当前 {benchmark_label} 的有效 `promotion_delta > {promotion_min_delta:.2f}` 时，候选才有资格刷新当前 active reference。
-- `train` 看滚动窗口均值/中位数，`val` 看连续 holdout 的 `promotion_score`，`test` 只做只读观察，不参与晋升。
+- 当前评分口径是 `{score_regime}`；只要 `gate` 通过，且 `promotion_score` 高于当前 {benchmark_label}，候选就有资格刷新当前 active reference。
+- `promotion_score` 现在以 `train/val` 连续趋势抓取分 `5:5` 为主，只混入少量按日收益路径年化分；`test` 只做只读观察，不参与晋升。
+- `train` 滚动窗口均值/中位数、`val` 分块稳定性和过拟合集中度仍保留为 gate/诊断，但不再是 `promotion_score` 主公式的一部分。
 
 当前 active reference 角色：`{current_base_role}`
 当前 {benchmark_label} 参考晋级分：{previous_best_score:.2f}
@@ -345,6 +356,10 @@ def build_strategy_research_prompt(
 - 失败 wiki：`{failure_wiki_path}`
 - 历史摘要包：`{history_package_path}`
 {bootstrap_block}
+
+本轮读取预算（软约束）：
+- 先读 reviewer 卡、direction_board 顶部摘要和 latest_history_package 前部摘要；只有方向高热、证据冲突或需要确认失败层时，才下钻更长表格。
+- 读取文件是为了定位失败层，不是把全部 wiki 内容搬进脑内后再开始思考。
 
 本轮阅读顺序（必须执行）：
 1. 先看“刷新条件与本轮目标”和上一轮 `reviewer` 总结卡；先判断上一轮为什么失败，再决定本轮继续还是转向。
@@ -382,7 +397,7 @@ def build_strategy_research_prompt(
 - 这份 round brief 只是 `draft`；主进程还会交给 `reviewer` 审稿。若 reviewer 打回，本轮必须先吸收其反馈再重写，不允许绕过审稿直接进入落码。
 - `primary_direction` 必须是你本轮主动施力的主方向，不要把所有联动改动都往里塞。
 - `change_plan` 必须具体到你希望 worker 改哪条规则块、阈值或最终放行链。
-- `novelty_proof` 不是自我辩护。先写上一版被什么证据否掉，再写本轮为什么继续或转向，最后再写这次换了哪一层。
+- `novelty_proof` 不是自我辩护。{_novelty_proof_rule()}
 - 不允许把“未执行代码改动”“blocked”“no_edit”“no_change”这类占位回复当成完成。
 - 如果辅助记忆缺失，就直接基于当前源码做单假设判断，不要停在解释阶段。
 """
@@ -439,11 +454,12 @@ def build_strategy_reviewer_prompt(
 审稿要求：
 1. 先判断它的 `primary_direction` 是否命中当前方向账本里的高热方向。
 2. 如果没有命中高热方向，默认不要因为“解释不够漂亮”而打回；首次或低热尝试应允许进入落码。
-3. 如果命中高热方向，重点检查这份 draft 是否明确换了失败层、关键规则链或真实触达路径；不要要求它先证明完整因果。
-4. 如果它仍只是换措辞、换标签或局部阈值，而没有明确换层，应判 `REVISE`。
-5. 只要 draft 已明确声明了结构性差异，即使方向仍相同，也可以 `PASS` 让它进入评估。
-6. `REVISE` 时不要替 planner 写新方案；只指出它必须换哪一层。
-7. 若证据不足，优先回看本地只读证据文件；不要因为 draft 自己写了 `novelty_proof` 就直接放行。
+3. `PASS` 前确认 draft 已说明它预计新增、删除或迁移哪类真实交易；若完全没有交易路径变化说明，应判 `REVISE` 让 planner 补清楚。
+4. 如果命中高热方向，重点检查这份 draft 是否明确换了失败层、关键规则链或真实触达路径；不要要求它先证明完整因果。
+5. 如果它仍只是换措辞、换标签或局部阈值，而没有明确换层，应判 `REVISE`。
+6. 只要 draft 已明确声明了结构性差异和真实交易路径变化，即使方向仍相同，也可以 `PASS` 让它进入评估。
+7. `REVISE` 时不要替 planner 写新方案；只指出它必须换哪一层。
+8. 若证据不足，优先回看本地只读证据文件；不要因为 draft 自己写了 `novelty_proof` 就直接放行。
 
 输出要求：
 {build_reviewer_response_format_instructions()}
@@ -461,9 +477,15 @@ def build_strategy_edit_worker_prompt(
     novelty_proof: str,
     closest_failed_cluster: str = "",
     current_complexity_headroom_text: str = "",
+    evaluation_digest_text: str = "",
 ) -> str:
     _ = current_complexity_headroom_text
     _ = closest_failed_cluster
+    digest_block = (
+        f"\n当前紧凑诊断（只用于辅助落码，不要重做 planner 研究）:\n{evaluation_digest_text.strip()}\n"
+        if evaluation_digest_text.strip()
+        else "\n"
+    )
     return f"""你现在负责把已经确定的 round brief 直接落到代码。
 
 本轮 round brief：
@@ -474,6 +496,7 @@ def build_strategy_edit_worker_prompt(
 - change_tags: {", ".join(change_tags) or "-"}
 - expected_effects: {"；".join(expected_effects) or "-"}
 - novelty_proof: {novelty_proof or "-"}
+{digest_block}
 
 当前要求：
 - 只修改 `src/strategy_macd_aggressive.py`。
@@ -481,6 +504,7 @@ def build_strategy_edit_worker_prompt(
 - 整份策略文件都允许修改，但必须克制、结构准确、添加有必要。
 - 优先改已经存在的命名规则块、阈值和最终放行链；不要为了造 diff 新写一套近似逻辑。
 - 如果你判断 brief 指向的 choke point 根本不在当前代码路径上，应在同一主题内改成能真实触达交易路径的实现，但不要改写研究方向本身。
+- 单轮改动预算只是参考，不是硬 gate：典型情况下优先控制为小 diff，少量新增、少量删除、少量参数或条件调整；超出这个范围必须是为了打通真实路径或删除旧冗余。
 - 保持代码结构化，不要做无关重构、大面积格式化或复制已有因果链。
 - 只要完成真实落码并保存文件，就回复 `EDIT_DONE`。不要输出解释、计划、JSON、markdown 或源码。
 - 如果辅助记忆文件读不到，不是合法 no-edit 理由；直接以当前 `src/strategy_macd_aggressive.py` 为事实源落码。
@@ -810,5 +834,5 @@ def build_strategy_exploration_repair_prompt(
 
 输出要求：
 - 返回格式仍然使用同一组纯文本字段，不要 JSON。
-- `novelty_proof` 先写上一版被什么证据否掉，再写本轮为什么继续或转向，最后再明确说明这次相对刚才被拒方向，具体换了哪一个 choke point / 最终放行链 / 目标侧 / 关键规则块。
+- `novelty_proof` {_novelty_proof_rule()}
 """

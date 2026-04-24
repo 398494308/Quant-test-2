@@ -37,6 +37,10 @@ from codex_exec_client import (
     generate_text_response,
     load_strategy_client_config,
 )
+from deepseek_planner_client import (
+    generate_text_response as generate_deepseek_planner_text_response,
+    load_deepseek_planner_config,
+)
 from research_v2.config import ResearchRuntimeConfig, load_research_runtime_config
 from research_v2.charting import PerformanceChartPaths, charts_available, render_performance_chart
 from research_v2.evaluation import (
@@ -108,7 +112,7 @@ DISCORD_CONFIG = load_discord_config()
 EVAL_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "eval")
 VALIDATION_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "validation")
 TEST_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "test")
-SCORE_REGIME = "trend_capture_v6"
+SCORE_REGIME = "trend_capture_v8"
 MODEL_WORKSPACE_STRATEGY_PATH = Path("src/strategy_macd_aggressive.py")
 PRIMARY_DIRECTION_DOMAINS = frozenset({"long", "short", "mixed", "structure"})
 PLANNER_BRIEF_REQUIRED_FIELDS = ("primary_direction", "hypothesis", "change_plan", "novelty_proof", "change_tags")
@@ -525,6 +529,7 @@ def _persist_reviewer_summary_card(
                 "",
                 "说明：",
                 "- 这张卡来自上一轮 reviewer 审稿，不是人工硬限制。",
+                "- 这张卡只保留当前轮最后一次 reviewer 判定；如果同轮先 REVISE 后 PASS，最终卡记录最后一次 PASS。",
                 "- planner 下一版开始前先看这里，再决定是否继续原方向。",
                 "- 若 `verdict=REVISE`，说明上一版 draft 当前不值得进入落码；必须先吸收打回理由，再重写 draft。",
                 "",
@@ -627,8 +632,26 @@ def _model_client_config():
     )
 
 
-def _effective_positive_delta_threshold() -> float:
-    return max(0.01, float(RUNTIME.promotion_min_delta) * 0.5)
+def _planner_uses_deepseek(session_kind: str) -> bool:
+    return session_kind == "planner" and load_deepseek_planner_config().enabled
+
+
+def _embed_workspace_agents_for_api(system_prompt: str, workspace_root: Path) -> str:
+    agents_path = workspace_root / "AGENTS.md"
+    if not agents_path.exists():
+        return system_prompt
+    try:
+        agents_text = agents_path.read_text().strip()
+    except OSError:
+        return system_prompt
+    if not agents_text:
+        return system_prompt
+    return (
+        f"{system_prompt.strip()}\n\n"
+        "以下是当前工作区 `AGENTS.md` 的完整内容。"
+        "你无法自动读取本地文件，因此必须把下面这份文本当成已展开的长期规则严格遵守：\n\n"
+        f"{agents_text}"
+    )
 
 
 def _complexity_level_rank(level: str) -> int:
@@ -812,6 +835,7 @@ def _reference_manifest_payload(
     shadow_test_metrics: dict[str, float] | None = None,
     stage_started_at: str = "",
     stage_iteration: int = 0,
+    suppress_initialize_saved_reference_discord_once: bool = False,
 ) -> dict[str, Any]:
     reference_payload = _saved_report_payload(
         source,
@@ -835,6 +859,7 @@ def _reference_manifest_payload(
         "gate_passed": reference_payload["gate_passed"],
         "gate_reason": reference_payload["gate_reason"],
         "shadow_test_metrics": reference_payload["shadow_test_metrics"],
+        "suppress_initialize_saved_reference_discord_once": suppress_initialize_saved_reference_discord_once,
     }
 
 
@@ -2216,12 +2241,32 @@ def _run_model_text_request(
     use_persistent_session: bool = True,
 ) -> str:
     session_id = _active_research_session_id() if use_persistent_session else ""
+    use_deepseek_planner = _planner_uses_deepseek(session_kind)
+    provider_name = "deepseek" if use_deepseek_planner else "codex"
+    resolved_system_prompt = (
+        _embed_workspace_agents_for_api(system_prompt, workspace_root)
+        if use_deepseek_planner else system_prompt
+    )
 
     def _invoke(active_session_id: str | None, metadata: dict[str, Any]) -> str:
         with _temporary_cwd(workspace_root):
+            if use_deepseek_planner:
+                return generate_deepseek_planner_text_response(
+                    prompt=prompt,
+                    system_prompt=resolved_system_prompt,
+                    workspace_root=workspace_root,
+                    max_output_tokens=RUNTIME.prompt_max_output_tokens,
+                    config=load_deepseek_planner_config(),
+                    progress_callback=_build_model_progress_callback(
+                        phase,
+                        repair_attempt=repair_attempt,
+                    ),
+                    session_id=active_session_id,
+                    response_metadata=metadata,
+                )
             return generate_text_response(
                 prompt=prompt,
-                system_prompt=system_prompt,
+                system_prompt=resolved_system_prompt,
                 max_output_tokens=RUNTIME.prompt_max_output_tokens,
                 config=_model_client_config(),
                 progress_callback=_build_model_progress_callback(
@@ -2239,7 +2284,7 @@ def _run_model_text_request(
     except StrategyGenerationSessionError as exc:
         if not session_id or not use_persistent_session:
             raise
-        log_info(f"Codex session 无法恢复，改为新 session 重试: {exc}")
+        log_info(f"{provider_name} session 无法恢复，改为新 session 重试: {exc}")
         _clear_research_session_state(remove_workspace=False, reason="invalid provider session")
         response_metadata = {}
         raw_text = _invoke(None, response_metadata)
@@ -2260,6 +2305,7 @@ def _run_model_text_request(
             "timestamp": datetime.now(UTC).isoformat(),
             "iteration": iteration_counter,
             "phase": phase,
+            "provider_name": provider_name,
             "session_kind": session_kind,
             "persistent_session": bool(use_persistent_session),
             "requested_resume": bool(session_id),
@@ -2716,7 +2762,6 @@ def _build_model_round_brief(
         benchmark_label=_benchmark_role(),
         current_base_role=_reference_role(),
         score_regime=SCORE_REGIME,
-        promotion_min_delta=RUNTIME.promotion_min_delta,
         session_mode=session_mode,
         operator_focus_text=_load_operator_focus_text(),
         operator_focus_path="config/research_v2_operator_focus.md",
@@ -2748,6 +2793,38 @@ def _build_model_round_brief(
     )
 
 
+def _metric_float(metrics: dict[str, Any], key: str) -> float:
+    try:
+        return float(metrics.get(key, 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _build_edit_worker_evaluation_digest(report: EvaluationReport | None) -> str:
+    if report is None:
+        return ""
+    metrics = report.metrics
+    bull = _metric_float(metrics, "validation_bull_capture_score")
+    bear = _metric_float(metrics, "validation_bear_capture_score")
+    hit_rate = _metric_float(metrics, "validation_segment_hit_rate")
+    weakest_candidates = (
+        ("val趋势捕获", _metric_float(metrics, "validation_trend_capture_score")),
+        ("val到来", _metric_float(metrics, "validation_arrival_capture_score")),
+        ("val陪跑", _metric_float(metrics, "validation_escort_capture_score")),
+        ("val掉头", _metric_float(metrics, "validation_turn_adaptation_score")),
+        ("val多头捕获", bull),
+        ("val空头捕获", bear),
+    )
+    weakest_name, weakest_value = min(weakest_candidates, key=lambda item: item[1])
+    return "\n".join(
+        [
+            f"- gate: {report.gate_reason}",
+            f"- 最弱维度: {weakest_name}={weakest_value:.2f}",
+            f"- val多/空捕获={bull:.2f}/{bear:.2f}，命中率={hit_rate:.0%}",
+        ]
+    )
+
+
 def _run_edit_worker(
     *,
     base_source: str,
@@ -2764,6 +2841,7 @@ def _run_edit_worker(
         change_tags=round_brief.change_tags,
         expected_effects=round_brief.expected_effects,
         novelty_proof=round_brief.novelty_proof,
+        evaluation_digest_text=_build_edit_worker_evaluation_digest(best_report),
     )
     return _run_model_text_request(
         prompt=prompt,
@@ -3164,6 +3242,7 @@ def _persist_best_state(
     shadow_test_metrics: dict[str, float] | None = None,
     stage_started_at: str = "",
     stage_iteration: int = 0,
+    suppress_initialize_saved_reference_discord_once: bool = False,
 ) -> None:
     RUNTIME.paths.best_state_file.parent.mkdir(parents=True, exist_ok=True)
     payload = _reference_manifest_payload(
@@ -3172,6 +3251,7 @@ def _persist_best_state(
         shadow_test_metrics=shadow_test_metrics,
         stage_started_at=stage_started_at,
         stage_iteration=stage_iteration,
+        suppress_initialize_saved_reference_discord_once=suppress_initialize_saved_reference_discord_once,
     )
     RUNTIME.paths.best_state_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
     write_strategy_source(RUNTIME.paths.best_strategy_file, source)
@@ -3215,6 +3295,9 @@ def initialize_best_state(force_rebuild: bool = False) -> None:
                 if champion_report is not None
                 else None
             )
+            suppress_initialize_saved_reference_discord_once = bool(
+                saved_state.get("suppress_initialize_saved_reference_discord_once", False)
+            )
 
             reference_stage_started_at, reference_stage_iteration = _recover_reference_stage_state(
                 saved_state,
@@ -3226,6 +3309,7 @@ def initialize_best_state(force_rebuild: bool = False) -> None:
                 best_report,
                 stage_started_at=reference_stage_started_at,
                 stage_iteration=reference_stage_iteration,
+                suppress_initialize_saved_reference_discord_once=False,
             )
             log_info(
                 "已加载已保存主参考: "
@@ -3242,17 +3326,20 @@ def initialize_best_state(force_rebuild: bool = False) -> None:
                 promotion=best_report.metrics["promotion_score"],
                 quality=best_report.metrics["quality_score"],
             )
-            maybe_send_discord(
-                build_discord_summary_message(
-                    title=f"📌 研究器 v2 已加载{_reference_role()}参考",
-                    report=best_report,
-                    eval_window_count=EVAL_WINDOW_COUNT,
-                    validation_window_count=VALIDATION_WINDOW_COUNT,
-                    test_window_count=TEST_WINDOW_COUNT,
-                    data_range_text=_discord_data_range_text(),
-                ),
-                context="initialize_saved_reference",
-            )
+            if suppress_initialize_saved_reference_discord_once:
+                log_info("跳过 Discord 启动播报: 上次退出原因是 new champion accepted")
+            else:
+                maybe_send_discord(
+                    build_discord_summary_message(
+                        title=f"📌 研究器 v2 已加载{_reference_role()}参考",
+                        report=best_report,
+                        eval_window_count=EVAL_WINDOW_COUNT,
+                        validation_window_count=VALIDATION_WINDOW_COUNT,
+                        test_window_count=TEST_WINDOW_COUNT,
+                        data_range_text=_discord_data_range_text(),
+                    ),
+                    context="initialize_saved_reference",
+                )
             return
 
     best_source = load_strategy_source(RUNTIME.paths.strategy_file)
@@ -3478,11 +3565,10 @@ def _promotion_acceptance_decision(report: EvaluationReport) -> tuple[bool, str]
         return False, "reference benchmark is not initialized"
     current_best_score = float(benchmark_report.metrics["promotion_score"])
     candidate_score = float(report.metrics["promotion_score"])
-    promotion_delta = candidate_score - current_best_score
-    if promotion_delta <= RUNTIME.promotion_min_delta:
+    if candidate_score <= current_best_score:
         return (
             False,
-            f"相对当前{_benchmark_role()}晋级分提升不足({promotion_delta:.2f} <= {RUNTIME.promotion_min_delta:.2f})",
+            f"未超过当前{_benchmark_role()}晋级分({candidate_score:.2f} <= {current_best_score:.2f})",
         )
     return True, "通过"
 
@@ -4204,6 +4290,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
             shadow_test_metrics=shadow_test_metrics,
             stage_started_at=reference_stage_started_at,
             stage_iteration=reference_stage_iteration,
+            suppress_initialize_saved_reference_discord_once=True,
         )
         _clear_research_session_state(remove_workspace=True, reason="new champion accepted")
         _append_research_journal_entry(entry_base)

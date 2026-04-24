@@ -30,6 +30,7 @@ from scripts.research_macd_aggressive_v2 import select_smoke_windows
 from research_v2.config import GateConfig
 from research_v2.evaluation import (
     EvaluationReport,
+    _annualized_return_score,
     _collect_daily_path,
     _collect_trend_path,
     _trend_score_report,
@@ -400,6 +401,7 @@ class EvaluationFixesTest(unittest.TestCase):
                 "result": {
                     "return": 3.0,
                     "max_drawdown": 5.0,
+                    "daily_returns": [0.010, 0.018, -0.004],
                     "trades": 8,
                     "fee_drag_pct": 0.5,
                     "liquidations": 0,
@@ -411,6 +413,7 @@ class EvaluationFixesTest(unittest.TestCase):
                 "result": {
                     "return": 4.0,
                     "max_drawdown": 6.0,
+                    "daily_returns": [0.012, 0.011, 0.006],
                     "trades": 7,
                     "fee_drag_pct": 0.8,
                     "liquidations": 0,
@@ -422,6 +425,7 @@ class EvaluationFixesTest(unittest.TestCase):
                 "result": {
                     "return": 2.0,
                     "max_drawdown": 4.0,
+                    "daily_returns": [0.007, -0.003, 0.009],
                     "trades": 6,
                     "fee_drag_pct": 0.2,
                     "liquidations": 0,
@@ -460,6 +464,10 @@ class EvaluationFixesTest(unittest.TestCase):
         ]
         expected_validation_report = _trend_score_report(expected_validation_points)
         expected_full_period_report = _trend_score_report(full_period_result["trend_capture_points"])
+        expected_train_timed_return_score = _annualized_return_score(_collect_daily_path(results, "eval").returns)
+        expected_validation_timed_return_score = _annualized_return_score(
+            _collect_daily_path(results, "validation").returns
+        )
 
         self.assertAlmostEqual(
             report.metrics["eval_trend_capture_score"],
@@ -467,19 +475,35 @@ class EvaluationFixesTest(unittest.TestCase):
         )
         self.assertAlmostEqual(report.metrics["combined_trend_capture_score"], expected_full_period_report.trend_score)
         self.assertAlmostEqual(report.metrics["full_period_trend_capture_score"], expected_full_period_report.trend_score)
+        self.assertAlmostEqual(report.metrics["train_capture_score"], expected_eval_report.trend_score)
+        self.assertAlmostEqual(report.metrics["validation_capture_score"], expected_validation_report.trend_score)
         self.assertAlmostEqual(
-            report.metrics["quality_score"],
-            sum(0.70 * item.trend_score + 0.30 * item.return_score for item in expected_eval_window_scores)
-            / len(expected_eval_window_scores),
+            report.metrics["capture_score"],
+            0.50 * (expected_eval_report.trend_score + expected_validation_report.trend_score),
         )
         self.assertAlmostEqual(
-            report.metrics["promotion_score"],
+            report.metrics["quality_score"],
+            expected_eval_report.trend_score,
+        )
+        self.assertAlmostEqual(
+            report.metrics["validation_score"],
             0.70 * expected_validation_report.trend_score + 0.30 * expected_validation_report.return_score,
+        )
+        self.assertAlmostEqual(report.metrics["train_timed_return_score"], expected_train_timed_return_score)
+        self.assertAlmostEqual(report.metrics["validation_timed_return_score"], expected_validation_timed_return_score)
+        self.assertAlmostEqual(
+            report.metrics["timed_return_score"],
+            0.50 * (expected_train_timed_return_score + expected_validation_timed_return_score),
         )
         self.assertAlmostEqual(
             report.metrics["promotion_gap"],
-            report.metrics["quality_score"] - report.metrics["promotion_score"],
+            report.metrics["train_capture_score"] - report.metrics["validation_capture_score"],
         )
+        expected_promotion_score = (
+            0.85 * report.metrics["capture_score"]
+            + 0.15 * report.metrics["timed_return_score"]
+        )
+        self.assertAlmostEqual(report.metrics["promotion_score"], expected_promotion_score)
         self.assertEqual(report.metrics["validation_block_count_used"], 0.0)
         self.assertEqual(report.metrics["eval_unique_trend_points"], 15.0)
         self.assertEqual(report.metrics["eval_overlap_trend_points"], 2.0)
@@ -648,6 +672,7 @@ class EvaluationFixesTest(unittest.TestCase):
         self.assertGreater(report.metrics["overfit_risk_score"], 0.0)
         self.assertGreater(report.metrics["overfit_top1_positive_share"], 0.60)
         self.assertEqual(report.metrics["overfit_hard_fail"], 1.0)
+        self.assertAlmostEqual(report.metrics["promotion_score"], 0.85 * report.metrics["capture_score"])
 
     def test_summarize_evaluation_emits_funnel_and_low_activity_soft_signal(self):
         eval_window = type("Window", (), {"group": "eval", "label": "train1", "start_date": "2026-01-01", "end_date": "2026-01-10"})()
@@ -1478,20 +1503,25 @@ class JournalPromptFixesTest(unittest.TestCase):
         self.assertIn("不要 hard code", prompt)
         self.assertIn("整份文件都允许修改", prompt)
 
-    def test_build_strategy_runtime_prompt_mentions_promotion_gate(self):
+    def test_build_strategy_runtime_prompt_mentions_refresh_rule(self):
         prompt = build_strategy_research_prompt(
             evaluation_summary="诊断",
             journal_summary="记忆",
             previous_best_score=1.23,
         )
 
-        self.assertIn("promotion_delta > 0.02", prompt)
+        self.assertIn("promotion_score` 高于当前 champion", prompt)
+        self.assertIn("连续趋势抓取分 `5:5`", prompt)
+        self.assertIn("按日收益路径年化分", prompt)
+        self.assertNotIn("promotion_delta >", prompt)
         self.assertIn("当前回合任务", prompt)
         self.assertIn("本轮阅读顺序（必须执行）", prompt)
         self.assertIn("reviewer_summary_card.md", prompt)
         self.assertIn("direction_board.md", prompt)
         self.assertIn("duplicate_watchlist.md", prompt)
         self.assertIn("failure_wiki.md", prompt)
+        self.assertIn("本轮读取预算（软约束）", prompt)
+        self.assertIn("只有方向高热、证据冲突或需要确认失败层时，才下钻", prompt)
         self.assertIn("先复盘最近一条最强结构化失败证据", prompt)
         self.assertIn("继续还是转向", prompt)
         self.assertIn("形成假设后，必须回看一次", prompt)
@@ -1527,6 +1557,21 @@ class JournalPromptFixesTest(unittest.TestCase):
         self.assertIn("人工方向卡（软引导，不是硬限制", prompt)
         self.assertIn("config/research_v2_operator_focus.md", prompt)
         self.assertIn("优先检查多头外层 choke point", prompt)
+
+    def test_build_strategy_runtime_prompt_softens_side_bias_when_hit_rate_is_weak(self):
+        prompt = build_strategy_research_prompt(
+            evaluation_summary="诊断",
+            journal_summary="记忆",
+            previous_best_score=1.23,
+            reference_metrics={
+                "validation_bull_capture_score": 0.06,
+                "validation_bear_capture_score": 0.28,
+                "validation_segment_hit_rate": 0.22,
+            },
+        )
+
+        self.assertIn("整体命中率也偏低", prompt)
+        self.assertIn("不要自动锁定为单纯补 long", prompt)
 
     def test_build_strategy_agents_instructions_mentions_all_required_symbols(self):
         prompt = build_strategy_agents_instructions()
@@ -1600,11 +1645,15 @@ class JournalPromptFixesTest(unittest.TestCase):
             closest_failed_cluster="participation_cluster",
             novelty_proof="这次直接改最终可达性，不再停留在内层 helper 微调。",
             current_complexity_headroom_text="当前基底复杂度余量：trend_quality_family bool_ops 剩 4",
+            evaluation_digest_text="- gate: 通过\n- 最弱维度: val陪跑=0.12\n- val多/空捕获=0.20/0.40，命中率=38%",
         )
 
         self.assertIn("round brief", prompt)
         self.assertIn("只修改 `src/strategy_macd_aggressive.py`", prompt)
         self.assertIn("整份策略文件都允许修改", prompt)
+        self.assertIn("当前紧凑诊断", prompt)
+        self.assertIn("最弱维度: val陪跑=0.12", prompt)
+        self.assertIn("单轮改动预算只是参考，不是硬 gate", prompt)
         self.assertIn("只回复 `EDIT_DONE`", prompt)
         self.assertNotIn("当前基底复杂度余量", prompt)
 
@@ -1669,6 +1718,7 @@ class JournalPromptFixesTest(unittest.TestCase):
         self.assertIn("duplicate_watchlist.md", prompt)
         self.assertIn("failure_wiki.md", prompt)
         self.assertIn("不能替 planner 发明新方向", prompt)
+        self.assertIn("预计新增、删除或迁移哪类真实交易", prompt)
 
     def test_build_strategy_round_brief_repair_prompt_mentions_required_fields(self):
         prompt = build_strategy_round_brief_repair_prompt(
@@ -4401,6 +4451,7 @@ class ReferenceStateFixesTest(unittest.TestCase):
 
             card_text = (memory_root / "wiki/reviewer_summary_card.md").read_text()
             self.assertIn("candidate_review_1", card_text)
+            self.assertIn("只保留当前轮最后一次 reviewer 判定", card_text)
             self.assertIn("REVISE", card_text)
             self.assertIn("saturated_same_basin", card_text)
             self.assertIn("至少换机制层或 changed_regions", card_text)
@@ -4502,6 +4553,62 @@ class ReferenceStateFixesTest(unittest.TestCase):
         self.assertTrue(accepted)
         self.assertIn("首个 gate-passed champion", reason)
 
+    def test_promotion_acceptance_accepts_small_positive_improvement(self):
+        baseline_report = EvaluationReport(
+            metrics={"promotion_score": 0.40, "quality_score": 0.33},
+            gate_passed=True,
+            gate_reason="通过",
+            summary_text="",
+            prompt_summary_text="",
+        )
+        candidate_report = EvaluationReport(
+            metrics={"promotion_score": 0.41, "quality_score": 0.30},
+            gate_passed=True,
+            gate_reason="通过",
+            summary_text="",
+            prompt_summary_text="",
+        )
+        original_best_report = research_script.best_report
+        original_champion = research_script.champion_report
+        try:
+            research_script.best_report = baseline_report
+            research_script.champion_report = baseline_report
+            accepted, reason = research_script._promotion_acceptance_decision(candidate_report)
+        finally:
+            research_script.best_report = original_best_report
+            research_script.champion_report = original_champion
+
+        self.assertTrue(accepted)
+        self.assertEqual("通过", reason)
+
+    def test_promotion_acceptance_rejects_non_improving_candidate(self):
+        baseline_report = EvaluationReport(
+            metrics={"promotion_score": 0.40, "quality_score": 0.33},
+            gate_passed=True,
+            gate_reason="通过",
+            summary_text="",
+            prompt_summary_text="",
+        )
+        candidate_report = EvaluationReport(
+            metrics={"promotion_score": 0.40, "quality_score": 0.36},
+            gate_passed=True,
+            gate_reason="通过",
+            summary_text="",
+            prompt_summary_text="",
+        )
+        original_best_report = research_script.best_report
+        original_champion = research_script.champion_report
+        try:
+            research_script.best_report = baseline_report
+            research_script.champion_report = baseline_report
+            accepted, reason = research_script._promotion_acceptance_decision(candidate_report)
+        finally:
+            research_script.best_report = original_best_report
+            research_script.champion_report = original_champion
+
+        self.assertFalse(accepted)
+        self.assertEqual("未超过当前champion晋级分(0.40 <= 0.40)", reason)
+
     def test_initialize_best_state_falls_back_when_saved_reference_source_is_invalid(self):
         valid_source = (REPO_ROOT / "src/strategy_macd_aggressive.py").read_text()
         invalid_saved_source = valid_source.replace("def _flow_entry_ok(", "def _flow_entry_missing(", 1)
@@ -4566,10 +4673,74 @@ class ReferenceStateFixesTest(unittest.TestCase):
                 self.assertIs(research_script.best_report, report)
                 self.assertIsNone(research_script.champion_report)
 
-            self.assertEqual(temp_paths.best_strategy_file.read_text(), valid_source)
-            self.assertEqual(evaluate_current_strategy.call_count, 1)
-            log_messages = [call.args[0] for call in log_info.call_args_list if call.args]
-            self.assertTrue(any("已保存主参考无效" in message for message in log_messages))
+    def test_initialize_best_state_skips_loaded_reference_discord_once_after_new_champion(self):
+        valid_source = (REPO_ROOT / "src/strategy_macd_aggressive.py").read_text()
+        report = EvaluationReport(
+            metrics={"promotion_score": 0.46, "quality_score": 0.27},
+            gate_passed=True,
+            gate_reason="通过",
+            summary_text="summary",
+            prompt_summary_text="prompt summary",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            temp_paths = replace(
+                research_script.RUNTIME.paths,
+                repo_root=temp_root,
+                strategy_file=temp_root / "src/strategy_macd_aggressive.py",
+                log_file=temp_root / "logs/research.log",
+                journal_file=temp_root / "state/journal.jsonl",
+                memory_dir=temp_root / "state/memory",
+                heartbeat_file=temp_root / "state/heartbeat.json",
+                best_state_file=temp_root / "state/best.json",
+                best_strategy_file=temp_root / "backups/best.py",
+                champion_strategy_file=temp_root / "backups/champion.py",
+                stop_file=temp_root / "state/stop",
+                strategy_backup_file=temp_root / "backups/candidate.py",
+            )
+            temp_runtime = replace(research_script.RUNTIME, paths=temp_paths)
+            temp_paths.strategy_file.parent.mkdir(parents=True, exist_ok=True)
+            temp_paths.best_strategy_file.parent.mkdir(parents=True, exist_ok=True)
+            temp_paths.best_state_file.parent.mkdir(parents=True, exist_ok=True)
+            temp_paths.strategy_file.write_text(valid_source)
+            temp_paths.best_strategy_file.write_text(valid_source)
+            temp_paths.best_state_file.write_text(
+                json.dumps(
+                    {
+                        "score_regime": research_script.SCORE_REGIME,
+                        "reference_role": "champion",
+                        "reference_stage_started_at": "2026-04-23T12:37:56+00:00",
+                        "reference_stage_iteration": 21,
+                        "reference": {"code_hash": research_script.source_hash(valid_source)},
+                        "suppress_initialize_saved_reference_discord_once": True,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+            with mock.patch.object(research_script, "RUNTIME", temp_runtime), mock.patch.object(
+                research_script, "best_source", ""
+            ), mock.patch.object(research_script, "best_report", None), mock.patch.object(
+                research_script, "champion_report", None
+            ), mock.patch.object(
+                research_script, "reload_strategy_module"
+            ), mock.patch.object(
+                research_script, "evaluate_current_strategy", return_value=report
+            ), mock.patch.object(
+                research_script, "maybe_send_discord"
+            ) as maybe_send_discord, mock.patch.object(
+                research_script, "build_discord_summary_message", return_value="msg"
+            ), mock.patch.object(
+                research_script, "write_heartbeat"
+            ), mock.patch.object(
+                research_script, "log_info"
+            ):
+                research_script.initialize_best_state()
+
+            self.assertFalse(maybe_send_discord.called)
+            payload = json.loads(temp_paths.best_state_file.read_text())
+            self.assertFalse(payload.get("suppress_initialize_saved_reference_discord_once", False))
 
 
 class DiscordSummaryFormattingTest(unittest.TestCase):

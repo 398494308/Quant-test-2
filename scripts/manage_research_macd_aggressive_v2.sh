@@ -18,9 +18,13 @@ mkdir -p "${REPO_ROOT}/logs" "${REPO_ROOT}/state"
 is_running() {
   if [[ -f "${PID_FILE}" ]]; then
     local pid
+    local cmd
     pid="$(cat "${PID_FILE}")"
     if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
-      return 0
+      cmd="$(ps -o args= -p "${pid}" 2>/dev/null || true)"
+      if [[ "${cmd}" == *"${RUNNER}"* ]]; then
+        return 0
+      fi
     fi
   fi
   return 1
@@ -74,7 +78,7 @@ PY
 }
 
 list_running_pids() {
-  pgrep -f "scripts/research_macd_aggressive_v2.py" || true
+  pgrep -f "${RUNNER}" || true
 }
 
 kill_pid_or_group() {

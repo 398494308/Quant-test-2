@@ -129,6 +129,9 @@ TREND_REVERSAL_MOVE_MULTIPLIER = 2.0
 TREND_REVERSAL_MOVE_FLOOR = 0.025
 TREND_MIN_SEGMENT_BARS = 3
 MIN_VALIDATION_BLOCK_POINTS = 60
+TRAIN_VAL_SCORE_WEIGHT = 0.50
+PROMOTION_CAPTURE_SCORE_WEIGHT = 0.85
+PROMOTION_TIMED_RETURN_SCORE_WEIGHT = 0.15
 
 
 # ==================== 基础统计 ====================
@@ -707,6 +710,16 @@ def _return_score(points: list[dict[str, Any]]) -> tuple[float, float]:
     return score, path_return_pct
 
 
+def _annualized_return_score(daily_returns: list[float]) -> float:
+    if not daily_returns:
+        return 0.0
+    growth = 1.0
+    for value in daily_returns:
+        growth *= max(1e-9, 1.0 + float(value))
+    annualized_growth = max(growth, 1e-9) ** (365.0 / len(daily_returns))
+    return _clamp(math.log(max(annualized_growth, 1e-9), 2.0), -2.0, 3.0)
+
+
 def _trend_score_report(points: list[dict[str, Any]]) -> TrendScoreReport:
     if len(points) < 6:
         return TrendScoreReport(
@@ -1190,19 +1203,40 @@ def summarize_evaluation(
     development_mean_hit_rate = _mean([report.hit_rate for report in development_window_reports])
     development_mean_segment_count = _mean([float(report.segment_count) for report in development_window_reports])
 
-    validation_trend_report = _trend_report_from_result(validation_source)
+    train_continuous_trend_report = _trend_score_report(eval_path.points)
+    validation_trend_report = (
+        _trend_score_report(validation_path.points)
+        if validation_path.points
+        else _trend_report_from_result(validation_source)
+    )
     selection_trend_report = _trend_report_from_result(selection_source)
 
-    quality_score = development_mean_score
-    promotion_score = _period_score(validation_trend_report)
+    train_capture_score = train_continuous_trend_report.trend_score
+    validation_capture_score = validation_trend_report.trend_score
+    capture_score = (
+        TRAIN_VAL_SCORE_WEIGHT * train_capture_score
+        + TRAIN_VAL_SCORE_WEIGHT * validation_capture_score
+    )
+    train_timed_return_score = _annualized_return_score(eval_daily_path.returns)
+    validation_timed_return_score = _annualized_return_score(validation_daily_path.returns)
+    timed_return_score = (
+        TRAIN_VAL_SCORE_WEIGHT * train_timed_return_score
+        + TRAIN_VAL_SCORE_WEIGHT * validation_timed_return_score
+    )
+    quality_score = train_capture_score
+    raw_validation_score = _period_score(validation_trend_report)
     validation_block_report = _validation_block_report(
         validation_source,
         block_count=gates.validation_block_count,
-        fallback_score=promotion_score,
+        fallback_score=raw_validation_score,
     )
-    capture_drop = development_mean_trend_score - validation_trend_report.trend_score
-    promotion_gap = quality_score - promotion_score
-    overfit_report = _overfit_risk_report(selection_trend_report, promotion_gap)
+    capture_drop = train_capture_score - validation_capture_score
+    promotion_gap = capture_drop
+    overfit_report = _overfit_risk_report(selection_trend_report, capture_drop)
+    promotion_score = (
+        PROMOTION_CAPTURE_SCORE_WEIGHT * capture_score
+        + PROMOTION_TIMED_RETURN_SCORE_WEIGHT * timed_return_score
+    )
     validation_long_trades, validation_short_trades = _trade_side_counts(validation_source)
     selection_long_trades, selection_short_trades = _trade_side_counts(selection_source)
     validation_closed_trades = int(validation_source.get("trades", validation_long_trades + validation_short_trades))
@@ -1270,10 +1304,19 @@ def summarize_evaluation(
             f"{development_mean_score:.2f} / {development_median_score:.2f} / "
             f"{development_score_std:.2f} / {profitable_window_ratio:.0%}"
         ),
-        f"val晋级分 / 趋势分 / 收益分: {promotion_score:.2f} / {validation_trend_report.trend_score:.2f} / {validation_trend_report.return_score:.2f}",
+        (
+            "train/val连续趋势抓取分 / 抓取主分: "
+            f"{train_capture_score:.2f} / {validation_capture_score:.2f} / {capture_score:.2f}"
+        ),
+        (
+            "train/val按日收益年化分 / 收益补充分 / 晋级分: "
+            f"{train_timed_return_score:.2f} / {validation_timed_return_score:.2f} / "
+            f"{timed_return_score:.2f} / {promotion_score:.2f}"
+        ),
         f"val到来 / 陪跑 / 掉头: {validation_trend_report.arrival_score:.2f} / {validation_trend_report.escort_score:.2f} / {validation_trend_report.turn_score:.2f}",
         f"val多头 / 空头捕获: {validation_trend_report.bull_score:.2f} / {validation_trend_report.bear_score:.2f}",
         f"val趋势段 / 命中率: {validation_trend_report.segment_count} / {validation_trend_report.hit_rate:.0%}",
+        f"val连续综合分 / 收益分: {raw_validation_score:.2f} / {validation_trend_report.return_score:.2f}",
         f"val多 / 空平仓数: {validation_long_trades} / {validation_short_trades}",
         _format_funnel_line("train滚动漏斗(long)", eval_funnel_counts["long"]),
         _format_funnel_line("train滚动漏斗(short)", eval_funnel_counts["short"]),
@@ -1281,7 +1324,7 @@ def summarize_evaluation(
         _format_funnel_line("val连续漏斗(short)", validation_funnel_counts["short"]),
         f"val短板: {validation_weakest_axis}",
         (
-            "val分块晋级分(均值/std/最差/负分块): "
+            "val分块门控分(均值/std/最差/负分块): "
             f"{validation_block_report.mean_score:.2f} / "
             f"{validation_block_report.std_score:.2f} / "
             f"{validation_block_report.min_score:.2f} / "
@@ -1307,12 +1350,12 @@ def summarize_evaluation(
         f"Sharpe(train / val / train+val): {eval_sharpe_ratio:.2f} / {validation_sharpe_ratio:.2f} / {selection_sharpe_ratio:.2f}",
         f"train窗口收益均值 / 中位 / P25 / 最差: {eval_avg_return:.2f}% / {eval_median_return:.2f}% / {eval_p25_return:.2f}% / {eval_worst_return:.2f}%",
         f"val窗口收益均值 / 最差: {validation_avg_return:.2f}% / {validation_worst_return:.2f}%",
-        f"train/val分数落差: {promotion_gap:.2f}",
+        f"train/val趋势抓取落差: {promotion_gap:.2f}",
         f"train 4h唯一路径点 / 重叠点 / 被覆盖点: {eval_path.unique_points} / {eval_path.overlap_points} / {eval_path.dropped_points}",
         f"funding覆盖(train均值 / val / train+val): {eval_funding_coverage:.0%} / {validation_funding_coverage:.0%} / {selection_funding_coverage:.0%}",
         f"最大回撤 / 手续费拖累: {worst_drawdown:.2f}% / {avg_fee_drag:.2f}%",
         f"总交易 / train交易 / val交易 / 爆仓: {total_trades} / {eval_trades} / {validation_trades} / {liquidations}",
-        f"质量分 / 晋级分: {quality_score:.2f} / {promotion_score:.2f}",
+        f"质量分(train连续趋势分) / 晋级分: {quality_score:.2f} / {promotion_score:.2f}",
         f"Gate: {gate_reason}",
         "",
         "窗口明细:",
@@ -1328,7 +1371,8 @@ def summarize_evaluation(
     prompt_lines = [
         "当前诊断（必须先读）:",
         (
-            f"- 当前基底: 质量分={quality_score:.2f}，晋级分={promotion_score:.2f}，"
+            f"- 当前基底: 质量分(train连续趋势分)={quality_score:.2f}，晋级分={promotion_score:.2f}，"
+            f"抓取主分={capture_score:.2f}，收益补充分={timed_return_score:.2f}，"
             f"gate={gate_reason}"
         ),
         f"- 当前主短板: {validation_weakest_axis}",
@@ -1352,6 +1396,10 @@ def summarize_evaluation(
             f"{development_score_std:.2f}/{profitable_window_ratio:.0%}"
         ),
         (
+            f"- 当前评分组成: train/val 连续趋势抓取={train_capture_score:.2f}/{validation_capture_score:.2f}，"
+            f"train/val 按日收益年化分={train_timed_return_score:.2f}/{validation_timed_return_score:.2f}"
+        ),
+        (
             f"- train+val 状态: 趋势分/收益分={selection_trend_report.trend_score:.2f}/"
             f"{selection_trend_report.return_score:.2f}，"
             f"多头/空头捕获={selection_trend_report.bull_score:.2f}/"
@@ -1361,7 +1409,7 @@ def summarize_evaluation(
         (
             f"- 风险与成本: 最大回撤={worst_drawdown:.2f}%，"
             f"手续费拖累={avg_fee_drag:.2f}%，"
-            f"train/val 分差={promotion_gap:.2f}"
+            f"train/val 抓取分差={promotion_gap:.2f}"
         ),
         (
             f"- 集中度诊断: {overfit_report.risk_level}({overfit_report.risk_score:.0f})，"
@@ -1405,7 +1453,13 @@ def summarize_evaluation(
         "validation_unique_trend_points": float(validation_path.unique_points),
         "validation_overlap_trend_points": float(validation_path.overlap_points),
         "validation_overlap_trend_points_dropped": float(validation_path.dropped_points),
-        "validation_score": promotion_score,
+        "validation_score": raw_validation_score,
+        "train_capture_score": train_capture_score,
+        "validation_capture_score": validation_capture_score,
+        "capture_score": capture_score,
+        "train_timed_return_score": train_timed_return_score,
+        "validation_timed_return_score": validation_timed_return_score,
+        "timed_return_score": timed_return_score,
         "eval_trend_capture_score": development_mean_trend_score,
         "eval_return_score": development_mean_return_score,
         "eval_segment_hit_rate": development_mean_hit_rate,

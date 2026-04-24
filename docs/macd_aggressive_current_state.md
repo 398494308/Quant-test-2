@@ -15,18 +15,25 @@
 | 项目 | 数值 |
 | --- | --- |
 | 当前角色 | champion |
+| 当前 reference stage 起点轮次 | 54 |
 | gate | 通过 |
-| score regime | trend_capture_v6 |
-| quality_score | 0.2607 |
-| promotion_score | 0.3634 |
-| train+val期间收益 | 16.60% |
-| val期间收益 | 13.18% |
-| val多/空捕获 | 0.37 / 0.51 |
-| Sharpe(train / val) | 0.37 / 0.48 |
-| train+val交易数量 | 262 |
+| score regime（保存态 / 仓库默认） | trend_capture_v8 / trend_capture_v8 |
+| quality_score（train连续趋势分） | 0.5226 |
+| promotion_score（保存态） | 0.5542 |
+| capture_score / timed_return_score | 0.4763 / 0.9955 |
+| train/val连续抓取分 | 0.5226 / 0.4301 |
+| train+val期间收益 | 273.68% |
+| val期间收益 | 165.62% |
+| train+val多/空捕获 | 0.31 / 0.66 |
+| Sharpe(train+val / val) | 0.98 / 1.82 |
+| hidden test收益 / Sharpe | 暂无 / 暂无 |
+| train+val交易数量 | 301 |
 
 说明：
 
+- 上表按当前 [state/research_macd_aggressive_v2_best.json](../state/research_macd_aggressive_v2_best.json) 的保存态整理；下一次 champion 刷新后，这些数值会继续前移。
+- 当前保存态已经按 `trend_capture_v8` 重算完成；后续如果 active reference 再变化，状态文件会继续覆盖为最新值。
+- 当前保存态里的 hidden test 快照为空；只有在新 champion 刷新并触发 test 验收后，这两项才会重新出现。
 - `state/research_macd_aggressive_v2_best.json` 里如果还带旧字段，例如 `working_base`，那只是历史兼容读取入口；新状态写回只使用单一 active reference 语义。
 - 当前运行状态以 [state/research_macd_aggressive_v2_heartbeat.json](../state/research_macd_aggressive_v2_heartbeat.json) 为准。
 
@@ -51,21 +58,33 @@
 
 ## 评分与晋升
 
-单段分数：
+原始单段分数：
 
 `period_score = 0.70 * trend_capture_score + 0.30 * return_score`
 
-研究器主要看两类分：
+研究器主要看三类分：
 
 - `quality_score`
-  `train` 滚动窗口的均值分
+  `train` 连续路径上的趋势抓取分
+- `capture_score`
+  `train/val` 连续趋势抓取分按 `5:5` 平均后的主分
+- `timed_return_score`
+  `train/val` 按日收益路径年化分按 `5:5` 平均后的补充分
 - `promotion_score`
-  `val` 连续 holdout 的单段分
+  最终晋级分。以 `capture_score` 为主，只混入少量 `timed_return_score`
+
+当前默认公式：
+
+`capture_score = 0.50 * train_capture_score + 0.50 * val_capture_score`
+
+`timed_return_score = 0.50 * train_timed_return_score + 0.50 * val_timed_return_score`
+
+`promotion_score = 0.85 * capture_score + 0.15 * timed_return_score`
 
 晋升规则：
 
 - 先过 `gate`
-- 再满足相对当前 active reference 的 `promotion_delta > 0.02`
+- 再满足 `promotion_score` 高于当前 active reference
 - 只有刷新 champion 时才额外跑隐藏 `test`
 
 `test` 只做验收，不参与 prompt，不参与当前轮次调参。
@@ -78,7 +97,7 @@
 - `train` 中位分至少 `0.00`
 - `val` 命中率至少 `0.35`
 - `val` 趋势捕获分至少 `0.05`
-- `train / val` 分差不超过 `0.30`
+- `train / val` 连续趋势抓取分差不超过 `0.30`
 - 手续费拖累不超过 `8%`
 - `val` 分成 `3` 块后，最差块至少 `-0.35`
 - `val` 负块数量最多 `1`
@@ -139,16 +158,19 @@
 
 - 先看上一轮 `reviewer` 总结卡
 - 再看 `direction_board`，确认当前主方向是否已经高热，以及这次是不是还在同一热区横移
+- planner 读取 wiki 时先看顶部摘要；只有方向高热、证据冲突或需要确认失败层时，才下钻更长表格
 - 再看结构化失败反馈和当前诊断，确认当前到底是 `long_impulse / long_retest / long_reaccel / long_relay` 还是 `short_impulse / short_retest / short_reaccel` 在拖分
 - 先复盘上一轮为什么失败、失败更像发生在哪一层交易路径
 - 先决定这轮继续同方向还是转向，再写 draft brief
 - 最后才写 `hypothesis / change_plan / novelty_proof`
-- `novelty_proof` 现在用于先说明“上一版被什么证据否掉”，再说明“这轮为什么继续或转向”，最后才补“这次和旧 cut 的不同点”
+- `novelty_proof` 现在用于先说明“上一版被什么证据否掉”，再说明“这轮为什么继续或转向”，最后才补“这次换了哪一层真实触达路径或关键规则链”
 
 当前 edit_worker 约束：
 
 - worker 仍然只改 [src/strategy_macd_aggressive.py](../src/strategy_macd_aggressive.py)
 - 整份策略文件都允许修改，但改动必须克制、结构准确、添加有必要
+- worker 会收到当前 gate、最弱维度和 val 多/空捕获/命中率的紧凑诊断，但不会收到完整历史包，也不重新做 planner 研究
+- 单轮改动预算只作为参考，不是硬 gate；超出小 diff 范围时必须服务于打通真实路径或删除旧冗余
 - 真正会进入 diff / smoke / full eval 的，是最终源码里的真实落地改动
 
 当前 reviewer 的职责：
@@ -156,6 +178,7 @@
 - reviewer 不负责提出新方向，只负责审稿
 - reviewer 只能输出 `PASS` 或 `REVISE`
 - reviewer 会把 `direction_board` 当成高优先级证据，但它只在命中高热方向时检查“有没有结构性差异”，不会把方向永久封死
+- reviewer 在 `PASS` 前会检查 draft 是否说明预计新增、删除或迁移哪类真实交易；如果完全没有交易路径变化说明，会打回让 planner 补清楚
 - 若 `REVISE`，必须指出当前 draft 仍落在哪个失败近邻，以及 planner 下一版至少要换哪一层
 - 未通过 reviewer 的 brief 不会进入 `edit_worker`
 
@@ -165,7 +188,8 @@
 - `reviewer / edit_worker / repair_worker / summary_worker` 都不复用 planner session
 - session scope 只绑定当前 active reference 的 `code_hash + stage`
 - 一旦手工重开 stage，或 champion 刷新，planner session 就会重置
-- 如果本轮没有刷新 champion，主进程只写回 `journal / wiki / reviewer_summary_card`，然后沿用当前 stage / planner session 进入下一轮
+- `wiki/reviewer_summary_card.md` 只保留当前轮最后一次 reviewer 判定；如果同轮先 `REVISE` 后重写再 `PASS`，最终卡记录最后一次 `PASS`
+- 如果本轮没有刷新 champion，主进程会写回 `journal / wiki / reviewer_summary_card / direction_board`，然后沿用当前 stage / planner session 进入下一轮
 - 当前同一轮允许出现 `planner -> reviewer -> planner 重写 -> reviewer` 的短链，但只有 planner 复用持久 session
 
 ## 复杂度与手工瘦身
@@ -248,6 +272,12 @@
 - val多/空捕获
 - train+val期间回撤/手续费拖累
 - 新 champion 时的 test期间回撤/手续费拖累
+
+另外：
+
+- 普通启动仍会发送 `📌 已加载 champion 参考` 播报。
+- 真正刷新 champion 时，仍会发送 `🚀 新 champion` 播报
+- 如果进程随后因承接这个新 champion 而重启，启动时那条 `📌 已加载 champion 参考` 不再重复播报
 
 ## 安全评估当前策略
 

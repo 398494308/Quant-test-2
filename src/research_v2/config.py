@@ -108,7 +108,6 @@ class ResearchRuntimeConfig:
     max_no_edit_repair_attempts: int
     max_exploration_regen_attempts: int
     max_consecutive_no_edit_failures_before_stop: int
-    promotion_min_delta: float
 
 
 # ==================== 对外入口 ====================
@@ -182,5 +181,4 @@ def load_research_runtime_config(repo_root: Path) -> ResearchRuntimeConfig:
             "MACD_V2_MAX_CONSECUTIVE_NO_EDIT_FAILURES_BEFORE_STOP",
             3,
         ),
-        promotion_min_delta=_env_float("MACD_V2_PROMOTION_MIN_DELTA", 0.02),
     )
