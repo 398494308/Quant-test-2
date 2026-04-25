@@ -10,6 +10,16 @@ SIDEWAYS_MIN_HOURLY_SPREAD_PCT = 0.0016
 SIDEWAYS_MIN_FOURH_SPREAD_PCT = 0.0020
 SIDEWAYS_MAX_HOURLY_ADX = 18.0
 SIDEWAYS_MAX_FOURH_ADX = 16.0
+SIDEWAYS_RELEASE_RELAX = {
+    "spread_floor_mult": 0.88,
+    "slope_floor_mult": 0.90,
+    "atr_ceiling_mult": 1.12,
+    "chop_buffer": 2.5,
+    "hard_sideways_atr_mult": 1.22,
+    "hard_sideways_spread_mult": 1.18,
+    "extreme_compression_atr_mult": 0.96,
+    "extreme_compression_spread_mult": 0.94,
+}
 
 # PARAMS_START
 PARAMS = {
@@ -52,9 +62,9 @@ PARAMS = {
     "intraday_adx_min": 12.5,
     "intraday_ema_fast": 9,
     "intraday_ema_slow": 28,
-    "macd_fast": 5,
-    "macd_signal": 3,
-    "macd_slow": 16,
+    "macd_fast": 8,
+    "macd_signal": 6,
+    "macd_slow": 20,
     "min_history": 260,
     "volume_lookback": 9,
 }
@@ -848,6 +858,7 @@ def _sideways_release_flags(market_state, positions=None):
     adx_soft = hourly["adx"] <= SIDEWAYS_MAX_HOURLY_ADX and fourh["adx"] <= SIDEWAYS_MAX_FOURH_ADX
     aligned_trend = hourly["trend_spread_pct"] * fourh["trend_spread_pct"] > 0.0
     long_pullback_hold = _long_pullback_hold_active(positions)
+    relax = SIDEWAYS_RELEASE_RELAX
 
     def _safe_float(payload, key, default):
         if payload is None:
@@ -882,11 +893,11 @@ def _sideways_release_flags(market_state, positions=None):
     convexity_release = (
         aligned_trend
         and intraday_spread >= atr_ratio * 0.26
-        and hourly_spread >= max(SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 1.10, atr_ratio * 0.66)
-        and fourh_spread >= max(SIDEWAYS_MIN_FOURH_SPREAD_PCT * 0.50, atr_ratio * 0.48)
-        and fourh_spread <= max(SIDEWAYS_MIN_FOURH_SPREAD_PCT * 1.18, atr_ratio * 0.98)
-        and hourly_slope >= max(hourly_spread * 0.10, atr_ratio * 0.082)
-        and fourh_slope >= max(fourh_spread * 0.18, atr_ratio * 0.028)
+        and hourly_spread >= max(SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 1.10 * relax["spread_floor_mult"], atr_ratio * 0.66 * relax["spread_floor_mult"])
+        and fourh_spread >= max(SIDEWAYS_MIN_FOURH_SPREAD_PCT * 0.50 * relax["spread_floor_mult"], atr_ratio * 0.48 * relax["spread_floor_mult"])
+        and fourh_spread <= max(SIDEWAYS_MIN_FOURH_SPREAD_PCT * 1.18, atr_ratio * 0.98 * relax["atr_ceiling_mult"])
+        and hourly_slope >= max(hourly_spread * 0.10 * relax["slope_floor_mult"], atr_ratio * 0.082 * relax["slope_floor_mult"])
+        and fourh_slope >= max(fourh_spread * 0.18 * relax["slope_floor_mult"], atr_ratio * 0.028 * relax["slope_floor_mult"])
         and market_state["adx"] >= 13.5
         and hourly["adx"] >= 18.0
         and fourh["adx"] >= 12.0
@@ -894,27 +905,27 @@ def _sideways_release_flags(market_state, positions=None):
     trend_awakening = (
         aligned_trend
         and intraday_spread >= atr_ratio * 0.24
-        and intraday_spread <= max(hourly_spread * 1.92, atr_ratio * 0.98)
-        and hourly_spread >= max(SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 0.92, atr_ratio * 0.54)
-        and fourh_spread >= max(SIDEWAYS_MIN_FOURH_SPREAD_PCT * 0.42, atr_ratio * 0.40)
-        and fourh_spread <= max(SIDEWAYS_MIN_FOURH_SPREAD_PCT * 1.08, atr_ratio * 0.90)
-        and hourly_slope >= max(hourly_spread * 0.12, atr_ratio * 0.080)
-        and fourh_slope >= max(fourh_spread * 0.20, atr_ratio * 0.028)
+        and intraday_spread <= max(hourly_spread * 1.92, atr_ratio * 0.98 * relax["atr_ceiling_mult"])
+        and hourly_spread >= max(SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 0.92 * relax["spread_floor_mult"], atr_ratio * 0.54 * relax["spread_floor_mult"])
+        and fourh_spread >= max(SIDEWAYS_MIN_FOURH_SPREAD_PCT * 0.42 * relax["spread_floor_mult"], atr_ratio * 0.40 * relax["spread_floor_mult"])
+        and fourh_spread <= max(SIDEWAYS_MIN_FOURH_SPREAD_PCT * 1.08, atr_ratio * 0.90 * relax["atr_ceiling_mult"])
+        and hourly_slope >= max(hourly_spread * 0.12 * relax["slope_floor_mult"], atr_ratio * 0.080 * relax["slope_floor_mult"])
+        and fourh_slope >= max(fourh_spread * 0.20 * relax["slope_floor_mult"], atr_ratio * 0.028 * relax["slope_floor_mult"])
         and market_state["adx"] >= 13.0
         and hourly["adx"] >= 17.0
         and fourh["adx"] >= 11.8
-        and intraday_chop < SIDEWAYS_HARD_INTRADAY_CHOP_MIN + 2.0
-        and hourly_chop < SIDEWAYS_HARD_HOURLY_CHOP_MIN + 2.0
+        and intraday_chop < SIDEWAYS_HARD_INTRADAY_CHOP_MIN + relax["chop_buffer"]
+        and hourly_chop < SIDEWAYS_HARD_HOURLY_CHOP_MIN + relax["chop_buffer"]
     )
     fresh_directional_expansion = (
         aligned_trend
         and intraday_spread >= atr_ratio * 0.22
-        and intraday_spread <= max(hourly_spread * 1.35, atr_ratio * 0.92)
-        and hourly_spread >= max(SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 1.02, atr_ratio * 0.60)
-        and fourh_spread >= max(SIDEWAYS_MIN_FOURH_SPREAD_PCT * 0.56, atr_ratio * 0.52)
-        and fourh_spread <= max(SIDEWAYS_MIN_FOURH_SPREAD_PCT * 1.52, atr_ratio * 1.18)
-        and hourly_slope >= max(hourly_spread * 0.13, atr_ratio * 0.084)
-        and fourh_slope >= max(fourh_spread * 0.22, atr_ratio * 0.032)
+        and intraday_spread <= max(hourly_spread * 1.35, atr_ratio * 0.92 * relax["atr_ceiling_mult"])
+        and hourly_spread >= max(SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 1.02 * relax["spread_floor_mult"], atr_ratio * 0.60 * relax["spread_floor_mult"])
+        and fourh_spread >= max(SIDEWAYS_MIN_FOURH_SPREAD_PCT * 0.56 * relax["spread_floor_mult"], atr_ratio * 0.52 * relax["spread_floor_mult"])
+        and fourh_spread <= max(SIDEWAYS_MIN_FOURH_SPREAD_PCT * 1.52, atr_ratio * 1.18 * relax["atr_ceiling_mult"])
+        and hourly_slope >= max(hourly_spread * 0.13 * relax["slope_floor_mult"], atr_ratio * 0.084 * relax["slope_floor_mult"])
+        and fourh_slope >= max(fourh_spread * 0.22 * relax["slope_floor_mult"], atr_ratio * 0.032 * relax["slope_floor_mult"])
         and market_state["adx"] >= 14.0
         and hourly["adx"] >= 18.5
         and fourh["adx"] >= 12.5
@@ -935,9 +946,9 @@ def _sideways_release_flags(market_state, positions=None):
             and adx_soft
         )
         or (
-            atr_ratio < SIDEWAYS_MIN_ATR_RATIO * 1.10
-            and hourly_spread < SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 1.15
-            and fourh_spread < SIDEWAYS_MIN_FOURH_SPREAD_PCT * 1.15
+            atr_ratio < SIDEWAYS_MIN_ATR_RATIO * relax["hard_sideways_atr_mult"]
+            and hourly_spread < SIDEWAYS_MIN_HOURLY_SPREAD_PCT * relax["hard_sideways_spread_mult"]
+            and fourh_spread < SIDEWAYS_MIN_FOURH_SPREAD_PCT * relax["hard_sideways_spread_mult"]
             and not (convexity_release or trend_awakening or fresh_directional_expansion)
         )
         or (
@@ -950,9 +961,9 @@ def _sideways_release_flags(market_state, positions=None):
     extreme_compression = (
         intraday_chop >= SIDEWAYS_HARD_INTRADAY_CHOP_MIN + 2.0
         and hourly_chop >= SIDEWAYS_HARD_HOURLY_CHOP_MIN + 2.0
-        and atr_ratio < SIDEWAYS_MIN_ATR_RATIO * 0.92
-        and hourly_spread < SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 0.90
-        and fourh_spread < SIDEWAYS_MIN_FOURH_SPREAD_PCT * 0.90
+        and atr_ratio < SIDEWAYS_MIN_ATR_RATIO * relax["extreme_compression_atr_mult"]
+        and hourly_spread < SIDEWAYS_MIN_HOURLY_SPREAD_PCT * relax["extreme_compression_spread_mult"]
+        and fourh_spread < SIDEWAYS_MIN_FOURH_SPREAD_PCT * relax["extreme_compression_spread_mult"]
     )
     return {
         "intraday_spread": intraday_spread,
@@ -1048,6 +1059,90 @@ def _is_sideways_regime(market_state, positions=None):
     if mild_long_pullback and not extreme_compression:
         signals -= 1
     return signals >= 3
+
+
+def _completed_fourh_bars(data, idx):
+    completed_end = ((idx + 1) // 16) * 16
+    if completed_end < 16:
+        return []
+
+    fourh_bars = []
+    for start in range(0, completed_end, 16):
+        chunk = data[start : start + 16]
+        if len(chunk) < 16:
+            continue
+        volume = 0.0
+        open_price = chunk[0]["open"]
+        high_price = chunk[0]["high"]
+        low_price = chunk[0]["low"]
+        close_price = chunk[-1]["close"]
+        for bar in chunk:
+            volume += bar["volume"]
+            if bar["high"] > high_price:
+                high_price = bar["high"]
+            if bar["low"] < low_price:
+                low_price = bar["low"]
+        fourh_bars.append(
+            {
+                "open": open_price,
+                "high": high_price,
+                "low": low_price,
+                "close": close_price,
+                "volume": volume,
+            }
+        )
+    return fourh_bars
+
+
+def _is_strong_bull_regime(data, idx, market_state):
+    fourh = market_state.get("four_hour")
+    if fourh is None:
+        return False
+
+    fourh_bars = _completed_fourh_bars(data, idx)
+    if len(fourh_bars) < 100:
+        return False
+
+    ma100 = _avg(fourh_bars, len(fourh_bars) - 100, len(fourh_bars) - 1, "close")
+    plus_di = 0.0
+    minus_di = 0.0
+    if len(fourh_bars) > 14:
+        alpha = 2.0 / 15.0
+        tr_ema = 0.0
+        plus_dm_ema = 0.0
+        minus_dm_ema = 0.0
+        for i in range(1, len(fourh_bars)):
+            current = fourh_bars[i]
+            prev = fourh_bars[i - 1]
+            up_move = current["high"] - prev["high"]
+            down_move = prev["low"] - current["low"]
+            plus_dm = up_move if up_move > down_move and up_move > 0.0 else 0.0
+            minus_dm = down_move if down_move > up_move and down_move > 0.0 else 0.0
+            true_range = max(
+                current["high"] - current["low"],
+                abs(current["high"] - prev["close"]),
+                abs(current["low"] - prev["close"]),
+            )
+            if i == 1:
+                tr_ema = true_range
+                plus_dm_ema = plus_dm
+                minus_dm_ema = minus_dm
+                continue
+            tr_ema += (true_range - tr_ema) * alpha
+            plus_dm_ema += (plus_dm - plus_dm_ema) * alpha
+            minus_dm_ema += (minus_dm - minus_dm_ema) * alpha
+        if tr_ema > 1e-9:
+            plus_di = 100.0 * plus_dm_ema / tr_ema
+            minus_di = 100.0 * minus_dm_ema / tr_ema
+    return (
+        fourh["close"] > ma100
+        and fourh["close"] > fourh["ema_fast"] > fourh["ema_slow"]
+        and fourh["macd_line"] > fourh["signal_line"]
+        and fourh["trend_spread_pct"] > 0.0
+        and fourh["ema_slow_slope_pct"] > 0.0
+        and fourh["adx"] >= 30.0
+        and plus_di > minus_di
+    )
 
 
 def _directional_trend_metrics(market_state, side):
@@ -1324,13 +1419,24 @@ def _active_long_exit_followthrough_ok(positions, market_state, current_close):
     return _trend_followthrough_exit_long(market_state, trigger_price, current_close)
 
 
+def _long_durable_hold_active(market_state):
+    fourh = market_state["four_hour"]
+    if fourh is None:
+        return False
+    return (
+        fourh["adx"] >= 22.0
+        and fourh["trend_spread_pct"] > 0.0
+        and fourh["close"] > fourh["ema_slow"]
+    )
+
+
 def long_outer_context_ok(context, market_state, params):
     long_state = _build_long_trend_state(context, market_state, params)
     context["long_outer_lane"] = ""
     reclaim_ready = (
         context["current"]["close"] > market_state["ema_fast"] > market_state["ema_slow"]
         and market_state["macd_line"] > market_state["signal_line"]
-        and market_state["adx"] >= max(params["intraday_adx_min"] - 0.5, 12.0)
+        and market_state["adx"] >= max(params["intraday_adx_min"] - 1.6, 11.5)
         and context["breakout_distance_pct"] >= -context["atr_ratio"] * 0.02
         and context["hourly_fast_extension_pct"] <= max(
             context["atr_ratio"] * 0.84,
@@ -1364,7 +1470,7 @@ def long_outer_context_ok(context, market_state, params):
             context["atr_ratio"] * 0.26,
         )
         and context["hourly"]["ema_slow_slope_pct"] >= context["atr_ratio"] * 0.014
-        and context["hourly"]["adx"] >= max(params["hourly_adx_min"] - 3.5, 15.0)
+        and context["hourly"]["adx"] >= max(params["hourly_adx_min"] - 5.0, 14.0)
     )
     hourly_turn_repair_ready = (
         context["hourly"]["close"] > context["hourly"]["ema_slow"]
@@ -1378,7 +1484,7 @@ def long_outer_context_ok(context, market_state, params):
             context["atr_ratio"] * 0.22,
         )
         and context["hourly"]["ema_slow_slope_pct"] >= 0.0
-        and context["hourly"]["adx"] >= max(params["hourly_adx_min"] - 4.5, 14.0)
+        and context["hourly"]["adx"] >= max(params["hourly_adx_min"] - 6.0, 13.5)
     )
     late_mature_guard = (
         context["hourly_fast_extension_pct"] >= max(
@@ -1454,14 +1560,14 @@ def long_breakout_ok(context, market_state, params):
         and current_candle["body_ratio"] >= max(params["breakout_body_ratio_min"] - 0.03, 0.28)
         and context["volume_ratio"] >= max(params["breakout_volume_ratio_min"] - 0.06, 1.02)
         and current["volume"] >= max(context["prev_volume"] * 0.92, context["recent_volume_avg"] * 0.92)
-        and market_state["adx"] >= max(params["breakout_adx_min"] - 1.0, params["intraday_adx_min"] + 0.8)
+        and market_state["adx"] >= max(params["breakout_adx_min"] - 2.3, params["intraday_adx_min"] + 0.3)
         and params["breakout_rsi_min"] <= market_state["rsi"] <= min(params["breakout_rsi_max"], 69.0)
         and market_state["histogram"] >= max(params["breakout_hist_min"], 3.5)
         and _flow_entry_ok(market_state, hourly, fourh, params, "long", strong=False)
         and context["hourly_fast_extension_pct"] <= max(atr_ratio * 0.94, SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 2.08)
         and context["hourly_anchor_extension_pct"] <= max(atr_ratio * 1.36, SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 3.18)
-        and fourh["trend_spread_pct"] >= max(hourly["trend_spread_pct"] * 0.42, atr_ratio * 0.54)
-        and fourh["ema_slow_slope_pct"] >= atr_ratio * 0.028
+        and fourh["trend_spread_pct"] >= max(hourly["trend_spread_pct"] * 0.38, atr_ratio * 0.48)
+        and fourh["ema_slow_slope_pct"] >= atr_ratio * 0.024
     )
 
 
@@ -1487,13 +1593,13 @@ def long_pullback_ok(context, market_state, params):
         and context["current_range"] >= max(context["prev_range"] * 0.96, context["recent_range_avg"] * 0.88)
         and context["current_candle"]["close_pos"] >= max(params["breakout_close_pos_min"] + 0.01, 0.62)
         and context["current_candle"]["body_ratio"] >= max(context["prev_candle"]["body_ratio"] * 0.96, 0.30)
-        and current["volume"] >= max(context["prev_volume"] * 0.94, context["recent_volume_avg"] * 0.92)
+        and current["volume"] >= max(context["prev_volume"] * 0.92, context["recent_volume_avg"] * 0.90)
         and context["volume_ratio"] >= max(params["breakout_volume_ratio_min"] - 0.08, 1.02)
         and _flow_entry_ok(market_state, hourly, fourh, params, "long", strong=False)
-        and context["hourly_fast_extension_pct"] <= max(atr_ratio * 0.92, SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 2.00)
-        and context["hourly_anchor_extension_pct"] <= max(atr_ratio * 1.30, SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 3.02)
-        and fourh["trend_spread_pct"] >= max(hourly["trend_spread_pct"] * 0.40, atr_ratio * 0.52)
-        and fourh["ema_slow_slope_pct"] >= atr_ratio * 0.028
+        and context["hourly_fast_extension_pct"] <= max(atr_ratio * 0.96, SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 2.08)
+        and context["hourly_anchor_extension_pct"] <= max(atr_ratio * 1.36, SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 3.12)
+        and fourh["trend_spread_pct"] >= max(hourly["trend_spread_pct"] * 0.36, atr_ratio * 0.46)
+        and fourh["ema_slow_slope_pct"] >= atr_ratio * 0.022
     )
 
 
@@ -1823,16 +1929,22 @@ def strategy_decision(data, idx, positions, market_state):
     context = _strategy_entry_context(data, idx, positions, market_state, p)
     if context is None:
         return None
+    strong_bull_regime = _is_strong_bull_regime(data, idx, market_state)
 
     _record_funnel_pass("long", "sideways_pass")
     _record_funnel_pass("short", "sideways_pass")
 
-    if positions and _position_side(positions[0]) == "long":
+    if not strong_bull_regime and positions and _position_side(positions[0]) == "long":
         forced_short_path = _short_entry_path_key(context, market_state, p, require_breakdown_gate=False)
-        if forced_short_path and not _active_long_exit_followthrough_ok(
+        long_exit_followthrough_ok = _active_long_exit_followthrough_ok(
             positions,
             market_state,
             context["current"]["close"],
+        )
+        if (
+            forced_short_path
+            and not long_exit_followthrough_ok
+            and not _long_durable_hold_active(market_state)
         ):
             return {
                 "entry_signal": "short_breakdown",
@@ -1849,7 +1961,7 @@ def strategy_decision(data, idx, positions, market_state):
         long_ownership_relay = (
             not long_signal_path_ok(long_breakout_path, long_pullback_path, long_reaccel_path)
             and context["current"]["high"] > context["breakout_high"]
-            and context["current"]["close"] >= context["breakout_high"] * (1.0 + p["breakout_buffer_pct"] * 0.5)
+            and context["current"]["close"] >= context["breakout_high"] * (1.0 + p["breakout_buffer_pct"] * 0.4)
             and context["breakout_distance_pct"] >= context["atr_ratio"] * 0.02
             and context["current"]["close"] >= context["prev"]["close"]
             and context["current_candle"]["close_pos"] >= max(p["breakout_close_pos_min"] - 0.04, 0.54)
@@ -1893,7 +2005,7 @@ def strategy_decision(data, idx, positions, market_state):
                     "entry_path_tag": ENTRY_PATH_TAGS.get(path_key, path_key),
                 }
 
-    if short_outer_context_ok(context, market_state, p):
+    if not strong_bull_regime and short_outer_context_ok(context, market_state, p):
         _record_funnel_pass("short", "outer_context_pass")
         short_path_key = _short_entry_path_key(context, market_state, p, require_breakdown_gate=True)
         short_breakdown_path = short_path_key == "short_breakdown"
@@ -1925,16 +2037,22 @@ def strategy(data, idx, positions, market_state):
     context = _strategy_entry_context(data, idx, positions, market_state, p)
     if context is None:
         return None
+    strong_bull_regime = _is_strong_bull_regime(data, idx, market_state)
 
     _record_funnel_pass("long", "sideways_pass")
     _record_funnel_pass("short", "sideways_pass")
 
-    if positions and _position_side(positions[0]) == "long":
+    if not strong_bull_regime and positions and _position_side(positions[0]) == "long":
         forced_short_signal = _short_entry_signal(data, idx, positions, market_state)
-        if forced_short_signal and not _active_long_exit_followthrough_ok(
+        long_exit_followthrough_ok = _active_long_exit_followthrough_ok(
             positions,
             market_state,
             context["current"]["close"],
+        )
+        if (
+            forced_short_signal
+            and not long_exit_followthrough_ok
+            and not _long_durable_hold_active(market_state)
         ):
             return forced_short_signal
 
@@ -1992,7 +2110,7 @@ def strategy(data, idx, positions, market_state):
             and not long_signal_path_ok(long_breakout_path, long_pullback_path, long_reaccel_path)
             and context["long_reclaim_ready"]
             and context["current"]["high"] >= context["breakout_high"]
-            and context["current"]["close"] >= context["breakout_high"] * (1.0 + p["breakout_buffer_pct"] * 0.35)
+            and context["current"]["close"] >= context["breakout_high"] * (1.0 + p["breakout_buffer_pct"] * 0.28)
             and context["breakout_distance_pct"] >= 0.0
             and context["breakout_distance_pct"] <= context["atr_ratio"] * 0.08
             and context["current"]["close"] >= context["prev"]["close"]
@@ -2032,7 +2150,7 @@ def strategy(data, idx, positions, market_state):
                     path_key = "long_reaccel"
                 return normalize_entry_signal("long_pullback", fallback_side="long") or None
 
-    if short_outer_context_ok(context, market_state, p):
+    if not strong_bull_regime and short_outer_context_ok(context, market_state, p):
         _record_funnel_pass("short", "outer_context_pass")
         short_path_key = _short_entry_path_key(context, market_state, p, require_breakdown_gate=True)
         short_breakdown_path = short_path_key == "short_breakdown"
