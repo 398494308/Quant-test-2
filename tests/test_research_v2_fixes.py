@@ -795,6 +795,8 @@ class EvaluationFixesTest(unittest.TestCase):
 
         self.assertEqual(gate_snapshot["unique_points"], 2.0)
         self.assertGreaterEqual(gate_snapshot["path_return_pct"], 0.0)
+        self.assertIn("return_score", gate_snapshot)
+        self.assertIn("period_score", gate_snapshot)
 
 
 class StrategyValidationFixesTest(unittest.TestCase):
@@ -5140,3 +5142,145 @@ EXIT_PARAMS = {
         self.assertIsNotNone(spec)
         self.assertEqual(spec.param, "trailing_activation_pct")
         self.assertIn(24.0, spec.values)
+
+class ResearchRuntimeLeanPipelineTest(unittest.TestCase):
+    def test_context_cache_key_ignores_execution_irrelevant_exit_params(self):
+        original_cache = research_script.prepared_backtest_context_cache
+        research_script.prepared_backtest_context_cache = research_script.OrderedDict()
+        try:
+            with mock.patch.object(
+                research_script,
+                "_file_cache_signature",
+                return_value={"path": "fixture.csv", "exists": True, "mtime_ns": 1, "size": 1},
+            ):
+                with mock.patch.object(research_script.strategy_module, "PARAMS", {"alpha": 1}):
+                    with mock.patch.object(
+                        research_script.backtest_module,
+                        "prepare_backtest_context",
+                        return_value={"prepared": "context"},
+                    ) as prepare_mock:
+                        with mock.patch.object(
+                            research_script.strategy_module,
+                            "EXIT_PARAMS",
+                            {"execution_use_1m": 1, "funding_fee_enabled": 1, "trailing_activation_pct": 100.0},
+                        ):
+                            first = research_script._prepare_backtest_context()
+                        with mock.patch.object(
+                            research_script.strategy_module,
+                            "EXIT_PARAMS",
+                            {"execution_use_1m": 1, "funding_fee_enabled": 1, "trailing_activation_pct": 120.0},
+                        ):
+                            second = research_script._prepare_backtest_context()
+        finally:
+            research_script.prepared_backtest_context_cache = original_cache
+
+        self.assertIs(first, second)
+        self.assertEqual(prepare_mock.call_count, 1)
+
+    def test_context_cache_key_keeps_context_relevant_exit_params(self):
+        original_cache = research_script.prepared_backtest_context_cache
+        research_script.prepared_backtest_context_cache = research_script.OrderedDict()
+        try:
+            with mock.patch.object(
+                research_script,
+                "_file_cache_signature",
+                return_value={"path": "fixture.csv", "exists": True, "mtime_ns": 1, "size": 1},
+            ):
+                with mock.patch.object(research_script.strategy_module, "PARAMS", {"alpha": 1}):
+                    with mock.patch.object(
+                        research_script.backtest_module,
+                        "prepare_backtest_context",
+                        side_effect=[{"prepared": "ctx_1"}, {"prepared": "ctx_2"}],
+                    ) as prepare_mock:
+                        with mock.patch.object(
+                            research_script.strategy_module,
+                            "EXIT_PARAMS",
+                            {"execution_use_1m": 1, "funding_fee_enabled": 1},
+                        ):
+                            first = research_script._prepare_backtest_context()
+                        with mock.patch.object(
+                            research_script.strategy_module,
+                            "EXIT_PARAMS",
+                            {"execution_use_1m": 0, "funding_fee_enabled": 1},
+                        ):
+                            second = research_script._prepare_backtest_context()
+        finally:
+            research_script.prepared_backtest_context_cache = original_cache
+
+        self.assertEqual(first, {"prepared": "ctx_1"})
+        self.assertEqual(second, {"prepared": "ctx_2"})
+        self.assertEqual(prepare_mock.call_count, 2)
+
+    def test_early_reject_snapshot_runs_only_on_milestones(self):
+        class Window:
+            def __init__(self, label, start, end):
+                self.label = label
+                self.group = "eval"
+                self.start_date = start
+                self.end_date = end
+
+        windows = [Window(f"train{i}", f"2024-01-{i:02d}", f"2024-01-{i:02d}") for i in range(1, 27)]
+        temp_runtime = replace(
+            research_script.RUNTIME,
+            early_reject_after_windows=10,
+            early_reject_milestones=(10, 18, 26),
+            early_reject_min_segments=999,
+        )
+        calls = []
+
+        def fake_backtest(**kwargs):
+            calls.append((kwargs["start_date"], kwargs["end_date"]))
+            return {"trend_capture_points": [], "return": 0.0, "trades": 0}
+
+        with mock.patch.object(research_script, "RUNTIME", temp_runtime), mock.patch.object(
+            research_script, "write_heartbeat"
+        ), mock.patch.object(research_script.backtest_module, "backtest_macd_aggressive", side_effect=fake_backtest), mock.patch.object(
+            research_script.strategy_module, "PARAMS", {}
+        ), mock.patch.object(research_script, "active_exit_params", return_value={}):
+            research_script._run_base_backtests(
+                allow_early_reject=True,
+                windows=windows,
+                prepared_context={"prepared": True},
+            )
+
+        self.assertEqual(len(calls), 29)
+        snapshot_calls = [call for call in calls if call[0] == "2024-01-01" and call[1] != "2024-01-01"]
+        self.assertEqual(snapshot_calls, [
+            ("2024-01-01", "2024-01-10"),
+            ("2024-01-01", "2024-01-18"),
+            ("2024-01-01", "2024-01-26"),
+        ])
+
+    def test_behavior_profile_changed_accepts_large_funnel_delta(self):
+        fingerprint = {"return": 0.0, "score": 0.0, "max_drawdown": 0.0, "trades": 0}
+        base = [{
+            "window": "train1",
+            "fingerprint": fingerprint,
+            "funnel": {"long": {"outer_context_pass": 100, "path_pass": 20, "final_veto_pass": 10}},
+            "filled_side_entries": {"long": 0, "short": 0},
+        }]
+        candidate = [{
+            "window": "train1",
+            "fingerprint": fingerprint,
+            "funnel": {"long": {"outer_context_pass": 130, "path_pass": 20, "final_veto_pass": 10}},
+            "filled_side_entries": {"long": 0, "short": 0},
+        }]
+
+        self.assertTrue(research_script._behavior_profile_changed(base, candidate))
+
+    def test_behavior_profile_changed_ignores_small_funnel_delta(self):
+        fingerprint = {"return": 0.0, "score": 0.0, "max_drawdown": 0.0, "trades": 0}
+        base = [{
+            "window": "train1",
+            "fingerprint": fingerprint,
+            "funnel": {"long": {"outer_context_pass": 100, "path_pass": 20, "final_veto_pass": 10}},
+            "filled_side_entries": {"long": 0, "short": 0},
+        }]
+        candidate = [{
+            "window": "train1",
+            "fingerprint": fingerprint,
+            "funnel": {"long": {"outer_context_pass": 103, "path_pass": 20, "final_veto_pass": 10}},
+            "filled_side_entries": {"long": 0, "short": 0},
+        }]
+
+        self.assertFalse(research_script._behavior_profile_changed(base, candidate))

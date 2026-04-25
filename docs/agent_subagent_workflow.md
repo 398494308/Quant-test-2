@@ -109,6 +109,8 @@ flowchart TB
   - 做真实 diff 检查
   - 跑 `smoke`
   - 对合法的单参数 `EXIT_PARAMS` 做轻量 range scan 预筛
+  - 用三点 milestone 做 early reject，不再每个后续窗口都补跑连续 snapshot
+  - 用成交指纹加关键漏斗变化判断 behavioral no-op
   - 跑完整评估
   - 执行 `gate`
   - 写 `journal / wiki / heartbeat / reviewer_summary_card / direction_board`

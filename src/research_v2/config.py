@@ -35,6 +35,19 @@ def _env_float(name: str, default: float) -> float:
     return float(os.getenv(name, str(default)))
 
 
+def _env_int_tuple(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    raw = str(os.getenv(name, ",".join(str(item) for item in default))).strip()
+    if not raw:
+        return tuple()
+    values: list[int] = []
+    for item in raw.replace("；", ",").replace(";", ",").split(","):
+        text = item.strip()
+        if not text:
+            continue
+        values.append(int(text))
+    return tuple(dict.fromkeys(value for value in values if value > 0))
+
+
 def _env_text(name: str, default: str) -> str:
     return str(os.getenv(name, default)).strip()
 
@@ -100,6 +113,7 @@ class ResearchRuntimeConfig:
     prompt_max_output_tokens: int
     max_recent_journal_entries: int
     early_reject_after_windows: int
+    early_reject_milestones: tuple[int, ...]
     early_reject_min_segments: int
     early_reject_trend_score_threshold: float
     early_reject_hit_rate_threshold: float
@@ -175,6 +189,7 @@ def load_research_runtime_config(repo_root: Path) -> ResearchRuntimeConfig:
         prompt_max_output_tokens=_env_int("MACD_V2_PROMPT_MAX_OUTPUT_TOKENS", 12000),
         max_recent_journal_entries=_env_int("MACD_V2_MAX_RECENT_JOURNAL_ENTRIES", 12),
         early_reject_after_windows=_env_int("MACD_V2_EARLY_REJECT_WINDOWS", 15),
+        early_reject_milestones=_env_int_tuple("MACD_V2_EARLY_REJECT_MILESTONES", (10, 18, 26)),
         early_reject_min_segments=_env_int("MACD_V2_EARLY_REJECT_MIN_SEGMENTS", 4),
         early_reject_trend_score_threshold=_env_float("MACD_V2_EARLY_REJECT_TREND_SCORE", -0.10),
         early_reject_hit_rate_threshold=_env_float("MACD_V2_EARLY_REJECT_HIT_RATE", 0.15),

@@ -1072,6 +1072,8 @@ def partial_eval_gate_snapshot(result: dict[str, Any] | None) -> dict[str, float
     return {
         "segment_count": float(report.segment_count),
         "trend_score": report.trend_score,
+        "return_score": report.return_score,
+        "period_score": _period_score(report),
         "hit_rate": report.hit_rate,
         "path_return_pct": report.path_return_pct,
         "unique_points": float(len(points)),

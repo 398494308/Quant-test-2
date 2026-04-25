@@ -92,6 +92,9 @@
 - 候选必须先形成真实源码 diff
 - 再过 `smoke`
 - 如果本轮触达单个连续型 `EXIT_PARAMS`，主进程会先做最多 3 点轻量 range scan，只用少量窗口预筛并只保留最佳值
+- context cache 只按真实数据准备依赖建 key，普通止盈/止损/追踪数值变化不会触发重建
+- early reject 只在 `10/18/26` 三个 train milestone 做连续 snapshot，避免每个后续窗口都补跑
+- behavioral no-op 会先看成交指纹；若成交不变但关键漏斗触达大幅变化，也允许进入后续评估
 - 再跑完整 `train walk-forward + val`
 - 若刷新 `champion`，只在这时额外跑 `test`
 - `summary_worker` 只根据最终真实 diff 回写候选摘要，避免“原 brief”和“最终代码”错位

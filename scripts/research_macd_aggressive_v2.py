@@ -135,6 +135,11 @@ MAX_REVIEWER_REPAIR_ATTEMPTS = 1
 MAX_REVIEWER_REVISE_ATTEMPTS = 2
 PREPARED_BACKTEST_CONTEXT_CACHE_LIMIT = 2
 NON_PERSISTENT_CODEX_TRANSIENT_RETRY_LIMIT = 1
+CONTEXT_RELEVANT_EXIT_PARAM_KEYS = frozenset({"execution_use_1m", "funding_fee_enabled"})
+BEHAVIOR_FUNNEL_ABS_DELTA = 20
+BEHAVIOR_FUNNEL_REL_DELTA = 0.08
+BEHAVIOR_FUNNEL_REL_MIN_ABS_DELTA = 5
+BEHAVIOR_FUNNEL_STAGES = ("outer_context_pass", "path_pass", "final_veto_pass", "filled_entries")
 
 best_source = ""
 best_report: EvaluationReport | None = None
@@ -1007,6 +1012,14 @@ def _backtest_data_file_signatures() -> dict[str, Any]:
     }
 
 
+def _context_relevant_exit_params(exit_params: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: exit_params.get(key)
+        for key in sorted(CONTEXT_RELEVANT_EXIT_PARAM_KEYS)
+        if key in exit_params
+    }
+
+
 def _prepared_backtest_context_cache_key(
     strategy_params: dict[str, Any],
     *,
@@ -1015,7 +1028,7 @@ def _prepared_backtest_context_cache_key(
     return _stable_cache_text(
         {
             "strategy_params": strategy_params,
-            "exit_params": exit_params,
+            "context_exit_params": _context_relevant_exit_params(exit_params),
             "files": _backtest_data_file_signatures(),
         }
     )
@@ -1086,6 +1099,7 @@ def _run_base_backtests(
     results: list[dict[str, Any]] = []
     eval_count = 0
     check_at = RUNTIME.early_reject_after_windows
+    early_reject_milestones = set(getattr(RUNTIME, "early_reject_milestones", tuple()) or tuple())
     active_windows = windows or _scored_windows()
     runtime_context = prepared_context or _prepare_backtest_context()
     eval_start_date: str | None = None
@@ -1116,7 +1130,12 @@ def _run_base_backtests(
             eval_count += 1
             if eval_start_date is None:
                 eval_start_date = window.start_date
-            if eval_count >= check_at and check_at > 0:
+            should_check_early_reject = (
+                check_at > 0
+                and eval_count >= check_at
+                and (not early_reject_milestones or eval_count in early_reject_milestones)
+            )
+            if should_check_early_reject:
                 snapshot_result = backtest_module.backtest_macd_aggressive(
                     strategy_func=strategy_module.strategy,
                     intraday_file=backtest_module.DEFAULT_INTRADAY_FILE,
@@ -1132,6 +1151,7 @@ def _run_base_backtests(
                 if (
                     snapshot["segment_count"] >= float(RUNTIME.early_reject_min_segments)
                     and snapshot["trend_score"] < RUNTIME.early_reject_trend_score_threshold
+                    and snapshot["period_score"] < RUNTIME.early_reject_trend_score_threshold
                     and snapshot["hit_rate"] < RUNTIME.early_reject_hit_rate_threshold
                 ):
                     raise EarlyRejection(
@@ -1517,13 +1537,41 @@ def _base_behavior_profile(base_source: str) -> list[dict[str, Any]]:
     return profile
 
 
+def _behavior_funnel_stage_changed(base_value: int, candidate_value: int) -> bool:
+    delta = abs(candidate_value - base_value)
+    if delta >= BEHAVIOR_FUNNEL_ABS_DELTA:
+        return True
+    baseline = max(abs(base_value), 1)
+    return delta >= BEHAVIOR_FUNNEL_REL_MIN_ABS_DELTA and (delta / baseline) >= BEHAVIOR_FUNNEL_REL_DELTA
+
+
+def _behavior_funnel_changed(
+    base_profile: list[dict[str, Any]],
+    candidate_profile: list[dict[str, Any]],
+) -> bool:
+    base_funnel = _behavior_profile_summary(base_profile).get("funnel", {})
+    candidate_funnel = _behavior_profile_summary(candidate_profile).get("funnel", {})
+    for side in ("long", "short"):
+        base_side = base_funnel.get(side, {}) or {}
+        candidate_side = candidate_funnel.get(side, {}) or {}
+        for stage in BEHAVIOR_FUNNEL_STAGES:
+            if _behavior_funnel_stage_changed(
+                int(base_side.get(stage, 0) or 0),
+                int(candidate_side.get(stage, 0) or 0),
+            ):
+                return True
+    return False
+
+
 def _behavior_profile_changed(
     base_profile: list[dict[str, Any]],
     candidate_profile: list[dict[str, Any]],
 ) -> bool:
     base_fingerprints = [(item.get("window"), item.get("fingerprint")) for item in base_profile]
     candidate_fingerprints = [(item.get("window"), item.get("fingerprint")) for item in candidate_profile]
-    return base_fingerprints != candidate_fingerprints
+    if base_fingerprints != candidate_fingerprints:
+        return True
+    return _behavior_funnel_changed(base_profile, candidate_profile)
 
 
 def _behavior_profile_summary(profile: list[dict[str, Any]]) -> dict[str, Any]:
