@@ -63,6 +63,8 @@ class TrendScoreReport:
     arrival_score: float
     escort_score: float
     turn_score: float
+    turn_protection_score: float
+    turn_protection_event_count: int
     bull_score: float
     bear_score: float
     hit_rate: float
@@ -130,8 +132,13 @@ TREND_REVERSAL_MOVE_FLOOR = 0.025
 TREND_MIN_SEGMENT_BARS = 3
 MIN_VALIDATION_BLOCK_POINTS = 60
 TRAIN_VAL_SCORE_WEIGHT = 0.50
-PROMOTION_CAPTURE_SCORE_WEIGHT = 0.85
+PROMOTION_CAPTURE_SCORE_WEIGHT = 0.75
 PROMOTION_TIMED_RETURN_SCORE_WEIGHT = 0.15
+PROMOTION_TURN_PROTECTION_SCORE_WEIGHT = 0.10
+TURN_PROTECTION_NEUTRAL_DD_PCT = 12.0
+TURN_PROTECTION_DD_STEP_PCT = 6.0
+TURN_PROTECTION_SCORE_MIN = -1.0
+TURN_PROTECTION_SCORE_MAX = 1.0
 
 
 # ==================== 基础统计 ====================
@@ -673,6 +680,29 @@ def _capture_ratio(
     return _clamp(direction * _safe_ratio(strategy_return, abs(market_return), default=0.0), -1.0, 3.0)
 
 
+def _point_window_drawdown_pct(points: list[dict[str, Any]], start_idx: int, end_idx: int) -> float:
+    if not points or end_idx <= start_idx:
+        return 0.0
+    start_idx = max(0, min(start_idx, len(points) - 1))
+    end_idx = max(start_idx, min(end_idx, len(points) - 1))
+    peak = float(points[start_idx].get("strategy_equity", 0.0))
+    max_drawdown = 0.0
+    for idx in range(start_idx, end_idx + 1):
+        equity = float(points[idx].get("strategy_equity", 0.0))
+        peak = max(peak, equity)
+        if peak > 0.0:
+            max_drawdown = max(max_drawdown, (peak - equity) / peak * 100.0)
+    return max_drawdown
+
+
+def _turn_protection_score_from_drawdown(drawdown_pct: float) -> float:
+    return _clamp(
+        (TURN_PROTECTION_NEUTRAL_DD_PCT - drawdown_pct) / TURN_PROTECTION_DD_STEP_PCT,
+        TURN_PROTECTION_SCORE_MIN,
+        TURN_PROTECTION_SCORE_MAX,
+    )
+
+
 def _segment_split_indices(segment: TrendSegment) -> tuple[int, int]:
     span = segment.end_idx - segment.start_idx
     arrival_end = min(segment.end_idx - 1, segment.start_idx + max(1, int(math.ceil(span * 0.25))))
@@ -728,6 +758,8 @@ def _trend_score_report(points: list[dict[str, Any]]) -> TrendScoreReport:
             arrival_score=0.0,
             escort_score=0.0,
             turn_score=0.0,
+            turn_protection_score=0.0,
+            turn_protection_event_count=0,
             bull_score=0.0,
             bear_score=0.0,
             hit_rate=0.0,
@@ -747,6 +779,8 @@ def _trend_score_report(points: list[dict[str, Any]]) -> TrendScoreReport:
             arrival_score=0.0,
             escort_score=0.0,
             turn_score=0.0,
+            turn_protection_score=0.0,
+            turn_protection_event_count=0,
             bull_score=0.0,
             bear_score=0.0,
             hit_rate=0.0,
@@ -760,6 +794,7 @@ def _trend_score_report(points: list[dict[str, Any]]) -> TrendScoreReport:
     arrival_pairs: list[tuple[float, float]] = []
     escort_pairs: list[tuple[float, float]] = []
     turn_pairs: list[tuple[float, float]] = []
+    turn_protection_pairs: list[tuple[float, float]] = []
     bull_pairs: list[tuple[float, float]] = []
     bear_pairs: list[tuple[float, float]] = []
     segment_pairs: list[tuple[float, float]] = []
@@ -812,6 +847,12 @@ def _trend_score_report(points: list[dict[str, Any]]) -> TrendScoreReport:
                 weighted_score += 0.20 * turn_score
                 weighted_sum += 0.20
                 turn_pairs.append((turn_score, segment.weight))
+                protection_start = max(segment.start_idx, escort_end)
+                protection_end = turn_end
+                protection_drawdown = _point_window_drawdown_pct(points, protection_start, protection_end)
+                turn_protection_pairs.append(
+                    (_turn_protection_score_from_drawdown(protection_drawdown), segment.weight)
+                )
 
         segment_score = weighted_score / max(weighted_sum, 1e-9)
         segment_pairs.append((segment_score, segment.weight))
@@ -844,6 +885,8 @@ def _trend_score_report(points: list[dict[str, Any]]) -> TrendScoreReport:
         arrival_score=_weighted_average(arrival_pairs),
         escort_score=_weighted_average(escort_pairs),
         turn_score=_weighted_average(turn_pairs),
+        turn_protection_score=_weighted_average(turn_protection_pairs),
+        turn_protection_event_count=len(turn_protection_pairs),
         bull_score=_weighted_average(bull_pairs),
         bear_score=_weighted_average(bear_pairs),
         hit_rate=_safe_ratio(hit_count, len(segments)),
@@ -1225,6 +1268,12 @@ def summarize_evaluation(
         TRAIN_VAL_SCORE_WEIGHT * train_timed_return_score
         + TRAIN_VAL_SCORE_WEIGHT * validation_timed_return_score
     )
+    train_turn_protection_score = train_continuous_trend_report.turn_protection_score
+    validation_turn_protection_score = validation_trend_report.turn_protection_score
+    turn_protection_score = (
+        TRAIN_VAL_SCORE_WEIGHT * train_turn_protection_score
+        + TRAIN_VAL_SCORE_WEIGHT * validation_turn_protection_score
+    )
     quality_score = train_capture_score
     raw_validation_score = _period_score(validation_trend_report)
     validation_block_report = _validation_block_report(
@@ -1238,6 +1287,7 @@ def summarize_evaluation(
     promotion_score = (
         PROMOTION_CAPTURE_SCORE_WEIGHT * capture_score
         + PROMOTION_TIMED_RETURN_SCORE_WEIGHT * timed_return_score
+        + PROMOTION_TURN_PROTECTION_SCORE_WEIGHT * turn_protection_score
     )
     validation_long_trades, validation_short_trades = _trade_side_counts(validation_source)
     selection_long_trades, selection_short_trades = _trade_side_counts(selection_source)
@@ -1311,11 +1361,16 @@ def summarize_evaluation(
             f"{train_capture_score:.2f} / {validation_capture_score:.2f} / {capture_score:.2f}"
         ),
         (
-            "train/val按日收益年化分 / 收益补充分 / 晋级分: "
+            "train/val按日收益年化分 / 收益补充分 / 掉头保护分 / 晋级分: "
             f"{train_timed_return_score:.2f} / {validation_timed_return_score:.2f} / "
-            f"{timed_return_score:.2f} / {promotion_score:.2f}"
+            f"{timed_return_score:.2f} / {turn_protection_score:.2f} / {promotion_score:.2f}"
         ),
         f"val到来 / 陪跑 / 掉头: {validation_trend_report.arrival_score:.2f} / {validation_trend_report.escort_score:.2f} / {validation_trend_report.turn_score:.2f}",
+        (
+            "train/val掉头保护分(事件数): "
+            f"{train_turn_protection_score:.2f}({train_continuous_trend_report.turn_protection_event_count}) / "
+            f"{validation_turn_protection_score:.2f}({validation_trend_report.turn_protection_event_count})"
+        ),
         f"val多头 / 空头捕获: {validation_trend_report.bull_score:.2f} / {validation_trend_report.bear_score:.2f}",
         f"val趋势段 / 命中率: {validation_trend_report.segment_count} / {validation_trend_report.hit_rate:.0%}",
         f"val连续综合分 / 收益分: {raw_validation_score:.2f} / {validation_trend_report.return_score:.2f}",
@@ -1375,6 +1430,7 @@ def summarize_evaluation(
         (
             f"- 当前基底: 质量分(train连续趋势分)={quality_score:.2f}，晋级分={promotion_score:.2f}，"
             f"抓取主分={capture_score:.2f}，收益补充分={timed_return_score:.2f}，"
+            f"掉头保护分={turn_protection_score:.2f}，"
             f"gate={gate_reason}"
         ),
         f"- 当前主短板: {validation_weakest_axis}",
@@ -1399,7 +1455,8 @@ def summarize_evaluation(
         ),
         (
             f"- 当前评分组成: train/val 连续趋势抓取={train_capture_score:.2f}/{validation_capture_score:.2f}，"
-            f"train/val 按日收益年化分={train_timed_return_score:.2f}/{validation_timed_return_score:.2f}"
+            f"train/val 按日收益年化分={train_timed_return_score:.2f}/{validation_timed_return_score:.2f}，"
+            f"train/val 掉头保护分={train_turn_protection_score:.2f}/{validation_turn_protection_score:.2f}"
         ),
         (
             f"- train+val 状态: 趋势分/收益分={selection_trend_report.trend_score:.2f}/"
@@ -1462,6 +1519,11 @@ def summarize_evaluation(
         "train_timed_return_score": train_timed_return_score,
         "validation_timed_return_score": validation_timed_return_score,
         "timed_return_score": timed_return_score,
+        "train_turn_protection_score": train_turn_protection_score,
+        "validation_turn_protection_score": validation_turn_protection_score,
+        "turn_protection_score": turn_protection_score,
+        "train_turn_protection_event_count": float(train_continuous_trend_report.turn_protection_event_count),
+        "validation_turn_protection_event_count": float(validation_trend_report.turn_protection_event_count),
         "eval_trend_capture_score": development_mean_trend_score,
         "eval_return_score": development_mean_return_score,
         "eval_segment_hit_rate": development_mean_hit_rate,
@@ -1480,9 +1542,11 @@ def summarize_evaluation(
         "selection_arrival_capture_score": selection_trend_report.arrival_score,
         "selection_escort_capture_score": selection_trend_report.escort_score,
         "selection_turn_adaptation_score": selection_trend_report.turn_score,
+        "selection_turn_protection_score": selection_trend_report.turn_protection_score,
         "arrival_capture_score": selection_trend_report.arrival_score,
         "escort_capture_score": selection_trend_report.escort_score,
         "turn_adaptation_score": selection_trend_report.turn_score,
+        "selection_turn_protection_event_count": float(selection_trend_report.turn_protection_event_count),
         "validation_bull_capture_score": validation_trend_report.bull_score,
         "validation_bear_capture_score": validation_trend_report.bear_score,
         "selection_bull_capture_score": selection_trend_report.bull_score,

@@ -361,7 +361,7 @@ def build_strategy_research_prompt(
 - 围绕一个可证伪假设，先产出一个简洁 round brief，交给后续 edit worker 落码。
 - 本轮目标是改变真实交易路径，不是只制造源码 diff；若后续落码后的 smoke 行为完全不变，会被系统按 `behavioral_noop` 拒收。
 - 当前评分口径是 `{score_regime}`；只要 `gate` 通过，且 `promotion_score` 高于当前 {benchmark_label}，候选就有资格刷新当前 active reference。
-- `promotion_score` 现在以 `train/val` 连续趋势抓取分 `5:5` 为主，只混入少量按日收益路径年化分；`test` 只做只读观察，不参与晋升。
+- `promotion_score` 现在以 `train/val` 连续趋势抓取分 `5:5` 为主，混入少量按日收益路径年化分和掉头保护分；`test` 只做只读观察，不参与晋升。
 - `train` 滚动窗口均值/中位数、`val` 分块稳定性和过拟合集中度仍保留为 gate/诊断，但不再是 `promotion_score` 主公式的一部分。
 
 当前 active reference 角色：`{current_base_role}`

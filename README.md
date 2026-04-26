@@ -31,7 +31,7 @@
 - 事实层：`15m`
 - `1h / 4h` 由 `15m` 聚合得到，只做趋势和环境确认
 - 回测执行价优先使用 `1m`
-- 当前评分口径：`trend_capture_v8`
+- 当前评分口径：`trend_capture_v9_turn_protection`
 
 时间窗口：
 
@@ -43,7 +43,7 @@
 
 - 候选必须先过 `gate`
 - 再满足 `promotion_score` 高于当前 active reference
-- `promotion_score` 以 `train/val` 连续趋势抓取分 `5:5` 为主，再混入少量按日收益路径年化分
+- `promotion_score` 以 `train/val` 连续趋势抓取分 `5:5` 为主，再混入少量按日收益路径年化分和趋势掉头保护分
 - `train` 滚动窗口均值/中位数、`val` 分块稳定性和过拟合集中度继续用于 gate 和诊断，不再直接进入晋级主公式
 - `test` 只在新 champion 时运行，只做观察记录，不参与晋升，也不进入 prompt
 - 复杂度信息现在只做只读诊断，只写入 `journal / wiki` 供人工查看，不再进入 `planner / reviewer` prompt，也不再自动触发压缩任务
@@ -108,7 +108,7 @@ flowchart TB
 - `GPT` 更适合固定框架、规则严密、执行链稳定的角色，例如 `reviewer / edit_worker / repair_worker / summary_worker`
 - `DeepSeek` 在发散找方向、提出新假设、快速换研究层级这类 `planner` 任务里，当前表现更好
 
-这个结论只针对当前仓库、当前评分口径 `trend_capture_v8` 和当前这组实验流程成立，不把它外推成所有任务的一般结论。
+这个结论只针对当前仓库、当前评分口径 `trend_capture_v9_turn_protection` 和当前这组实验流程成立，不把它外推成所有任务的一般结论。
 
 ### 为什么保留混合架构
 

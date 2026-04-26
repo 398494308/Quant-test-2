@@ -25,25 +25,26 @@
 | 项目 | 数值 |
 | --- | --- |
 | 当前角色 | champion |
-| 当前 reference stage 起点轮次 | 54 |
+| 当前 reference stage 起点轮次 | 0 |
 | gate | 通过 |
-| score regime（保存态 / 仓库默认） | trend_capture_v8 / trend_capture_v8 |
-| quality_score（train连续趋势分） | 0.5226 |
-| promotion_score（保存态） | 0.5542 |
-| capture_score / timed_return_score | 0.4763 / 0.9955 |
-| train/val连续抓取分 | 0.5226 / 0.4301 |
-| train+val期间收益 | 273.68% |
-| val期间收益 | 165.62% |
-| train+val多/空捕获 | 0.31 / 0.66 |
-| Sharpe(train+val / val) | 0.98 / 1.82 |
+| score regime（保存态 / 仓库默认） | trend_capture_v9_turn_protection / trend_capture_v9_turn_protection |
+| quality_score（train连续趋势分） | 1.0359 |
+| promotion_score（保存态） | 1.0594 |
+| capture_score / timed_return_score / turn_protection_score | 0.9068 / 2.1582 / 0.5551 |
+| train/val连续抓取分 | 1.0359 / 0.7778 |
+| train+val期间收益 | 1272.61% |
+| val期间收益 | 257.55% |
+| train+val多/空捕获 | 0.30 / 0.58 |
+| Sharpe(train+val / val) | 1.16 / 1.68 |
 | hidden test收益 / Sharpe | 暂无 / 暂无 |
-| train+val交易数量 | 301 |
+| train+val交易数量 | 408 |
 
 说明：
 
 - 上表按当前 [state/research_macd_aggressive_v2_best.json](../state/research_macd_aggressive_v2_best.json) 的保存态整理；下一次 champion 刷新后，这些数值会继续前移。
-- 当前保存态已经按 `trend_capture_v8` 重算完成；后续如果 active reference 再变化，状态文件会继续覆盖为最新值。
+- 当前保存态已经按 `trend_capture_v9_turn_protection` 重算完成；后续如果 active reference 再变化，状态文件会继续覆盖为最新值。
 - 当前保存态里的 hidden test 快照为空；只有在新 champion 刷新并触发 test 验收后，这两项才会重新出现。
+- 当前人工方向已经从“继续补多头收益”切到“保护已有收益、减少利润回吐和深回撤”；长期软引导在 [config/research_v2_operator_focus.md](../config/research_v2_operator_focus.md)，当前 champion 人工观察卡已清空，先让新评分自然运行。
 - `state/research_macd_aggressive_v2_best.json` 里如果还带旧字段，例如 `working_base`，那只是历史兼容读取入口；新状态写回只使用单一 active reference 语义。
 - 当前运行状态以 [state/research_macd_aggressive_v2_heartbeat.json](../state/research_macd_aggressive_v2_heartbeat.json) 为准。
 
@@ -72,7 +73,7 @@
 
 `period_score = 0.70 * trend_capture_score + 0.30 * return_score`
 
-研究器主要看三类分：
+研究器主要看四类分：
 
 - `quality_score`
   `train` 连续路径上的趋势抓取分
@@ -80,8 +81,10 @@
   `train/val` 连续趋势抓取分按 `5:5` 平均后的主分
 - `timed_return_score`
   `train/val` 按日收益路径年化分按 `5:5` 平均后的补充分
+- `turn_protection_score`
+  `train/val` 趋势掉头窗口保护分按 `5:5` 平均后的利润回吐控制分
 - `promotion_score`
-  最终晋级分。以 `capture_score` 为主，只混入少量 `timed_return_score`
+  最终晋级分。以 `capture_score` 为主，只混入少量 `timed_return_score` 和 `turn_protection_score`
 
 当前默认公式：
 
@@ -89,7 +92,11 @@
 
 `timed_return_score = 0.50 * train_timed_return_score + 0.50 * val_timed_return_score`
 
-`promotion_score = 0.85 * capture_score + 0.15 * timed_return_score`
+`turn_protection_score = 0.50 * train_turn_protection_score + 0.50 * val_turn_protection_score`
+
+`promotion_score = 0.75 * capture_score + 0.15 * timed_return_score + 0.10 * turn_protection_score`
+
+`turn_protection_score` 复用现有主要趋势段，只在相邻趋势方向反转时切掉头保护窗口，衡量窗口内策略权益从运行高点到后续低点的最大回吐。它不是 `Calmar`，也不是 `Sharpe`，目标是直接约束趋势掉头时的利润保护能力。
 
 晋升规则：
 
