@@ -8,7 +8,7 @@ import requests
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
-OUTPUT_FILE = REPO_ROOT / "data/index/crypto_fear_greed_daily_20230101_20260401.csv"
+OUTPUT_FILE = REPO_ROOT / "data/index/crypto_fear_greed_daily_20230101_20260420.csv"
 API_URL = "https://api.alternative.me/fng/"
 
 
@@ -17,7 +17,7 @@ def _to_timestamp_ms(date_str):
     return int(dt.timestamp() * 1000)
 
 
-def main(start_date="2023-01-01", end_date="2026-04-01"):
+def main(start_date="2023-01-01", end_date="2026-04-20"):
     response = requests.get(API_URL, params={"limit": 0, "format": "json"}, timeout=20)
     response.raise_for_status()
     payload = response.json()

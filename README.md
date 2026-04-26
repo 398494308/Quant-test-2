@@ -37,7 +37,7 @@
 
 - `train`：`2023-07-01` 到 `2024-12-31`
 - `val`：`2025-01-01` 到 `2025-12-31`
-- `test`：`2026-01-01` 到 `2026-03-31`
+- `test`：`2026-01-01` 到 `2026-04-20`
 
 晋升规则：
 
@@ -47,6 +47,7 @@
 - `train` 滚动窗口均值/中位数、`val` 分块稳定性和过拟合集中度继续用于 gate 和诊断，不再直接进入晋级主公式
 - `test` 只在新 champion 时运行，只做观察记录，不参与晋升，也不进入 prompt
 - 复杂度信息现在只做只读诊断，只写入 `journal / wiki` 供人工查看，不再进入 `planner / reviewer` prompt，也不再自动触发压缩任务
+- `config/research_v2_champion_review.md` 是绑定当前 champion hash 的人工观察卡，只给 planner 做软引导；新 champion 后自动忽略，直到人工更新 hash。
 
 ## 研究器工作流
 
@@ -64,7 +65,7 @@
 
 它每一轮的固定顺序是：
 
-1. 先读 `reviewer_summary_card`、`direction_board` 和前台记忆
+1. 先读当前 champion 人工观察卡、`reviewer_summary_card`、`direction_board` 和前台记忆
 2. 先判断上一轮为什么失败，这一轮该继续还是转向
 3. 再输出 `draft brief`
 

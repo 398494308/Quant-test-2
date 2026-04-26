@@ -440,6 +440,26 @@ def _load_operator_focus_text(*, max_chars: int = 1800) -> str:
     return f"{text[:max_chars].rstrip()}\n\n[operator focus 已按长度截断]"
 
 
+def _extract_champion_review_hash(text: str) -> str:
+    match = re.search(r"(?im)^\s*(?:[-*]\s*)?champion_code_hash\s*:\s*`?([0-9a-f]{64})`?\s*$", text)
+    return match.group(1).lower() if match else ""
+
+
+def _load_champion_review_text(*, active_code_hash: str, max_chars: int = 1800) -> str:
+    path = RUNTIME.paths.champion_review_file
+    if not path.exists() or not active_code_hash:
+        return ""
+    text = path.read_text().strip()
+    if not text:
+        return ""
+    expected_hash = _extract_champion_review_hash(text)
+    if expected_hash != active_code_hash.lower():
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars].rstrip()}\n\n[champion review 已按长度截断]"
+
+
 def _ensure_workspace_link(link_path: Path, target_path: Path) -> None:
     link_path.parent.mkdir(parents=True, exist_ok=True)
     if link_path.is_symlink():
@@ -482,6 +502,11 @@ def _prepare_agent_workspace(
         _ensure_workspace_link(
             workspace_root / "config/research_v2_operator_focus.md",
             RUNTIME.paths.operator_focus_file,
+        )
+    if RUNTIME.paths.champion_review_file.exists():
+        _ensure_workspace_link(
+            workspace_root / "config/research_v2_champion_review.md",
+            RUNTIME.paths.champion_review_file,
         )
     if (REPO_ROOT / "data").exists():
         _ensure_workspace_link(workspace_root / "data", REPO_ROOT / "data")
@@ -3035,6 +3060,7 @@ def _build_model_round_brief(
     session_mode = (
         "resume" if _active_research_session_id() else "bootstrap"
     )
+    active_reference_code_hash = source_hash(best_source) if best_source else ""
     prompt = build_strategy_research_prompt(
         evaluation_summary=report.prompt_summary_text,
         journal_summary=journal_summary,
@@ -3046,6 +3072,11 @@ def _build_model_round_brief(
         session_mode=session_mode,
         operator_focus_text=_load_operator_focus_text(),
         operator_focus_path="config/research_v2_operator_focus.md",
+        champion_review_text=_load_champion_review_text(
+            active_code_hash=active_reference_code_hash,
+        ),
+        champion_review_path="config/research_v2_champion_review.md",
+        champion_review_code_hash=active_reference_code_hash,
         reviewer_summary_text=_load_reviewer_summary_text(),
     )
     round_brief = _request_validated_round_brief(

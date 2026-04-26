@@ -55,7 +55,7 @@
 
 - `train`：`2023-07-01` 到 `2024-12-31`
 - `val`：`2025-01-01` 到 `2025-12-31`
-- `test`：`2026-01-01` 到 `2026-03-31`
+- `test`：`2026-01-01` 到 `2026-04-20`
 
 当前默认配置：
 
@@ -149,11 +149,12 @@
 4. reviewer system prompt
 5. edit / repair / summary 各自的 system prompt
 6. planner runtime prompt
-7. `wiki/reviewer_summary_card.md`
-8. `wiki/direction_board.md`
-9. `wiki/latest_history_package.md`
-10. `wiki/failure_wiki.md`
-11. `wiki/duplicate_watchlist.md`
+7. `config/research_v2_champion_review.md`
+8. `wiki/reviewer_summary_card.md`
+9. `wiki/direction_board.md`
+10. `wiki/latest_history_package.md`
+11. `wiki/failure_wiki.md`
+12. `wiki/duplicate_watchlist.md`
 
 其中第 6 层现在只保留精简前台记忆：
 
@@ -196,6 +197,13 @@
 - reviewer 在 `PASS` 前会检查 draft 是否说明预计新增、删除或迁移哪类真实交易；如果完全没有交易路径变化说明，会打回让 planner 补清楚
 - 若 `REVISE`，必须指出当前 draft 仍落在哪个失败近邻，以及 planner 下一版至少要换哪一层
 - 未通过 reviewer 的 brief 不会进入 `edit_worker`
+
+
+人工观察卡：
+
+- `config/research_v2_champion_review.md` 只给 planner 看，是软引导，不是硬 gate。
+- 卡内 `champion_code_hash` 必须命中当前 champion；刷新新 champion 后主进程自动忽略旧卡，避免旧直觉污染新阶段。
+- 适合记录人工看图后的直觉，例如退出过晚、利润回吐、回撤结构等。
 
 当前 session 规则：
 

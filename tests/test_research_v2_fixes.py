@@ -1581,6 +1581,41 @@ class JournalPromptFixesTest(unittest.TestCase):
         self.assertIn("config/research_v2_operator_focus.md", prompt)
         self.assertIn("优先检查多头外层 choke point", prompt)
 
+    def test_build_strategy_runtime_prompt_can_include_champion_review_card(self):
+        prompt = build_strategy_research_prompt(
+            evaluation_summary="诊断",
+            journal_summary="记忆",
+            previous_best_score=1.23,
+            champion_review_text="champion_code_hash: " + "a" * 64 + "\n- 退出过晚，利润回吐偏大",
+            champion_review_path="config/research_v2_champion_review.md",
+            champion_review_code_hash="a" * 64,
+        )
+
+        self.assertIn("当前 champion 人工观察卡", prompt)
+        self.assertIn("config/research_v2_champion_review.md", prompt)
+        self.assertIn("退出过晚", prompt)
+        self.assertIn("新 champion 后自动忽略", prompt)
+
+    def test_load_champion_review_text_requires_matching_hash(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            card = temp_root / "review.md"
+            matching_hash = "b" * 64
+            stale_hash = "c" * 64
+            card.write_text(f"champion_code_hash: {matching_hash}\n\n- 人工观察")
+            temp_paths = replace(research_script.RUNTIME.paths, champion_review_file=card)
+            temp_runtime = replace(research_script.RUNTIME, paths=temp_paths)
+
+            with mock.patch.object(research_script, "RUNTIME", temp_runtime):
+                self.assertIn(
+                    "人工观察",
+                    research_script._load_champion_review_text(active_code_hash=matching_hash),
+                )
+                self.assertEqual(
+                    research_script._load_champion_review_text(active_code_hash=stale_hash),
+                    "",
+                )
+
     def test_build_strategy_runtime_prompt_softens_side_bias_when_hit_rate_is_weak(self):
         prompt = build_strategy_research_prompt(
             evaluation_summary="诊断",

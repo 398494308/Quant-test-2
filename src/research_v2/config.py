@@ -61,6 +61,7 @@ class ResearchPaths:
     strategy_file: Path
     backtest_file: Path
     operator_focus_file: Path
+    champion_review_file: Path
     log_file: Path
     model_call_log_file: Path
     journal_file: Path
@@ -140,6 +141,7 @@ def load_research_runtime_config(repo_root: Path) -> ResearchRuntimeConfig:
         strategy_file=repo_root / "src/strategy_macd_aggressive.py",
         backtest_file=repo_root / "src/backtest_macd_aggressive.py",
         operator_focus_file=repo_root / "config/research_v2_operator_focus.md",
+        champion_review_file=repo_root / "config/research_v2_champion_review.md",
         log_file=repo_root / "logs/macd_aggressive_research_v2.log",
         model_call_log_file=repo_root / "logs/macd_aggressive_research_v2_model_calls.jsonl",
         journal_file=repo_root / "state/research_macd_aggressive_v2_journal.jsonl",
@@ -160,7 +162,7 @@ def load_research_runtime_config(repo_root: Path) -> ResearchRuntimeConfig:
         validation_start_date=os.getenv("MACD_V2_VALIDATION_START_DATE", "2025-01-01"),
         validation_end_date=os.getenv("MACD_V2_VALIDATION_END_DATE", "2025-12-31"),
         test_start_date=os.getenv("MACD_V2_TEST_START_DATE", "2026-01-01"),
-        test_end_date=os.getenv("MACD_V2_TEST_END_DATE", "2026-03-31"),
+        test_end_date=os.getenv("MACD_V2_TEST_END_DATE", "2026-04-20"),
         eval_window_days=_env_int("MACD_V2_EVAL_WINDOW_DAYS", 28),
         eval_step_days=_env_int("MACD_V2_EVAL_STEP_DAYS", 21),
     )

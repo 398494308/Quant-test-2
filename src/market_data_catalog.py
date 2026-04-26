@@ -14,8 +14,8 @@ INDEX_DIR = REPO_ROOT / "data" / "index"
 DEFAULT_VENUE = "okx"
 DEFAULT_INSTRUMENT_ID = "BTC-USDT-SWAP"
 DATA_START_STR = "2023-01-01"
-DATA_END_STR = "2026-04-01"
-SENTIMENT_FILE_NAME = "crypto_fear_greed_daily_20230101_20260401.csv"
+DATA_END_STR = "2026-04-21"
+SENTIMENT_FILE_NAME = "crypto_fear_greed_daily_20230101_20260420.csv"
 FILE_TAG = f"{DATA_START_STR.replace('-', '')}_{DATA_END_STR.replace('-', '')}"
 
 PRICE_HEADER = [

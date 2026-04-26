@@ -115,6 +115,7 @@ def build_strategy_agents_instructions() -> str:
 - `src/strategy_macd_aggressive.py`：唯一允许修改的策略文件，包含入场参数 `PARAMS` 与退出参数 `EXIT_PARAMS`。
 - `src/backtest_macd_aggressive.py`：回测、成交路径与指标口径定义，只读参考；不要把它当成退出参数主源。
 - `config/research_v2_operator_focus.md`：人工方向卡，只是软引导，不是系统硬限制。
+- `config/research_v2_champion_review.md`：当前 champion 人工观察卡；只在卡内 hash 命中当前 champion 时有效，新 champion 后自动忽略。
 - `wiki/reviewer_summary_card.md`：上一轮 reviewer 审稿卡；若它明确打回某条近邻方向，planner 下一版必须先吸收这张卡里的打回理由。
 - `wiki/direction_board.md`：当前 active reference 作用域下的方向账本；先看主方向是否已经高热，再决定本轮是否要换失败层或关键规则链。
 - `wiki/duplicate_watchlist.md`：最近高频重复源码黑名单摘要；先扫它，避免把同一份补丁再交一次。
@@ -300,6 +301,9 @@ def build_strategy_research_prompt(
     session_mode: str = "resume",
     operator_focus_text: str = "",
     operator_focus_path: str = "config/research_v2_operator_focus.md",
+    champion_review_text: str = "",
+    champion_review_path: str = "config/research_v2_champion_review.md",
+    champion_review_code_hash: str = "",
     reviewer_summary_text: str = "",
     reviewer_summary_path: str = "wiki/reviewer_summary_card.md",
     direction_board_path: str = "wiki/direction_board.md",
@@ -318,6 +322,19 @@ def build_strategy_research_prompt(
             "人工方向卡（软引导，不是硬限制，优先服从当前有效诊断）:\n"
             f"- 文件: `{operator_focus_path}`\n"
             f"{operator_focus_text.strip()}\n"
+        )
+    champion_review_block = ""
+    if champion_review_text.strip():
+        champion_review_hash_line = (
+            f"- 绑定 champion hash: `{champion_review_code_hash}`\n"
+            if champion_review_code_hash
+            else ""
+        )
+        champion_review_block = (
+            "当前 champion 人工观察卡（软引导；只对绑定 hash 生效，新 champion 后自动忽略）:\n"
+            f"- 文件: `{champion_review_path}`\n"
+            f"{champion_review_hash_line}"
+            f"{champion_review_text.strip()}\n"
         )
     bootstrap_excerpt = _bootstrap_journal_excerpt(journal_summary, max_lines=10, max_chars=900)
     bootstrap_block = ""
@@ -352,9 +369,11 @@ def build_strategy_research_prompt(
 {side_bias_block}
 {champion_focus_block}
 {operator_focus_block}
+{champion_review_block}
 {reviewer_summary_block}
 本轮本地只读记忆文件：
 - reviewer 总结卡：`{reviewer_summary_path}`
+- 当前 champion 人工观察卡：`{champion_review_path}`
 - 当前方向账本：`{direction_board_path}`
 - 重复黑名单：`{duplicate_watchlist_path}`
 - 失败 wiki：`{failure_wiki_path}`
@@ -366,7 +385,7 @@ def build_strategy_research_prompt(
 - 读取文件是为了定位失败层，不是把全部 wiki 内容搬进脑内后再开始思考。
 
 本轮阅读顺序（必须执行）：
-1. 先看“刷新条件与本轮目标”和上一轮 `reviewer` 总结卡；先判断上一轮为什么失败，再决定本轮继续还是转向。
+1. 先看“刷新条件与本轮目标”、当前 champion 人工观察卡和上一轮 `reviewer` 总结卡；先判断上一轮为什么失败，再决定本轮继续还是转向。
 2. 再看 `{direction_board_path}`、`{duplicate_watchlist_path}`、`{failure_wiki_path}`；先确认你的 `primary_direction` 是否已经高热。`{history_package_path}` 只在需要下钻时再看前部摘要。
 3. 再看“当前诊断”，定位当前 gate 主失败项、弱侧和 val 漏斗堵点，并判断失败更像发生在 `outer_context / path / final_veto / routing / followthrough / exit / unknown` 的哪一层。
 4. 再决定本轮继续还是转向；如果某个主方向已经高热，本轮至少要换失败层、关键规则链或真实触达路径，不要只换标签。
