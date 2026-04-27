@@ -107,7 +107,9 @@ class GateConfig:
 class ScoringConfig:
     promotion_capture_weight: float = 0.80
     promotion_timed_return_weight: float = 0.20
-    promotion_drawdown_penalty_weight: float = 0.40
+    promotion_drawdown_base_weight: float = 0.20
+    promotion_drawdown_knee: float = 1.25
+    promotion_drawdown_excess_weight: float = 1.00
     risk_window_days: int = 28
     risk_window_step_days: int = 7
     drawdown_risk_tail_quantile: float = 0.75
@@ -201,7 +203,9 @@ def load_research_runtime_config(repo_root: Path) -> ResearchRuntimeConfig:
     scoring = ScoringConfig(
         promotion_capture_weight=_env_float("MACD_V2_PROMOTION_CAPTURE_WEIGHT", 0.80),
         promotion_timed_return_weight=_env_float("MACD_V2_PROMOTION_TIMED_RETURN_WEIGHT", 0.20),
-        promotion_drawdown_penalty_weight=_env_float("MACD_V2_PROMOTION_DRAWDOWN_PENALTY_WEIGHT", 0.40),
+        promotion_drawdown_base_weight=_env_float("MACD_V2_PROMOTION_DRAWDOWN_BASE_WEIGHT", 0.20),
+        promotion_drawdown_knee=_env_float("MACD_V2_PROMOTION_DRAWDOWN_KNEE", 1.25),
+        promotion_drawdown_excess_weight=_env_float("MACD_V2_PROMOTION_DRAWDOWN_EXCESS_WEIGHT", 1.00),
         risk_window_days=max(1, risk_window_days),
         risk_window_step_days=max(1, risk_window_step_days),
         drawdown_risk_tail_quantile=_env_float("MACD_V2_DRAWDOWN_RISK_TAIL_QUANTILE", 0.75),

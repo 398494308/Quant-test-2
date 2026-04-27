@@ -503,11 +503,16 @@ class EvaluationFixesTest(unittest.TestCase):
             report.metrics["promotion_gap"],
             report.metrics["train_capture_score"] - report.metrics["validation_capture_score"],
         )
+        expected_drawdown_penalty = (
+            0.20 * report.metrics["drawdown_risk_score"]
+            + 1.00 * max(report.metrics["drawdown_risk_score"] - 1.25, 0.0)
+        )
         expected_promotion_score = (
             0.80 * report.metrics["capture_score"]
             + 0.20 * report.metrics["timed_return_score"]
-            - 0.40 * report.metrics["drawdown_risk_score"]
+            - expected_drawdown_penalty
         )
+        self.assertAlmostEqual(report.metrics["drawdown_penalty_score"], expected_drawdown_penalty)
         self.assertAlmostEqual(report.metrics["promotion_score"], expected_promotion_score)
         self.assertGreaterEqual(report.metrics["drawdown_risk_score"], 0.0)
         self.assertEqual(report.metrics["validation_block_count_used"], 0.0)
@@ -678,7 +683,17 @@ class EvaluationFixesTest(unittest.TestCase):
         self.assertGreater(report.metrics["overfit_risk_score"], 0.0)
         self.assertGreater(report.metrics["overfit_top1_positive_share"], 0.60)
         self.assertEqual(report.metrics["overfit_hard_fail"], 1.0)
-        self.assertAlmostEqual(report.metrics["promotion_score"], 0.80 * report.metrics["capture_score"])
+        expected_drawdown_penalty = (
+            0.20 * report.metrics["drawdown_risk_score"]
+            + 1.00 * max(report.metrics["drawdown_risk_score"] - 1.25, 0.0)
+        )
+        self.assertAlmostEqual(report.metrics["drawdown_penalty_score"], expected_drawdown_penalty)
+        self.assertAlmostEqual(
+            report.metrics["promotion_score"],
+            0.80 * report.metrics["capture_score"]
+            + 0.20 * report.metrics["timed_return_score"]
+            - expected_drawdown_penalty,
+        )
 
     def test_summarize_evaluation_drawdown_risk_penalizes_persistent_underwater_path(self):
         scoring = ScoringConfig(
@@ -756,6 +771,10 @@ class EvaluationFixesTest(unittest.TestCase):
         self.assertGreater(
             persistent_underwater_report.metrics["drawdown_risk_score"],
             fast_recovery_report.metrics["drawdown_risk_score"],
+        )
+        self.assertGreater(
+            persistent_underwater_report.metrics["drawdown_penalty_score"],
+            fast_recovery_report.metrics["drawdown_penalty_score"],
         )
         self.assertGreater(
             persistent_underwater_report.metrics["validation_window_ulcer_p75_pct"],
@@ -1624,7 +1643,8 @@ class JournalPromptFixesTest(unittest.TestCase):
         self.assertIn("promotion_score` 高于当前 champion", prompt)
         self.assertIn("连续趋势抓取分 `5:5`", prompt)
         self.assertIn("按日收益路径年化分", prompt)
-        self.assertIn("固定窗口回撤风险惩罚", prompt)
+        self.assertIn("分段回撤惩罚", prompt)
+        self.assertIn("固定窗口风险做基础扣分", prompt)
         self.assertNotIn("promotion_delta >", prompt)
         self.assertIn("当前回合任务", prompt)
         self.assertIn("本轮阅读顺序（必须执行）", prompt)

@@ -25,26 +25,26 @@
 | 项目 | 数值 |
 | --- | --- |
 | 当前角色 | champion |
-| 当前 reference stage 起点轮次 | 0 |
+| 当前 reference stage 起点轮次 | 1 |
 | gate | 通过 |
-| score regime（保存态 / 仓库默认） | trend_capture_v9_turn_protection / trend_capture_v10_windowed_drawdown_penalty |
-| quality_score（train连续趋势分） | 1.0373 |
-| promotion_score（保存态） | 1.0617 |
-| capture_score / timed_return_score / turn_protection_score | 0.9089 / 2.1600 / 0.5598 |
-| drawdown_risk_score（保存态） | 暂无，待本轮新口径重算 |
-| train/val连续抓取分 | 1.0373 / 0.7806 |
-| train+val期间收益 | 1134.06% |
-| val期间收益 | 257.67% |
-| train+val多/空捕获 | 0.38 / 0.62 |
-| Sharpe(train+val / val) | 1.33 / 1.71 |
-| hidden test收益 / Sharpe | -37.73% / -1.26 |
-| train+val交易数量 | 411 |
+| score regime（保存态 / 仓库默认） | trend_capture_v11_piecewise_drawdown_penalty / trend_capture_v11_piecewise_drawdown_penalty |
+| quality_score（train连续趋势分） | 1.0474 |
+| promotion_score（保存态） | 0.3845 |
+| capture_score / timed_return_score / turn_protection_score | 0.9145 / 2.1362 / 0.5685 |
+| drawdown_risk_score / drawdown_penalty_score（保存态） | 1.6870 / 0.7744 |
+| train/val连续抓取分 | 1.0474 / 0.7817 |
+| train+val期间收益 | 1069.50% |
+| val期间收益 | 256.71% |
+| train+val多/空捕获 | 0.41 / 0.65 |
+| Sharpe(train+val / val) | 1.38 / 1.71 |
+| hidden test收益 / Sharpe | -37.65% / -1.26 |
+| train+val交易数量 | 415 |
 
 说明：
 
-- 上表按当前 [state/research_macd_aggressive_v2_best.json](../state/research_macd_aggressive_v2_best.json) 的保存态整理；这份保存态仍是旧口径冠军快照。
-- 仓库默认评分已经切到 `trend_capture_v10_windowed_drawdown_penalty`，并已于 `2026-04-27` 重启研究器；当前运行进程会在首轮完整评估完成后，把保存态重写为新口径字段。
-- 因为新口径重算还在进行，`drawdown_risk_score` 相关字段暂时还没写回保存态；在下一次保存态刷新后，这几项会自动补齐。
+- 上表按当前 [state/research_macd_aggressive_v2_best.json](../state/research_macd_aggressive_v2_best.json) 的保存态整理，已是 `2026-04-27` 这次重启后的最新快照。
+- 仓库默认评分已经切到 `trend_capture_v11_piecewise_drawdown_penalty`；研究器启动时先从已保存 champion 重算新口径，再继续后续轮次。本次重启后的首轮已正常完成，并刷新出新的 champion。
+- 新口径下 `drawdown_risk_score` 仍是固定窗口 `Ulcer` 风格风险分；`promotion_score` 不再直接使用单一线性扣分，而是额外记录 `drawdown_penalty_score` 作为分段惩罚项。
 - 当前人工方向已经从“继续补多头收益”切到“保护已有收益、减少利润回吐和深回撤”；长期软引导在 [config/research_v2_operator_focus.md](../config/research_v2_operator_focus.md)，当前 champion 人工观察卡已清空，先让新评分自然运行。
 - `state/research_macd_aggressive_v2_best.json` 里如果还带旧字段，例如 `working_base`，那只是历史兼容读取入口；新状态写回只使用单一 active reference 语义。
 - 若只切换 `score_regime` 后重启，研究器现在会优先从 `backups/strategy_macd_aggressive_v2_best.py` 载入已保存 champion，并按新评分口径重算；不会再误用工作区里的当前候选文件做启动基线。
@@ -84,11 +84,13 @@
 - `timed_return_score`
   `train/val` 按日收益路径年化分按 `5:5` 平均后的补充分
 - `drawdown_risk_score`
-  `train/val` 固定窗口回撤风险分按 `5:5` 平均后的惩罚项；窗口内用 `Ulcer` 风格回撤深度与持续时间衡量利润回吐压力
+  `train/val` 固定窗口回撤风险分按 `5:5` 平均后的原始风险指标；窗口内用 `Ulcer` 风格回撤深度与持续时间衡量利润回吐压力
+- `drawdown_penalty_score`
+  由 `drawdown_risk_score` 映射出的分段惩罚项；先做基础扣分，超过拐点后按更陡斜率追加扣分
 - `turn_protection_score`
   `train/val` 趋势掉头窗口保护分按 `5:5` 平均后的诊断分，不再直接进入晋级主公式
 - `promotion_score`
-  最终晋级分。以 `capture_score` 为主，加少量 `timed_return_score`，再减去 `drawdown_risk_score`
+  最终晋级分。以 `capture_score` 为主，加少量 `timed_return_score`，再减去 `drawdown_penalty_score`
 
 当前默认公式：
 
@@ -100,9 +102,13 @@
 
 `turn_protection_score = 0.50 * train_turn_protection_score + 0.50 * val_turn_protection_score`
 
-`promotion_score = 0.80 * capture_score + 0.20 * timed_return_score - 0.40 * drawdown_risk_score`
+`drawdown_penalty_score = 0.20 * drawdown_risk_score + 1.00 * max(drawdown_risk_score - 1.25, 0.0)`
+
+`promotion_score = 0.80 * capture_score + 0.20 * timed_return_score - drawdown_penalty_score`
 
 `drawdown_risk_score` 直接复用现有 `train/val` 日收益路径，不新增回测。两侧都按固定 `28` 天窗口滚动切分，再对每个窗口计算 `Ulcer` 风格回撤值，最后用 `median + P75` 的加权聚合成风险分。这样 `train` 的滚动窗口路径和 `val` 的整年路径会落到同一时间单位上比较，也不会被一次单日极端点完全主导。
+
+`drawdown_penalty_score` 在此基础上再做一层分段映射：低于 `1.25` 时只按基础权重扣分，超过 `1.25` 后每增加一单位风险都按更陡斜率继续扣分。目的不是把所有回撤都打死，而是显著压低“收益爆炸但回撤也很深”的候选，让研究器更偏向收益仍强、但利润回吐更可控的方案。
 
 `turn_protection_score` 仍复用现有主要趋势段，只在相邻趋势方向反转时切掉头保护窗口，衡量窗口内策略权益从运行高点到后续低点的最大回吐。它现在保留给诊断和人工复盘，不再直接进入晋级主公式。
 

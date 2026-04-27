@@ -833,6 +833,14 @@ def _drawdown_risk_side_report(
     )
 
 
+def _promotion_drawdown_penalty(drawdown_risk_score: float, scoring: ScoringConfig) -> float:
+    risk_score = max(0.0, float(drawdown_risk_score))
+    knee = max(0.0, float(scoring.promotion_drawdown_knee))
+    base_penalty = max(0.0, float(scoring.promotion_drawdown_base_weight)) * risk_score
+    excess_penalty = max(0.0, float(scoring.promotion_drawdown_excess_weight)) * max(risk_score - knee, 0.0)
+    return base_penalty + excess_penalty
+
+
 def _trend_score_report(points: list[dict[str, Any]]) -> TrendScoreReport:
     if len(points) < 6:
         return TrendScoreReport(
@@ -1361,6 +1369,7 @@ def summarize_evaluation(
         TRAIN_VAL_SCORE_WEIGHT * train_drawdown_risk_score
         + TRAIN_VAL_SCORE_WEIGHT * validation_drawdown_risk_score
     )
+    drawdown_penalty_score = _promotion_drawdown_penalty(drawdown_risk_score, scoring)
     train_turn_protection_score = train_continuous_trend_report.turn_protection_score
     validation_turn_protection_score = validation_trend_report.turn_protection_score
     turn_protection_score = (
@@ -1380,7 +1389,7 @@ def summarize_evaluation(
     promotion_score = (
         scoring.promotion_capture_weight * capture_score
         + scoring.promotion_timed_return_weight * timed_return_score
-        - scoring.promotion_drawdown_penalty_weight * drawdown_risk_score
+        - drawdown_penalty_score
     )
     validation_long_trades, validation_short_trades = _trade_side_counts(validation_source)
     selection_long_trades, selection_short_trades = _trade_side_counts(selection_source)
@@ -1454,14 +1463,20 @@ def summarize_evaluation(
             f"{train_capture_score:.2f} / {validation_capture_score:.2f} / {capture_score:.2f}"
         ),
         (
-            "train/val按日收益年化分 / 收益补充分 / 固定窗口回撤风险分 / 晋级分: "
+            "train/val按日收益年化分 / 收益补充分 / 固定窗口回撤风险分 / 回撤罚分 / 晋级分: "
             f"{train_timed_return_score:.2f} / {validation_timed_return_score:.2f} / "
-            f"{timed_return_score:.2f} / {drawdown_risk_score:.2f} / {promotion_score:.2f}"
+            f"{timed_return_score:.2f} / {drawdown_risk_score:.2f} / {drawdown_penalty_score:.2f} / {promotion_score:.2f}"
         ),
         (
             "train/val回撤风险分(窗口数): "
             f"{train_drawdown_risk_score:.2f}({train_drawdown_risk_report.window_count}) / "
             f"{validation_drawdown_risk_score:.2f}({validation_drawdown_risk_report.window_count})"
+        ),
+        (
+            "回撤罚分公式(base / knee / excess): "
+            f"{scoring.promotion_drawdown_base_weight:.2f} / "
+            f"{scoring.promotion_drawdown_knee:.2f} / "
+            f"{scoring.promotion_drawdown_excess_weight:.2f}"
         ),
         (
             "train/val窗口 Ulcer 中位 / P75: "
@@ -1533,7 +1548,7 @@ def summarize_evaluation(
         (
             f"- 当前基底: 质量分(train连续趋势分)={quality_score:.2f}，晋级分={promotion_score:.2f}，"
             f"抓取主分={capture_score:.2f}，收益补充分={timed_return_score:.2f}，"
-            f"回撤风险惩罚分={drawdown_risk_score:.2f}，"
+            f"回撤风险分={drawdown_risk_score:.2f}，回撤罚分={drawdown_penalty_score:.2f}，"
             f"gate={gate_reason}"
         ),
         f"- 当前主短板: {validation_weakest_axis}",
@@ -1559,7 +1574,8 @@ def summarize_evaluation(
         (
             f"- 当前评分组成: train/val 连续趋势抓取={train_capture_score:.2f}/{validation_capture_score:.2f}，"
             f"train/val 按日收益年化分={train_timed_return_score:.2f}/{validation_timed_return_score:.2f}，"
-            f"train/val 固定窗口回撤风险分={train_drawdown_risk_score:.2f}/{validation_drawdown_risk_score:.2f}"
+            f"train/val 固定窗口回撤风险分={train_drawdown_risk_score:.2f}/{validation_drawdown_risk_score:.2f}，"
+            f"回撤罚分={drawdown_penalty_score:.2f}"
         ),
         (
             f"- train+val 状态: 趋势分/收益分={selection_trend_report.trend_score:.2f}/"
@@ -1627,6 +1643,7 @@ def summarize_evaluation(
         "train_drawdown_risk_score": train_drawdown_risk_score,
         "validation_drawdown_risk_score": validation_drawdown_risk_score,
         "drawdown_risk_score": drawdown_risk_score,
+        "drawdown_penalty_score": drawdown_penalty_score,
         "train_window_ulcer_median_pct": train_drawdown_risk_report.median_ulcer_pct,
         "train_window_ulcer_p75_pct": train_drawdown_risk_report.tail_ulcer_pct,
         "train_window_ulcer_blended_pct": train_drawdown_risk_report.blended_ulcer_pct,

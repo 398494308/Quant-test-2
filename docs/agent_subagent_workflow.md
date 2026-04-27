@@ -55,12 +55,12 @@ flowchart TB
 - 标的：`BTC-USDT-SWAP`，策略按 `20x` 合约研究。
 - 事实层：`15m`；`1h / 4h` 由 `15m` 聚合，只做确认层。
 - 执行层：优先使用 `1m` 回测成交。
-- 评分口径：`trend_capture_v10_windowed_drawdown_penalty`。
+- 评分口径：`trend_capture_v11_piecewise_drawdown_penalty`。
 - `train`：`2023-07-01` 到 `2024-12-31`。
 - `val`：`2025-01-01` 到 `2025-12-31`。
 - `test`：`2026-01-01` 到 `2026-04-20`。
 - 晋升条件：先过 `gate`，再要求 `promotion_score` 高于当前 active reference。
-- `promotion_score` 以 `train/val` 连续趋势抓取分 `5:5` 为主，加少量按日收益路径年化分，再减去固定窗口回撤风险惩罚。
+- `promotion_score` 以 `train/val` 连续趋势抓取分 `5:5` 为主，加少量按日收益路径年化分，再减去分段回撤惩罚：回撤先按固定窗口风险做基础扣分，超过拐点后按更陡斜率追加扣分。
 
 ## 每一轮怎么跑
 
