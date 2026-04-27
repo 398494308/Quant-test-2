@@ -47,6 +47,7 @@
 - 因为新口径重算还在进行，`drawdown_risk_score` 相关字段暂时还没写回保存态；在下一次保存态刷新后，这几项会自动补齐。
 - 当前人工方向已经从“继续补多头收益”切到“保护已有收益、减少利润回吐和深回撤”；长期软引导在 [config/research_v2_operator_focus.md](../config/research_v2_operator_focus.md)，当前 champion 人工观察卡已清空，先让新评分自然运行。
 - `state/research_macd_aggressive_v2_best.json` 里如果还带旧字段，例如 `working_base`，那只是历史兼容读取入口；新状态写回只使用单一 active reference 语义。
+- 若只切换 `score_regime` 后重启，研究器现在会优先从 `backups/strategy_macd_aggressive_v2_best.py` 载入已保存 champion，并按新评分口径重算；不会再误用工作区里的当前候选文件做启动基线。
 - 当前运行状态以 [state/research_macd_aggressive_v2_heartbeat.json](../state/research_macd_aggressive_v2_heartbeat.json) 为准。
 
 ## 数据与窗口

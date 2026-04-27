@@ -4889,6 +4889,72 @@ class ReferenceStateFixesTest(unittest.TestCase):
             payload = json.loads(temp_paths.best_state_file.read_text())
             self.assertFalse(payload.get("suppress_initialize_saved_reference_discord_once", False))
 
+    def test_initialize_best_state_rebuilds_saved_reference_when_score_regime_changes(self):
+        valid_source = (REPO_ROOT / "backups/strategy_macd_aggressive_v2_best.py").read_text()
+        candidate_source = (REPO_ROOT / "src/strategy_macd_aggressive.py").read_text()
+        report = EvaluationReport(
+            metrics={"promotion_score": 0.52, "quality_score": 0.33},
+            gate_passed=True,
+            gate_reason="通过",
+            summary_text="summary",
+            prompt_summary_text="prompt summary",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            temp_paths = replace(
+                research_script.RUNTIME.paths,
+                repo_root=temp_root,
+                strategy_file=temp_root / "src/strategy_macd_aggressive.py",
+                log_file=temp_root / "logs/research.log",
+                journal_file=temp_root / "state/journal.jsonl",
+                memory_dir=temp_root / "state/memory",
+                heartbeat_file=temp_root / "state/heartbeat.json",
+                best_state_file=temp_root / "state/best.json",
+                best_strategy_file=temp_root / "backups/best.py",
+                champion_strategy_file=temp_root / "backups/champion.py",
+                stop_file=temp_root / "state/stop",
+                strategy_backup_file=temp_root / "backups/candidate.py",
+            )
+            temp_runtime = replace(research_script.RUNTIME, paths=temp_paths)
+            temp_paths.strategy_file.parent.mkdir(parents=True, exist_ok=True)
+            temp_paths.best_strategy_file.parent.mkdir(parents=True, exist_ok=True)
+            temp_paths.best_state_file.parent.mkdir(parents=True, exist_ok=True)
+            temp_paths.strategy_file.write_text(candidate_source)
+            temp_paths.best_strategy_file.write_text(valid_source)
+            temp_paths.best_state_file.write_text(
+                json.dumps(
+                    {
+                        "score_regime": "trend_capture_v9_turn_protection",
+                        "reference_role": "champion",
+                        "reference": {"code_hash": research_script.source_hash(valid_source)},
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+            with mock.patch.object(research_script, "RUNTIME", temp_runtime), mock.patch.object(
+                research_script, "best_source", ""
+            ), mock.patch.object(research_script, "best_report", None), mock.patch.object(
+                research_script, "champion_report", None
+            ), mock.patch.object(
+                research_script, "reload_strategy_module"
+            ), mock.patch.object(
+                research_script, "evaluate_current_strategy", return_value=report
+            ), mock.patch.object(
+                research_script, "maybe_send_discord"
+            ), mock.patch.object(
+                research_script, "build_discord_summary_message", return_value="msg"
+            ), mock.patch.object(
+                research_script, "write_heartbeat"
+            ), mock.patch.object(
+                research_script, "log_info"
+            ) as log_info:
+                research_script.initialize_best_state()
+                self.assertEqual(research_script.best_source, valid_source)
+                self.assertEqual(temp_paths.strategy_file.read_text(), valid_source)
+                self.assertTrue(any("已按新评分口径重算已保存主参考" in str(call) for call in log_info.call_args_list))
+
 
 class ResearchRuntimeOptimizationsTest(unittest.TestCase):
     def test_prepare_backtest_context_reuses_cached_context_for_same_signature(self):

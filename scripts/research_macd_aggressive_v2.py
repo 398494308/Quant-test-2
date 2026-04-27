@@ -3586,7 +3586,6 @@ def initialize_best_state(force_rebuild: bool = False) -> None:
     saved_reference = saved_state.get("reference") or saved_state.get("working_base")
     can_load_saved_reference = (
         not force_rebuild
-        and saved_regime == SCORE_REGIME
         and isinstance(saved_reference, dict)
         and RUNTIME.paths.best_strategy_file.exists()
     )
@@ -3625,8 +3624,11 @@ def initialize_best_state(force_rebuild: bool = False) -> None:
                 stage_iteration=reference_stage_iteration,
                 suppress_initialize_saved_reference_discord_once=False,
             )
+            load_message = "已加载已保存主参考"
+            if saved_regime and saved_regime != SCORE_REGIME:
+                load_message = f"已按新评分口径重算已保存主参考({saved_regime} -> {SCORE_REGIME})"
             log_info(
-                "已加载已保存主参考: "
+                f"{load_message}: "
                 f"role={_reference_role()}, "
                 f"quality={best_report.metrics['quality_score']:.2f}, "
                 f"promotion={best_report.metrics['promotion_score']:.2f}, "
