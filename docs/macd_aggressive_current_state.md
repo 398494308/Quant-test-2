@@ -29,17 +29,17 @@
 | 当前 reference stage 起点轮次 | 3 |
 | gate | 通过 |
 | score regime（保存态 / 仓库默认） | trend_capture_v12_robustness_plateau_penalty / trend_capture_v12_robustness_plateau_penalty |
-| quality_score（train连续趋势分） | 0.8144 |
-| promotion_score（保存态） | 0.7798 |
-| capture_score / timed_return_score / turn_protection_score | 0.6697 / 2.3792 / 0.6744 |
-| drawdown_risk_score / drawdown_penalty_score（保存态） | 1.1593 / 0.2319 |
-| train/val连续抓取分 | 0.8144 / 0.5250 |
-| train+val期间收益 | 1263.42% |
-| val期间收益 | 285.39% |
-| train+val多/空捕获 | 0.32 / 0.28 |
-| Sharpe(train+val / val) | 1.42 / 1.89 |
-| test收益 / Sharpe | -2.64% / 0.33 |
-| train+val交易数量 | 256 |
+| quality_score（train连续趋势分） | 0.8123 |
+| promotion_score（保存态） | 0.5514 |
+| capture_score / timed_return_score / turn_protection_score | 0.6688 / 2.3504 / 0.6737 |
+| drawdown_risk_score / drawdown_penalty_score / robustness_penalty_score | 1.1686 / 0.2337 / 0.2200 |
+| train/val连续抓取分 | 0.8123 / 0.5252 |
+| train+val期间收益 | 1280.27% |
+| val期间收益 | 280.96% |
+| train+val多/空捕获 | 0.31 / 0.28 |
+| Sharpe(train+val / val) | 1.42 / 1.87 |
+| test收益 / Sharpe | - / - |
+| train+val交易数量 | 255 |
 
 当前轮次留档除了 `journal` 与 `memory/raw` 外，还额外维护一条最小可复现链路：
 
@@ -49,13 +49,13 @@
 
 说明：
 
-- 上表按当前 [state/research_macd_aggressive_v2_best.json](../state/research_macd_aggressive_v2_best.json) 的最近保存态整理；若你刚切到 `v12` 但还没重启研究器，`promotion_score` 与 `robustness_penalty_score` 会在下一次启动时按新口径重算。
+- 上表按当前 [state/research_macd_aggressive_v2_best.json](../state/research_macd_aggressive_v2_best.json) 的最近保存态整理；当前 best 写回时间是 `2026-04-29T02:13:26Z`，对应本次重启时把旧 `v11` champion 按 `v12` 口径重算后的结果。
 - 仓库默认评分已经切到 `trend_capture_v12_robustness_plateau_penalty`；研究器启动时会先从已保存 champion 重算新口径，再继续后续轮次。
 - 新口径下 `drawdown_risk_score` 仍是固定窗口 `Ulcer` 风格风险分；`promotion_score` 在分段回撤惩罚之外，又额外接了一层轻量鲁棒性软惩罚。
 - 当前人工方向已经从“继续补多头收益”切到“保护已有收益、减少利润回吐和深回撤”；长期软引导在 [config/research_v2_operator_focus.md](../config/research_v2_operator_focus.md)，当前 champion 人工观察卡在 [config/research_v2_champion_review.md](../config/research_v2_champion_review.md) 中已写回，并且只对当前 hash 生效。
 - `state/research_macd_aggressive_v2_best.json` 里如果还带旧字段，例如 `working_base`，那只是历史兼容读取入口；新状态写回只使用单一 active reference 语义。
 - 若只切换 `score_regime` 后重启，研究器现在会优先从 `backups/strategy_macd_aggressive_v2_best.py` 载入已保存 champion，并按新评分口径重算；不会再误用工作区里的当前候选文件做启动基线。
-- 当前运行状态以 [state/research_macd_aggressive_v2_heartbeat.json](../state/research_macd_aggressive_v2_heartbeat.json) 为准；本文更新时 heartbeat 显示 `iteration 5`、phase=`model_regenerate_edit_worker`，仍在围绕这版 champion 做后续重生尝试。
+- 当前运行状态以 [state/research_macd_aggressive_v2_heartbeat.json](../state/research_macd_aggressive_v2_heartbeat.json) 为准；本文更新时 heartbeat 显示 `iteration 1`、phase=`model_planner`，研究器已按新口径启动并进入下一轮。
 - `real-money-test/` 这条执行壳子现在默认转为 `OKX Demo Trading`：策略必须先冻结为固定副本，`demo` 只认 `OKX_DEMO_*` 凭证，旧 `dry-run` 代码保留但不再默认使用，播报也切到 `demo` 卡口径。
 - 如果你想把 `demo` 账户里的更大余额压到固定测试规模，当前壳子支持通过 `OKX_DEMO_AVAILABLE_CAPITAL` 给 `freqtrade` 注入单 bot 资金上限；例如 `1000` 表示只按 `1000 USDT` 规模运行。
 
