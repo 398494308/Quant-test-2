@@ -55,10 +55,8 @@ DEFAULT_MODE_MAX_NEW_TOP_LEVEL_CONSTANTS = 2
 DEFAULT_MODE_MAX_NEW_TOP_LEVEL_HELPERS = 2
 FIXED_EXIT_PARAM_VALUES: dict[str, object] = {
     "leverage": 20,
-    "position_fraction": 0.17,
     "position_size_min": 5000,
     "position_size_max": 30000,
-    "max_concurrent_positions": 4,
     "pyramid_enabled": 1,
     "pyramid_max_times": 2,
     "pyramid_size_ratio": 0.28,
@@ -84,8 +82,6 @@ PARAM_BOUNDS: dict[str, tuple[float, float]] = {
     # 成交量
     "breakout_volume_ratio_min": (0.5, 5.0),
     "breakdown_volume_ratio_min": (0.5, 5.0),
-    "breakout_trade_count_ratio_min": (0.5, 4.0),
-    "breakdown_trade_count_ratio_min": (0.5, 4.0),
     "breakout_taker_buy_ratio_min": (0.45, 0.95),
     "breakdown_taker_sell_ratio_min": (0.45, 0.95),
     "breakout_flow_imbalance_min": (-0.30, 0.90),

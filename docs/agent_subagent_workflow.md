@@ -62,6 +62,7 @@ flowchart TB
 - `test`：`2026-01-01` 到 `2026-04-20`。
 - 晋升条件：先过 `gate`，再要求 `promotion_score` 高于当前 active reference。
 - `promotion_score` 以连续趋势抓取主分与按日收益年化补分 `8:2` 为主体，再减去分段回撤惩罚和轻量鲁棒性软惩罚。
+- 交易数、`filled_entries` 和漏斗通过量只保留观察价值，不再作为下一轮方向的默认软触发。
 - 鲁棒性软惩罚只看 `train/val` 落差、`val` 分块稳定性，以及退出参数邻域在 `val` 3 段上的平台形态。
 - `test` 只做只读观察；reject / duplicate_skipped 的异步 `test` 只进留档，不进 prompt、不进晋升。
 
@@ -104,7 +105,7 @@ flowchart TB
 - 只接收 reviewer 放行后的 brief。
 - 只改 `src/strategy_macd_aggressive.py`。
 - `PARAMS` 和开放的 `EXIT_PARAMS` 都可调整。
-- 杠杆、仓位比例、单仓上下限、并发数和加仓规模保持固定。
+- 杠杆、单仓上下限和加仓规模保持固定；`position_fraction` 与 `max_concurrent_positions` 现在允许研究器探索。
 
 ### repair_worker
 
@@ -126,6 +127,12 @@ flowchart TB
 ### 临时给 planner 一句直觉
 
 编辑：`config/research_v2_champion_review.md`
+
+如果你在 Codex 里操作，也可以走本地 skill：
+
+- [research-champion-review-card](../.codex/skills/research-champion-review-card/SKILL.md)
+- 这个 skill 只封装流程：读取当前 champion hash、确认当前轮是否已经启动、回写 hash 绑定的人工卡。
+- 卡里的摘要内容、软约束，以及要不要回看多少轮历史，留给人工讨论，不在 skill 里预设。
 
 要求：
 

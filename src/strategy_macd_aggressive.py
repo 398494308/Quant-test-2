@@ -12,6 +12,7 @@ SIDEWAYS_MAX_HOURLY_ADX = 18.0
 SIDEWAYS_MAX_FOURH_ADX = 16.0
 LONG_PARTIAL_TAKE_PROFIT_PRICE_PCT = 0.05
 LONG_PARTIAL_TAKE_PROFIT_CLOSE_FRACTION = 0.50
+LONG_TRAILING_MULTIPLIER = 1.5
 SIDEWAYS_RELEASE_RELAX = {
     "spread_floor_mult": 0.88,
     "slope_floor_mult": 0.90,
@@ -43,14 +44,13 @@ PARAMS = {
     "breakout_buffer_pct": 0.00015,
     "breakout_close_pos_min": 0.60,
     "breakout_flow_imbalance_min": 0.02,
-    "breakout_flow_score_min": 4,
-    "breakout_flow_score_strong_min": 6,
+    "breakout_flow_score_min": 3,
+    "breakout_flow_score_strong_min": 5,
     "breakout_hist_min": 4.0,
     "breakout_lookback": 28,
     "breakout_rsi_max": 69.0,
     "breakout_rsi_min": 50.0,
     "breakout_taker_buy_ratio_min": 0.50,
-    "breakout_trade_count_ratio_min": 1.05,
     "breakout_volume_ratio_min": 1.12,
     "flow_lookback": 9,
     "fourh_adx_min": 12.5,
@@ -64,7 +64,6 @@ PARAMS = {
     "hourly_ema_slow": 50,
     "hourly_flow_confirmation_min": 0.0,
     "hourly_taker_buy_ratio_min": 0.495,
-    "hourly_trade_count_ratio_min": 0.75,
     "intraday_adx_min": 12.5,
     "intraday_ema_fast": 9,
     "intraday_ema_slow": 28,
@@ -88,7 +87,7 @@ EXIT_PARAMS = {
     "breakout_tp1_close_fraction": 0.16,
     "breakout_tp1_pnl_pct": 80.0,
     "breakout_trailing_activation_pct": 95.0,
-    "breakout_trailing_giveback_pct": 19.4,
+    "breakout_trailing_giveback_pct": 29.1,
     "dynamic_hold_adx_strong_threshold": 26.0,
     "dynamic_hold_adx_threshold": 16.0,
     "dynamic_hold_extension_bars": 96,
@@ -100,7 +99,7 @@ EXIT_PARAMS = {
     "long_breakout_stop_atr_mult": 5.90,
     "long_pullback_break_even_buffer_pct": 0.28,
     "long_pullback_stop_atr_mult": 5.90,
-    "long_pullback_trailing_giveback_pct": 11.760,
+    "long_pullback_trailing_giveback_pct": 17.64,
     "max_concurrent_positions": 4,
     "max_hold_bars": 288,
     "okx_maker_fee_rate": 0.0002,
@@ -545,11 +544,9 @@ def _flow_alignment_score(market_state, hourly, fourh, params, side):
             return default
         return value
 
-    intraday_trade_ratio = _safe_float(market_state, "trade_count_ratio", 1.0)
     intraday_buy_ratio = _safe_float(market_state, "taker_buy_ratio", 0.5)
     intraday_sell_ratio = _safe_float(market_state, "taker_sell_ratio", 0.5)
     intraday_imbalance = _safe_float(market_state, "flow_imbalance", 0.0)
-    hourly_trade_ratio = _safe_float(hourly, "trade_count_ratio", 1.0)
     hourly_buy_ratio = _safe_float(hourly, "taker_buy_ratio", 0.5)
     hourly_sell_ratio = _safe_float(hourly, "taker_sell_ratio", 0.5)
     hourly_imbalance = _safe_float(hourly, "flow_imbalance", 0.0)
@@ -559,13 +556,9 @@ def _flow_alignment_score(market_state, hourly, fourh, params, side):
 
     if side == "long":
         score = 0
-        if intraday_trade_ratio >= params["breakout_trade_count_ratio_min"]:
-            score += 1
         if intraday_buy_ratio >= params["breakout_taker_buy_ratio_min"]:
             score += 1
         if intraday_imbalance >= params["breakout_flow_imbalance_min"]:
-            score += 1
-        if hourly_trade_ratio >= params["hourly_trade_count_ratio_min"]:
             score += 1
         if hourly_buy_ratio >= params["hourly_taker_buy_ratio_min"]:
             score += 1
@@ -578,13 +571,9 @@ def _flow_alignment_score(market_state, hourly, fourh, params, side):
         return score
 
     score = 0
-    if intraday_trade_ratio >= 1.18:
-        score += 1
     if intraday_sell_ratio >= 0.54:
         score += 1
     if intraday_imbalance <= -0.08:
-        score += 1
-    if hourly_trade_ratio >= 0.88:
         score += 1
     if hourly_sell_ratio >= 0.505:
         score += 1
@@ -637,7 +626,7 @@ def _flow_confirmation_ok(market_state, hourly, fourh, params, side, strong=Fals
 
     if strong:
         return (
-            score >= 6
+            score >= 5
             and intraday_imbalance <= -0.06
             and hourly_imbalance <= 0.0
             and fourh_imbalance <= 0.0
@@ -645,7 +634,7 @@ def _flow_confirmation_ok(market_state, hourly, fourh, params, side, strong=Fals
             and fourh_sell_ratio >= 0.50
         )
     return (
-        score >= 5
+        score >= 4
         and intraday_imbalance <= 0.02
         and hourly_sell_ratio >= 0.50
         and fourh_sell_ratio >= 0.495
@@ -663,11 +652,9 @@ def _flow_signal_metrics(market_state, hourly, fourh, params, side):
             return default
         return value
 
-    intraday_trade_ratio = _safe_float(market_state, "trade_count_ratio", 1.0)
     intraday_buy_ratio = _safe_float(market_state, "taker_buy_ratio", 0.5)
     intraday_sell_ratio = _safe_float(market_state, "taker_sell_ratio", 0.5)
     intraday_imbalance = _safe_float(market_state, "flow_imbalance", 0.0)
-    hourly_trade_ratio = _safe_float(hourly, "trade_count_ratio", 1.0)
     hourly_buy_ratio = _safe_float(hourly, "taker_buy_ratio", 0.5)
     hourly_sell_ratio = _safe_float(hourly, "taker_sell_ratio", 0.5)
     hourly_imbalance = _safe_float(hourly, "flow_imbalance", 0.0)
@@ -676,10 +663,6 @@ def _flow_signal_metrics(market_state, hourly, fourh, params, side):
     fourh_imbalance = _safe_float(fourh, "flow_imbalance", 0.0)
 
     if side == "long":
-        participation_bias = (
-            max(intraday_trade_ratio - params["breakout_trade_count_ratio_min"], 0.0)
-            + max(hourly_trade_ratio - params["hourly_trade_count_ratio_min"], 0.0) * 0.5
-        )
         directional_bias = (
             max(intraday_buy_ratio - params["breakout_taker_buy_ratio_min"], 0.0)
             + max(hourly_buy_ratio - params["hourly_taker_buy_ratio_min"], 0.0)
@@ -689,10 +672,6 @@ def _flow_signal_metrics(market_state, hourly, fourh, params, side):
             + max(fourh_imbalance - params["fourh_flow_confirmation_min"], 0.0)
         )
     else:
-        participation_bias = (
-            max(intraday_trade_ratio - 1.18, 0.0)
-            + max(hourly_trade_ratio - 0.88, 0.0) * 0.5
-        )
         directional_bias = (
             max(intraday_sell_ratio - 0.54, 0.0)
             + max(hourly_sell_ratio - 0.505, 0.0)
@@ -703,7 +682,7 @@ def _flow_signal_metrics(market_state, hourly, fourh, params, side):
         )
     return {
         "score": _flow_alignment_score(market_state, hourly, fourh, params, side),
-        "participation_bias": participation_bias,
+        "participation_bias": 0.0,
         "directional_bias": directional_bias,
     }
 
@@ -935,8 +914,6 @@ def _sideways_release_flags(market_state, positions=None):
             return default
         return value
 
-    intraday_trade_ratio = _safe_float(market_state, "trade_count_ratio", 1.0)
-    hourly_trade_ratio = _safe_float(hourly, "trade_count_ratio", 1.0)
     intraday_flow_imbalance = _safe_float(market_state, "flow_imbalance", 0.0)
     hourly_flow_imbalance = _safe_float(hourly, "flow_imbalance", 0.0)
     long_flow_metrics = _flow_signal_metrics(market_state, hourly, fourh, PARAMS, "long")
@@ -950,8 +927,6 @@ def _sideways_release_flags(market_state, positions=None):
         and fourh["trend_spread_pct"] >= max(SIDEWAYS_MIN_FOURH_SPREAD_PCT * 0.46, atr_ratio * 0.38)
         and hourly["ema_slow_slope_pct"] >= -atr_ratio * 0.016
         and fourh["ema_slow_slope_pct"] >= -atr_ratio * 0.008
-        and intraday_trade_ratio >= max(PARAMS["breakout_trade_count_ratio_min"] - 0.20, 0.84)
-        and hourly_trade_ratio >= max(PARAMS["hourly_trade_count_ratio_min"] - 0.08, 0.68)
         and intraday_flow_imbalance >= -0.07
         and hourly_flow_imbalance >= -0.04
         and long_flow_metrics["directional_bias"] >= 0.0
@@ -2035,6 +2010,14 @@ def _long_entry_result(
     if not (long_signal_path_ok(long_breakout_path, long_pullback_path, long_reaccel_path) or long_ownership_relay):
         return None
     _record_funnel_pass("long", "path_pass")
+    current = context["current"]
+    real_body = max(abs(current["close"] - current["open"]), 1e-9)
+    upper_wick = max(current["high"] - max(current["open"], current["close"]), 0.0)
+    if (
+        upper_wick / real_body > 2.0
+        and current["volume"] > context["recent_volume_avg"] * 1.5
+    ):
+        return None
     try:
         strong_trend_bypass = _long_strong_trend_bypass(context, market_state, params)
     except (KeyError, TypeError):

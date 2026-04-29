@@ -855,7 +855,7 @@ class EvaluationFixesTest(unittest.TestCase):
         self.assertEqual(payload["plateau_probe_enabled"], 1.0)
         self.assertEqual(payload["plateau_current_is_best"], 0.0)
 
-    def test_summarize_evaluation_emits_funnel_and_low_activity_soft_signal(self):
+    def test_summarize_evaluation_emits_funnel_without_low_activity_soft_signal(self):
         eval_window = type("Window", (), {"group": "eval", "label": "train1", "start_date": "2026-01-01", "end_date": "2026-01-10"})()
         validation_window = type("Window", (), {"group": "validation", "label": "val1", "start_date": "2026-01-11", "end_date": "2026-01-18"})()
 
@@ -953,12 +953,12 @@ class EvaluationFixesTest(unittest.TestCase):
 
         self.assertIn("train滚动漏斗(long)", report.summary_text)
         self.assertIn("val连续漏斗(short)", report.summary_text)
-        self.assertIn("低活动度信号（软触发，不是硬 gate）", report.summary_text)
-        self.assertIn("下一轮优先做放宽/删减/合并类假设", report.summary_text)
-        self.assertIn("低活动度软触发=", report.prompt_summary_text)
+        self.assertNotIn("低活动度信号（软触发，不是硬 gate）", report.summary_text)
+        self.assertNotIn("下一轮优先做放宽/删减/合并类假设", report.summary_text)
+        self.assertNotIn("低活动度软触发=", report.prompt_summary_text)
         self.assertEqual(report.metrics["validation_long_path_pass"], 4.0)
         self.assertEqual(report.metrics["selection_long_final_veto_pass"], 0.0)
-        self.assertGreater(report.metrics["low_activity_signal_count"], 0.0)
+        self.assertEqual(report.metrics["low_activity_signal_count"], 0.0)
 
     def test_partial_eval_gate_snapshot_normalizes_missing_strategy_return(self):
         gate_snapshot = partial_eval_gate_snapshot(
@@ -1169,8 +1169,6 @@ PARAMS = {
     'breakdown_rsi_max': 60,
     'breakout_volume_ratio_min': 1.0,
     'breakdown_volume_ratio_min': 1.0,
-    'breakout_trade_count_ratio_min': 1.0,
-    'breakdown_trade_count_ratio_min': 1.0,
     'breakout_taker_buy_ratio_min': 0.55,
     'breakdown_taker_sell_ratio_min': 0.55,
     'breakout_flow_imbalance_min': 0.05,

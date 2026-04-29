@@ -204,7 +204,7 @@ def build_strategy_agents_instructions() -> str:
 
 项目目标：
 - 用 OKX 数据研究一套 BTC-USDT-SWAP 20x 高弹性趋势捕获策略；允许较大波动，但不能靠日期特判、路径硬编码或伪优化刷分。
-- `15m` 是唯一事实源，`1h + 4h` 只是由 `15m` 聚合的确认层；突破/跌破除了成交量，也要结合方向流量代理与成交活跃度。
+- `15m` 是唯一事实源，`1h + 4h` 只是由 `15m` 聚合的确认层；突破/跌破除了成交量，也要结合方向流量代理。
 - 目标不是做平滑净值，而是更早跟上 BTC 的主要上涨/下跌，并在趋势失效时更快退出或反手。
 
 工作区文件职责：
@@ -228,14 +228,14 @@ def build_strategy_agents_instructions() -> str:
 - 允许只改 `strategy()` / `PARAMS` / `EXIT_PARAMS` / 少量新 helper 做结构化重排，但前提是你能明确说明这会改变最终信号集合、退出集合或真实交易路径；否则不要为了造 diff 去动它们。
 - 明确要求：不要“堆屎”。新增前先检查现有规则块、阈值和最终放行链是否已经表达了同一因果。
 - 若现有脚本里已经有近似逻辑，不要换个名字再写一份重复条件；优先删旧、并旧、改旧，禁止把同一因果链在不同 helper / path / veto 里重复实现。
-- 明确允许结构性删减轮：`remove_dead_gate`、`merge_veto`、`widen_outer_context` 都是合法 change_tags；这类轮次的目标是减少死分支、提高 reachability。
+- 明确允许结构性删减轮：`remove_dead_gate`、`merge_veto`、`widen_outer_context` 都是合法 change_tags；这类轮次的目标是减少死分支、打通真实交易路径。
 
 源码护栏：
 - `src/strategy_macd_aggressive.py` 整份文件都允许修改，但改动必须克制、结构必须准确、添加必须有必要。
 - 你不需要再自报 `edited_regions`；系统会根据真实 diff 自动归类 region / family，并据此做重复探索与结构诊断。
 - 必须保留这些符号，不允许删除、改名或合并回旧结构：{_required_symbol_text()}。
 - 不允许新增 `PARAMS` 键；允许少量结构化 helper / 常量，但不要借这个口子堆新因子。
-- `EXIT_PARAMS` 中允许调止损、止盈、保本、追踪、持仓时间、趋势失效退出、`pyramid_trigger_pnl`、`pyramid_adx_min`；禁止修改 `leverage`、`position_fraction`、`position_size_min`、`position_size_max`、`max_concurrent_positions`、`pyramid_enabled`、`pyramid_max_times`、`pyramid_size_ratio`。
+- `EXIT_PARAMS` 中允许调止损、止盈、保本、追踪、持仓时间、趋势失效退出、`position_fraction`、`max_concurrent_positions`、`pyramid_trigger_pnl`、`pyramid_adx_min`；禁止修改 `leverage`、`position_size_min`、`position_size_max`、`pyramid_enabled`、`pyramid_max_times`、`pyramid_size_ratio`。
 - 不要引入网络、文件写入、随机数、外部依赖，也不要做无关重构、批量改名或大面积格式化。
 - 不要 hard code 针对单个日期、窗口、行情段或历史结果表的特判。
 """
@@ -403,26 +403,6 @@ def build_strategy_research_prompt(
     side_bias_block = f"\n{side_bias_guidance}\n" if side_bias_guidance else ""
     champion_focus_hint = _champion_focus_hint(reference_metrics)
     champion_focus_block = f"{champion_focus_hint}\n" if champion_focus_hint else ""
-    operator_focus_block = ""
-    if operator_focus_text.strip():
-        operator_focus_block = (
-            "人工方向卡（软引导，不是硬限制，优先服从当前有效诊断）:\n"
-            f"- 文件: `{operator_focus_path}`\n"
-            f"{operator_focus_text.strip()}\n"
-        )
-    champion_review_block = ""
-    if champion_review_text.strip():
-        champion_review_hash_line = (
-            f"- 绑定 champion hash: `{champion_review_code_hash}`\n"
-            if champion_review_code_hash
-            else ""
-        )
-        champion_review_block = (
-            "当前 champion 人工观察卡（软引导；只对绑定 hash 生效，新 champion 后自动忽略）:\n"
-            f"- 文件: `{champion_review_path}`\n"
-            f"{champion_review_hash_line}"
-            f"{champion_review_text.strip()}\n"
-        )
     bootstrap_excerpt = _bootstrap_journal_excerpt(journal_summary, max_lines=10, max_chars=900)
     bootstrap_block = ""
     if session_mode == "bootstrap":

@@ -452,62 +452,17 @@ def _low_activity_signal_payload(
     validation_closed_trades: int,
     selection_closed_trades: int,
 ) -> dict[str, Any]:
-    issues: list[str] = []
-    tags: set[str] = set()
-    for side, label in (("long", "多头"), ("short", "空头")):
-        validation_side = validation_counts[side]
-        selection_side = selection_counts[side]
-        if validation_side["filled_entries"] == 0 and selection_side["filled_entries"] == 0:
-            issues.append(
-                f"{label}连续 0 单: train+val/val 出单 {selection_side['filled_entries']} / {validation_side['filled_entries']}"
-            )
-            tags.update({"remove_dead_gate", "widen_outer_context"})
-        if (
-            selection_side["sideways_pass"] >= 24
-            and selection_side["outer_context_pass"] <= max(1, int(selection_side["sideways_pass"] * 0.03))
-        ):
-            issues.append(
-                f"{label} outer_context 基本放不行: 横盘后 {selection_side['sideways_pass']}，outer_context 仅 {selection_side['outer_context_pass']}"
-            )
-            tags.add("widen_outer_context")
-        if (
-            selection_side["path_pass"] >= 8
-            and selection_side["final_veto_pass"] <= max(1, int(selection_side["path_pass"] * 0.10))
-        ):
-            issues.append(
-                f"{label} path 能过但 final_veto 基本全死: path {selection_side['path_pass']}，final_veto 仅 {selection_side['final_veto_pass']}"
-            )
-            tags.update({"merge_veto", "remove_dead_gate"})
-    if selection_closed_trades < 12 or validation_closed_trades < 4:
-        issues.append(
-            f"总交易偏少: train+val/val 平仓 {selection_closed_trades} / {validation_closed_trades}"
-        )
-        tags.update({"remove_dead_gate", "widen_outer_context"})
-    if not issues:
-        return {
-            "count": 0,
-            "lines": [],
-            "prompt_line": "",
-            "tags": (),
-        }
-    ordered_tags = tuple(sorted(tags))
+    _ = (
+        validation_counts,
+        selection_counts,
+        validation_closed_trades,
+        selection_closed_trades,
+    )
     return {
-        "count": len(issues),
-        "lines": [
-            "低活动度信号（软触发，不是硬 gate）:",
-            *[f"- {issue}" for issue in issues],
-            (
-                "- 下一轮优先做放宽/删减/合并类假设，允许 `change_tags` 使用 "
-                + " / ".join(f"`{tag}`" for tag in ordered_tags)
-                + "；先减少死分支、提高 reachability，不要继续加条件。"
-            ),
-        ],
-        "prompt_line": (
-            "低活动度软触发="
-            + "；".join(issues[:3])
-            + "；下一轮优先放宽/删减/合并，先提高 reachability。"
-        ),
-        "tags": ordered_tags,
+        "count": 0,
+        "lines": [],
+        "prompt_line": "",
+        "tags": (),
     }
 
 

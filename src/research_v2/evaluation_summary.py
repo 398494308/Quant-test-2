@@ -198,7 +198,7 @@ def summarize_evaluation_impl(
     weakest_signals = mod._aggregate_signal_stats(results, "eval")
     weakest_signal_paths = mod._aggregate_signal_stats(results, "eval", stats_key="signal_path_stats")
     summary_lines = [
-        "研究评估摘要（15m 为唯一事实源，1h/4h 只是由 15m 聚合的确认层；成交量诊断同时看总量、OKX K 线方向流量代理和成交活跃度）",
+        "研究评估摘要（15m 为唯一事实源，1h/4h 只是由 15m 聚合的确认层；成交量只读展示总量，方向确认主要看 OKX K 线方向流量代理）",
         (
             "train滚动分(均值/中位/std/盈利窗比): "
             f"{development_mean_score:.2f} / {development_median_score:.2f} / "

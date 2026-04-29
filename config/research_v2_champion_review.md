@@ -1,5 +1,6 @@
-champion_code_hash: e66af6f30f0b4e0610d3ccb68a67545c8ebea67cf6853b3dc2ba961a4d9eefa9
+champion_code_hash: 694f6d1e607cc4ce087ab26cb3177fe581d698b8a0dee600f9f35694e9ae8f40
 
-- 这版更像卡在“误判真实生效层”，不是单纯还缺一个新参数。优先改当前源码里确实会消费的 `long_outer_context_ok`、`long_final_veto_clear` 或已接线的 `EXIT_PARAMS`，不要再做只改参数表层却不接执行链的 no-op。
-- 若继续看退出方向，先确认当前基底里哪条规则真的会迁移平仓集合；不要假设 `strategy()` 里存在独立的 long 持仓主退出链。
-- 一旦再次出现 `exploration_blocked` 或 `behavioral_noop`，下一轮必须换 choke point，不要只换标签和措辞。
+- 这版晋级更像是通过削弱部分 train 多头暴露，换来了更小的 train/val 落差和更低的鲁棒性罚分；`val` 主路径与验收侧并没有出现明显的新改善。后续不用把“继续压 gap”当成默认目标，避免为了分数更好看而只做 train 侧收缩。
+- 这版真实改动落在 `_long_entry_result` 的假突破过滤，属于多头保护近邻里的一次局部 veto 加法。如果继续探索保护类方向，继续围绕 `_long_entry_result`、`_trend_followthrough_long`、`EXIT_PARAMS` 做近邻横移应当降权；除非真实诊断明确支持，否则不建议重复追加同义 veto、同义过滤或同义 trailing 微调。
+- 当规划目标与控制回撤或保护利润相关时，建议优先探索能改变开仓暴露集合或仓位规模集合的机制，例如风险封禁、波动率缩放、再入场冷却和持仓规模调节；若某项机制并不改变在哪些 bar 上开仓，也不改变每笔仓位大小，只调整已有仓位的止盈、离场或延迟退出，则仍默认视作退出层的近邻，不作为优先方向。
+- 下一轮如果继续做多头防守或利润保护，建议优先选择会改变 `val` 真实交易路径的 choke point；至少应让 `val` 漏斗、`final_veto_pass` 或连续路径指标里有一个维度出现可观察变化，而不只是继续收缩 train 侧多头暴露。
