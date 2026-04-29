@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from research_v2.evaluation import EvaluationReport
+from research_v2.evaluation import EvaluationReport, normalize_test_metrics_payload
 from research_v2.strategy_code import source_hash, write_strategy_source
 
 
@@ -33,7 +33,25 @@ def load_saved_reference_state(best_state_file: Path) -> dict[str, Any]:
         payload = json.loads(best_state_file.read_text())
     except (json.JSONDecodeError, OSError):
         return {}
-    return payload if isinstance(payload, dict) else {}
+    if not isinstance(payload, dict):
+        return {}
+    test_metrics = normalize_test_metrics_payload(
+        payload.get("test_metrics") or payload.get("shadow_test_metrics")
+    )
+    if test_metrics:
+        payload["test_metrics"] = test_metrics
+    payload.pop("shadow_test_metrics", None)
+    for key in ("reference", "champion", "working_base"):
+        nested = payload.get(key)
+        if not isinstance(nested, dict):
+            continue
+        nested_test_metrics = normalize_test_metrics_payload(
+            nested.get("test_metrics") or nested.get("shadow_test_metrics")
+        )
+        if nested_test_metrics:
+            nested["test_metrics"] = nested_test_metrics
+        nested.pop("shadow_test_metrics", None)
+    return payload
 
 
 def recover_reference_stage_state(
@@ -84,14 +102,14 @@ def saved_report_payload(
     source: str,
     report: EvaluationReport,
     *,
-    shadow_test_metrics: dict[str, float] | None = None,
+    test_metrics: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     return {
         "code_hash": source_hash(source),
         "metrics": report.metrics,
         "gate_passed": report.gate_passed,
         "gate_reason": report.gate_reason,
-        "shadow_test_metrics": shadow_test_metrics or {},
+        "test_metrics": normalize_test_metrics_payload(test_metrics),
     }
 
 
@@ -119,7 +137,7 @@ def reference_manifest_payload(
     report: EvaluationReport,
     *,
     score_regime: str,
-    shadow_test_metrics: dict[str, float] | None = None,
+    test_metrics: dict[str, float] | None = None,
     stage_started_at: str = "",
     stage_iteration: int = 0,
     suppress_initialize_saved_reference_discord_once: bool = False,
@@ -127,7 +145,7 @@ def reference_manifest_payload(
     reference_payload = saved_report_payload(
         source,
         report,
-        shadow_test_metrics=shadow_test_metrics,
+        test_metrics=test_metrics,
     )
     reference_role = "champion" if report.gate_passed else "baseline"
     champion_payload = reference_payload if report.gate_passed else None
@@ -144,7 +162,7 @@ def reference_manifest_payload(
         "metrics": reference_payload["metrics"],
         "gate_passed": reference_payload["gate_passed"],
         "gate_reason": reference_payload["gate_reason"],
-        "shadow_test_metrics": reference_payload["shadow_test_metrics"],
+        "test_metrics": reference_payload["test_metrics"],
         "suppress_initialize_saved_reference_discord_once": suppress_initialize_saved_reference_discord_once,
     }
 
@@ -157,7 +175,7 @@ def persist_best_state(
     report: EvaluationReport,
     *,
     score_regime: str,
-    shadow_test_metrics: dict[str, float] | None = None,
+    test_metrics: dict[str, float] | None = None,
     stage_started_at: str = "",
     stage_iteration: int = 0,
     suppress_initialize_saved_reference_discord_once: bool = False,
@@ -168,7 +186,7 @@ def persist_best_state(
         source,
         report,
         score_regime=score_regime,
-        shadow_test_metrics=shadow_test_metrics,
+        test_metrics=test_metrics,
         stage_started_at=stage_started_at,
         stage_iteration=stage_iteration,
         suppress_initialize_saved_reference_discord_once=suppress_initialize_saved_reference_discord_once,

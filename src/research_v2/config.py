@@ -111,6 +111,32 @@ class ScoringConfig:
     promotion_drawdown_base_weight: float = 0.20
     promotion_drawdown_knee: float = 1.25
     promotion_drawdown_excess_weight: float = 1.00
+    robustness_penalty_cap: float = 0.25
+    robustness_gap_warn_threshold: float = 0.20
+    robustness_gap_fail_threshold: float = 0.27
+    robustness_gap_warn_penalty: float = 0.05
+    robustness_gap_fail_penalty: float = 0.10
+    robustness_block_std_warn_threshold: float = 0.22
+    robustness_block_std_fail_threshold: float = 0.30
+    robustness_block_std_warn_penalty: float = 0.03
+    robustness_block_std_fail_penalty: float = 0.06
+    robustness_block_floor_warn_threshold: float = 0.15
+    robustness_block_floor_fail_threshold: float = 0.00
+    robustness_block_floor_warn_penalty: float = 0.03
+    robustness_block_floor_fail_penalty: float = 0.06
+    robustness_block_tail_warn_threshold: float = 0.12
+    robustness_block_tail_fail_threshold: float = 0.22
+    robustness_block_tail_warn_penalty: float = 0.03
+    robustness_block_tail_fail_penalty: float = 0.06
+    robustness_block_fail_penalty_per_block: float = 0.03
+    robustness_block_fail_penalty_cap_count: int = 2
+    robustness_plateau_center_gap_warn_threshold: float = 0.05
+    robustness_plateau_center_gap_fail_threshold: float = 0.10
+    robustness_plateau_center_gap_warn_penalty: float = 0.03
+    robustness_plateau_center_gap_fail_penalty: float = 0.06
+    robustness_plateau_score_span_threshold: float = 0.12
+    robustness_plateau_drawdown_span_threshold: float = 8.0
+    robustness_plateau_extra_penalty: float = 0.03
     risk_window_days: int = 28
     risk_window_step_days: int = 7
     drawdown_risk_tail_quantile: float = 0.75
@@ -140,6 +166,7 @@ class ResearchRuntimeConfig:
     exit_range_scan_workers: int
     exit_range_scan_windows: int
     exit_range_scan_max_fee_mult: float
+    plateau_probe_enabled: bool
     max_repair_attempts: int
     max_no_edit_repair_attempts: int
     max_exploration_regen_attempts: int
@@ -236,6 +263,7 @@ def load_research_runtime_config(repo_root: Path) -> ResearchRuntimeConfig:
         exit_range_scan_workers=_env_int("MACD_V2_EXIT_RANGE_SCAN_WORKERS", 2),
         exit_range_scan_windows=_env_int("MACD_V2_EXIT_RANGE_SCAN_WINDOWS", 3),
         exit_range_scan_max_fee_mult=_env_float("MACD_V2_EXIT_RANGE_SCAN_MAX_FEE_MULT", 1.5),
+        plateau_probe_enabled=_env_int("MACD_V2_PLATEAU_PROBE_ENABLED", 1) > 0,
         max_repair_attempts=_env_int("MACD_V2_MAX_REPAIR_ATTEMPTS", 2),
         max_no_edit_repair_attempts=_env_int("MACD_V2_MAX_NO_EDIT_REPAIR_ATTEMPTS", 1),
         max_exploration_regen_attempts=_env_int("MACD_V2_MAX_EXPLORATION_REGEN_ATTEMPTS", 2),

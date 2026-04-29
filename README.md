@@ -31,7 +31,7 @@
 - 事实层：`15m`
 - `1h / 4h` 由 `15m` 聚合得到，只做趋势和环境确认
 - 回测执行价优先使用 `1m`
-- 当前评分口径：`trend_capture_v11_piecewise_drawdown_penalty`
+- 当前评分口径：`trend_capture_v12_robustness_plateau_penalty`
 
 时间窗口：
 
@@ -43,9 +43,10 @@
 
 - 候选必须先过 `gate`
 - 再满足 `promotion_score` 高于当前 active reference
-- `promotion_score` 以 `train/val` 连续趋势抓取分 `5:5` 为主，加少量按日收益路径年化分，再减去分段回撤惩罚：先按固定窗口回撤风险做基础扣分，超过拐点后按更陡斜率继续加罚
+- `promotion_score` 以连续趋势抓取主分与按日收益年化补分权重 `8:2` 为主体，再减去分段回撤惩罚和轻量鲁棒性软惩罚
+- 鲁棒性软惩罚只看 `train/val` 落差、`val` 分块稳定性，以及退出参数邻域在 `val` 3 段上的平台形态
 - `train` 滚动窗口均值/中位数、`val` 分块稳定性和过拟合集中度继续用于 gate 和诊断，不再直接进入晋级主公式
-- `test` 只在新 champion 时运行，只做观察记录，不参与晋升，也不进入 prompt
+- `test` 对新 champion 同步运行；对已完成完整评估但未保留的候选会后台异步补跑关键指标，只做观察记录，不参与晋升，也不进入 prompt
 - 复杂度信息现在只做只读诊断，只写入 `journal / wiki` 供人工查看，不再进入 `planner / reviewer` prompt，也不再自动触发压缩任务
 - `config/research_v2_champion_review.md` 是绑定当前 champion hash 的人工观察卡，只给 planner 做软引导；新 champion 后自动忽略，直到人工更新 hash。
 
@@ -116,7 +117,7 @@ flowchart TB
 - `GPT` 更适合固定框架、规则严密、执行链稳定的角色，例如 `reviewer / edit_worker / repair_worker / summary_worker`
 - `DeepSeek` 在发散找方向、提出新假设、快速换研究层级这类 `planner` 任务里，当前表现更好
 
-这个结论只针对当前仓库、当前评分口径 `trend_capture_v11_piecewise_drawdown_penalty` 和当前这组实验流程成立，不把它外推成所有任务的一般结论。
+这个结论只针对当前仓库、当前评分口径 `trend_capture_v12_robustness_plateau_penalty` 和当前这组实验流程成立，不把它外推成所有任务的一般结论。
 
 ### 为什么保留混合架构
 

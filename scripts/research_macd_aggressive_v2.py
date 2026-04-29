@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import argparse
 from collections import OrderedDict
+from concurrent.futures import ProcessPoolExecutor
 import contextlib
 import importlib
 import json
 import logging
+import multiprocessing
 import os
 import re
 import shutil
@@ -21,7 +23,7 @@ import sys
 import time
 import traceback
 from dataclasses import asdict, dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -54,12 +56,14 @@ from research_v2.exit_range_scan import (
     infer_exit_range_scan_spec,
     replace_exit_param_value,
     run_exit_range_scan,
+    run_plateau_probe,
 )
 from research_v2.evaluation import (
     EvaluationReport,
+    normalize_test_metrics_payload,
     partial_eval_gate_snapshot,
     summarize_evaluation,
-    summarize_hidden_test_result,
+    summarize_test_result,
 )
 from research_v2.journal import (
     append_journal_archive,
@@ -97,7 +101,12 @@ from research_v2.prompting import (
     build_strategy_summary_worker_system_prompt,
     build_strategy_runtime_repair_prompt,
 )
-from research_v2.round_artifacts import persist_round_artifact as persist_round_artifact_helper
+from research_v2.rejected_test_runner import run_round_artifact_test
+from research_v2.round_artifacts import (
+    load_round_artifact_metadata,
+    persist_round_artifact as persist_round_artifact_helper,
+    update_round_artifact_test_payload,
+)
 from research_v2.strategy_code import (
     REQUIRED_FUNCTIONS,
     StrategyCandidate,
@@ -122,7 +131,7 @@ from research_v2.reference_state import (
     report_from_saved_payload as report_from_saved_payload_helper,
     saved_report_payload as saved_report_payload_helper,
 )
-from research_v2.windows import build_research_windows
+from research_v2.windows import ResearchWindow, build_research_windows
 
 
 # ==================== 全局状态 ====================
@@ -134,7 +143,7 @@ DISCORD_CONFIG = load_discord_config()
 EVAL_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "eval")
 VALIDATION_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "validation")
 TEST_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "test")
-SCORE_REGIME = "trend_capture_v11_piecewise_drawdown_penalty"
+SCORE_REGIME = "trend_capture_v12_robustness_plateau_penalty"
 MODEL_WORKSPACE_STRATEGY_PATH = Path("src/strategy_macd_aggressive.py")
 PRIMARY_DIRECTION_DOMAINS = frozenset({"long", "short", "mixed", "structure"})
 PLANNER_BRIEF_REQUIRED_FIELDS = ("primary_direction", "hypothesis", "change_plan", "novelty_proof", "change_tags")
@@ -156,16 +165,20 @@ BEHAVIOR_FUNNEL_ABS_DELTA = 20
 BEHAVIOR_FUNNEL_REL_DELTA = 0.08
 BEHAVIOR_FUNNEL_REL_MIN_ABS_DELTA = 5
 BEHAVIOR_FUNNEL_STAGES = ("outer_context_pass", "path_pass", "final_veto_pass", "filled_entries")
+REJECT_TEST_ELIGIBLE_OUTCOMES = frozenset({"rejected", "duplicate_skipped"})
 
 best_source = ""
 best_report: EvaluationReport | None = None
 champion_source = ""
 champion_report: EvaluationReport | None = None
-champion_shadow_test_metrics: dict[str, float] | None = None
+champion_test_metrics: dict[str, float] | None = None
 iteration_counter = 0
 reference_stage_started_at = ""
 reference_stage_iteration = 0
 research_session_state: dict[str, Any] = {}
+rejected_test_executor: ProcessPoolExecutor | None = None
+rejected_test_futures: dict[Any, dict[str, Any]] = {}
+queued_rejected_test_round_dirs: set[str] = set()
 
 
 def active_exit_params() -> dict[str, Any]:
@@ -263,6 +276,148 @@ def write_heartbeat(status: str, **extra: Any) -> None:
     temp_path = RUNTIME.paths.heartbeat_file.with_suffix(".json.tmp")
     temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
     temp_path.replace(RUNTIME.paths.heartbeat_file)
+
+
+def _round_dir_key(round_dir: Path) -> str:
+    return str(round_dir.resolve())
+
+
+def _test_evaluation_payload(metadata: dict[str, Any]) -> dict[str, Any]:
+    payload = metadata.get("test_evaluation")
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def _round_artifact_needs_async_test(metadata: dict[str, Any]) -> bool:
+    if not metadata:
+        return False
+    if str(metadata.get("stop_stage", "")).strip() != "full_eval":
+        return False
+    if str(metadata.get("outcome", "")).strip() not in REJECT_TEST_ELIGIBLE_OUTCOMES:
+        return False
+    if normalize_test_metrics_payload(metadata.get("test_metrics")):
+        return False
+    status = str(_test_evaluation_payload(metadata).get("status", "")).strip()
+    return status not in {"completed", "failed"}
+
+
+def _ensure_rejected_test_executor() -> None:
+    global rejected_test_executor
+    if rejected_test_executor is not None:
+        return
+    rejected_test_executor = ProcessPoolExecutor(
+        max_workers=1,
+        mp_context=multiprocessing.get_context("spawn"),
+    )
+
+
+def _queue_round_artifact_test(round_dir: Path, *, reason: str) -> bool:
+    metadata = load_round_artifact_metadata(round_dir)
+    if not _round_artifact_needs_async_test(metadata):
+        return False
+    round_key = _round_dir_key(round_dir)
+    if round_key in queued_rejected_test_round_dirs:
+        return False
+
+    queued_at = datetime.now(UTC).isoformat()
+    evaluation = _test_evaluation_payload(metadata)
+    if str(evaluation.get("queued_at", "")).strip():
+        queued_at = str(evaluation.get("queued_at", "")).strip()
+    update_round_artifact_test_payload(
+        round_dir,
+        test_evaluation={
+            "status": "pending",
+            "mode": "rejected_async",
+            "queued_at": queued_at,
+            "error": "",
+        },
+    )
+
+    _ensure_rejected_test_executor()
+    assert rejected_test_executor is not None
+    future = rejected_test_executor.submit(
+        run_round_artifact_test,
+        str(REPO_ROOT),
+        str(round_dir),
+    )
+    queued_rejected_test_round_dirs.add(round_key)
+    rejected_test_futures[future] = {
+        "round_dir": round_dir,
+        "iteration": int(metadata.get("iteration", 0) or 0),
+        "candidate_id": str(metadata.get("candidate_id", "")).strip(),
+        "queued_at": queued_at,
+    }
+    log_info(
+        f"reject test已入队: iteration={int(metadata.get('iteration', 0) or 0)} "
+        f"candidate={str(metadata.get('candidate_id', '')).strip() or '-'} "
+        f"reason={reason}"
+    )
+    return True
+
+
+def _queue_pending_round_artifact_tests(*, reason: str) -> int:
+    rounds_root = RUNTIME.paths.round_artifacts_dir / "rounds"
+    if not rounds_root.exists():
+        return 0
+    queued = 0
+    for round_dir in sorted(path for path in rounds_root.iterdir() if path.is_dir()):
+        if _queue_round_artifact_test(round_dir, reason=reason):
+            queued += 1
+    return queued
+
+
+def _drain_rejected_test_futures() -> None:
+    for future, task in list(rejected_test_futures.items()):
+        if not future.done():
+            continue
+        rejected_test_futures.pop(future, None)
+        round_dir = Path(task["round_dir"])
+        queued_rejected_test_round_dirs.discard(_round_dir_key(round_dir))
+        metadata = load_round_artifact_metadata(round_dir)
+        queued_at = str(_test_evaluation_payload(metadata).get("queued_at", "")).strip() or str(task["queued_at"])
+        completed_at = datetime.now(UTC).isoformat()
+        try:
+            payload = future.result()
+            test_metrics = normalize_test_metrics_payload(payload.get("test_metrics"))
+        except Exception as exc:
+            update_round_artifact_test_payload(
+                round_dir,
+                test_evaluation={
+                    "status": "failed",
+                    "mode": "rejected_async",
+                    "queued_at": queued_at,
+                    "completed_at": completed_at,
+                    "error": str(exc),
+                },
+            )
+            log_info(
+                f"reject test失败: iteration={int(task['iteration'])} "
+                f"candidate={str(task['candidate_id']) or '-'} error={exc}"
+            )
+            logging.exception(
+                "reject test failed(iteration=%s,candidate=%s)",
+                task["iteration"],
+                task["candidate_id"],
+            )
+            continue
+
+        update_round_artifact_test_payload(
+            round_dir,
+            test_metrics=test_metrics,
+            test_evaluation={
+                "status": "completed",
+                "mode": "rejected_async",
+                "queued_at": queued_at,
+                "completed_at": completed_at,
+                "error": "",
+            },
+        )
+        log_info(
+            f"reject test完成: iteration={int(task['iteration'])} "
+            f"candidate={str(task['candidate_id']) or '-'} "
+            f"return={test_metrics.get('test_total_return_pct', 0.0):.2f}% "
+            f"sharpe={test_metrics.get('test_sharpe_ratio', 0.0):.2f} "
+            f"max_dd={test_metrics.get('test_max_drawdown', 0.0):.2f}%"
+        )
 
 
 def _build_model_progress_callback(phase: str, *, repair_attempt: int | None = None):
@@ -787,6 +942,12 @@ def _discord_data_range_text() -> str:
     )
 
 
+def _state_test_metrics(saved_state: dict[str, Any]) -> dict[str, float]:
+    return normalize_test_metrics_payload(
+        saved_state.get("test_metrics") or saved_state.get("shadow_test_metrics")
+    )
+
+
 def _parse_state_timestamp(value: Any) -> datetime | None:
     return parse_state_timestamp_helper(value)
 
@@ -809,12 +970,12 @@ def _saved_report_payload(
     source: str,
     report: EvaluationReport,
     *,
-    shadow_test_metrics: dict[str, float] | None = None,
+    test_metrics: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     return saved_report_payload_helper(
         source,
         report,
-        shadow_test_metrics=shadow_test_metrics,
+        test_metrics=test_metrics,
     )
 
 
@@ -826,7 +987,7 @@ def _reference_manifest_payload(
     source: str,
     report: EvaluationReport,
     *,
-    shadow_test_metrics: dict[str, float] | None = None,
+    test_metrics: dict[str, float] | None = None,
     stage_started_at: str = "",
     stage_iteration: int = 0,
     suppress_initialize_saved_reference_discord_once: bool = False,
@@ -835,7 +996,7 @@ def _reference_manifest_payload(
         source,
         report,
         score_regime=SCORE_REGIME,
-        shadow_test_metrics=shadow_test_metrics,
+        test_metrics=test_metrics,
         stage_started_at=stage_started_at,
         stage_iteration=stage_iteration,
         suppress_initialize_saved_reference_discord_once=suppress_initialize_saved_reference_discord_once,
@@ -995,11 +1156,12 @@ def _persist_round_artifact(
     entry: dict[str, Any],
     *,
     strategy_source: str,
-    shadow_test_metrics: dict[str, float] | None = None,
+    test_metrics: dict[str, float] | None = None,
+    test_evaluation: dict[str, Any] | None = None,
     champion_snapshot_dir: Path | None = None,
     chart_paths: PerformanceChartPaths | None = None,
-) -> None:
-    persist_round_artifact_helper(
+) -> Path:
+    return persist_round_artifact_helper(
         RUNTIME.paths.round_artifacts_dir,
         repo_root=RUNTIME.paths.repo_root,
         entry=entry,
@@ -1009,7 +1171,8 @@ def _persist_round_artifact(
         scoring=asdict(RUNTIME.scoring),
         data_fingerprints=_backtest_data_file_signatures(),
         engine_fingerprints=_round_artifact_engine_file_signatures(),
-        shadow_test_metrics=shadow_test_metrics,
+        test_metrics=test_metrics,
+        test_evaluation=test_evaluation,
         champion_snapshot_dir=champion_snapshot_dir,
         chart_paths=_round_artifact_chart_paths(chart_paths),
     )
@@ -1019,17 +1182,26 @@ def _append_research_journal_entry(
     entry: dict[str, Any],
     *,
     strategy_source: str,
+    test_metrics: dict[str, float] | None = None,
+    test_evaluation: dict[str, Any] | None = None,
     persist_round_artifact: bool = True,
-) -> None:
+) -> Path | None:
+    round_dir: Path | None = None
     append_journal_entry(RUNTIME.paths.journal_file, entry)
     append_journal_archive(RUNTIME.paths.memory_dir, entry)
     if persist_round_artifact:
         try:
-            _persist_round_artifact(entry, strategy_source=strategy_source)
+            round_dir = _persist_round_artifact(
+                entry,
+                strategy_source=strategy_source,
+                test_metrics=test_metrics,
+                test_evaluation=test_evaluation,
+            )
         except Exception as exc:
             log_info(f"round artifact 归档失败: {exc}")
             logging.exception("round artifact persist failed(iteration=%s)", entry.get("iteration"))
     _refresh_prompt_memory_snapshots()
+    return round_dir
 
 
 def _context_relevant_exit_params(exit_params: dict[str, Any]) -> dict[str, Any]:
@@ -1209,11 +1381,11 @@ def _run_selection_period_backtest(
     )
 
 
-def _run_hidden_test_backtest(
+def _run_test_backtest(
     prepared_context: dict[str, Any],
     *,
     include_diagnostics: bool = True,
-    heartbeat_phase: str = "hidden_test_eval",
+    heartbeat_phase: str = "test_eval",
 ) -> dict[str, Any]:
     test_window = _test_window()
     write_heartbeat(
@@ -1269,7 +1441,7 @@ def _archive_champion_snapshot(
     candidate: StrategyCandidate,
     source: str,
     report: EvaluationReport,
-    shadow_test_metrics: dict[str, float] | None = None,
+    test_metrics: dict[str, float] | None = None,
     chart_paths: PerformanceChartPaths | None = None,
 ) -> Path:
     snapshot_dir = archive_champion_snapshot_helper(
@@ -1279,7 +1451,7 @@ def _archive_champion_snapshot(
         candidate=candidate,
         source=source,
         report=report,
-        shadow_test_metrics=shadow_test_metrics,
+        test_metrics=test_metrics,
         chart_paths=chart_paths,
     )
     log_info(f"champion快照已归档: {snapshot_dir}")
@@ -1293,7 +1465,7 @@ def _build_chart_note(message: str) -> str:
 def _generate_new_champion_charts(
     iteration_id: int,
     *,
-    hidden_test_result: dict[str, Any] | None = None,
+    test_result: dict[str, Any] | None = None,
 ) -> PerformanceChartPaths:
     if not charts_available():
         log_info("跳过新 champion 图表：matplotlib 不可用")
@@ -1342,7 +1514,7 @@ def _generate_new_champion_charts(
         output_path=validation_chart,
         title=f"New Champion #{iteration_id} Validation",
         subtitle=f"{validation_window.start_date} to {validation_window.end_date}",
-        secondary_daily_equity_curve=(hidden_test_result or {}).get("daily_equity_curve", []),
+        secondary_daily_equity_curve=(test_result or {}).get("daily_equity_curve", []),
         secondary_title=f"New Champion #{iteration_id} Test",
         secondary_subtitle=f"{test_window.start_date} to {test_window.end_date}",
     )
@@ -1364,7 +1536,12 @@ def _generate_new_champion_charts(
     )
 
 
-def evaluate_current_strategy(allow_early_reject: bool = False) -> EvaluationReport:
+def evaluate_current_strategy(
+    allow_early_reject: bool = False,
+    *,
+    plateau_probe_candidate: StrategyCandidate | None = None,
+    plateau_probe_base_source: str = "",
+) -> EvaluationReport:
     prepared_context = _prepare_backtest_context()
     base_results = _run_base_backtests(
         allow_early_reject=allow_early_reject,
@@ -1375,22 +1552,29 @@ def evaluate_current_strategy(allow_early_reject: bool = False) -> EvaluationRep
         None,
     )
     selection_period_result = _run_selection_period_backtest(prepared_context)
+    plateau_probe_result: dict[str, Any] | None = None
+    if plateau_probe_candidate is not None and plateau_probe_base_source:
+        plateau_probe_result = _run_candidate_plateau_probe(
+            plateau_probe_candidate,
+            base_source=plateau_probe_base_source,
+        )
     return summarize_evaluation(
         base_results,
         RUNTIME.gates,
         selection_period_result=selection_period_result,
         validation_continuous_result=validation_continuous_result,
         scoring=RUNTIME.scoring,
+        plateau_probe=plateau_probe_result,
     )
 
 
-def evaluate_hidden_test_metrics() -> dict[str, float]:
-    return summarize_hidden_test_result(evaluate_hidden_test_result())
+def evaluate_test_metrics() -> dict[str, float]:
+    return summarize_test_result(evaluate_test_result())
 
 
-def evaluate_hidden_test_result() -> dict[str, Any]:
+def evaluate_test_result() -> dict[str, Any]:
     prepared_context = _prepare_backtest_context()
-    return _run_hidden_test_backtest(prepared_context, include_diagnostics=True)
+    return _run_test_backtest(prepared_context, include_diagnostics=True)
 
 
 def smoke_test_current_strategy() -> None:
@@ -3510,7 +3694,7 @@ def _persist_best_state(
     source: str,
     report: EvaluationReport,
     *,
-    shadow_test_metrics: dict[str, float] | None = None,
+    test_metrics: dict[str, float] | None = None,
     stage_started_at: str = "",
     stage_iteration: int = 0,
     suppress_initialize_saved_reference_discord_once: bool = False,
@@ -3522,7 +3706,7 @@ def _persist_best_state(
         source,
         report,
         score_regime=SCORE_REGIME,
-        shadow_test_metrics=shadow_test_metrics,
+        test_metrics=test_metrics,
         stage_started_at=stage_started_at,
         stage_iteration=stage_iteration,
         suppress_initialize_saved_reference_discord_once=suppress_initialize_saved_reference_discord_once,
@@ -3531,7 +3715,7 @@ def _persist_best_state(
 
 def initialize_best_state(force_rebuild: bool = False) -> None:
     global best_source, best_report, champion_source, champion_report
-    global champion_shadow_test_metrics, reference_stage_started_at, reference_stage_iteration
+    global champion_test_metrics, reference_stage_started_at, reference_stage_iteration
 
     journal_entries = load_journal_entries(RUNTIME.paths.journal_file)
     saved_state = _load_saved_reference_state()
@@ -3556,11 +3740,7 @@ def initialize_best_state(force_rebuild: bool = False) -> None:
             best_report = evaluate_current_strategy()
             champion_source = best_source if best_report.gate_passed else ""
             champion_report = best_report if best_report.gate_passed else None
-            champion_shadow_test_metrics = (
-                dict(saved_state.get("shadow_test_metrics", {}) or {})
-                if champion_report is not None
-                else None
-            )
+            champion_test_metrics = _state_test_metrics(saved_state) if champion_report is not None else None
             suppress_initialize_saved_reference_discord_once = bool(
                 saved_state.get("suppress_initialize_saved_reference_discord_once", False)
             )
@@ -3573,6 +3753,7 @@ def initialize_best_state(force_rebuild: bool = False) -> None:
             _persist_best_state(
                 best_source,
                 best_report,
+                test_metrics=champion_test_metrics,
                 stage_started_at=reference_stage_started_at,
                 stage_iteration=reference_stage_iteration,
                 suppress_initialize_saved_reference_discord_once=False,
@@ -3606,6 +3787,7 @@ def initialize_best_state(force_rebuild: bool = False) -> None:
                         validation_window_count=VALIDATION_WINDOW_COUNT,
                         test_window_count=TEST_WINDOW_COUNT,
                         data_range_text=_discord_data_range_text(),
+                        test_metrics=champion_test_metrics,
                     ),
                     context="initialize_saved_reference",
                 )
@@ -3617,7 +3799,7 @@ def initialize_best_state(force_rebuild: bool = False) -> None:
     best_report = evaluate_current_strategy()
     champion_source = best_source if best_report.gate_passed else ""
     champion_report = best_report if best_report.gate_passed else None
-    champion_shadow_test_metrics = dict(saved_state.get("shadow_test_metrics", {}) or {}) if champion_report else None
+    champion_test_metrics = _state_test_metrics(saved_state) if champion_report else None
     reference_stage_started_at = datetime.now(UTC).isoformat()
     reference_stage_iteration = (
         max((int(entry.get("iteration", 0) or 0) for entry in journal_entries), default=0) + 1
@@ -3625,6 +3807,7 @@ def initialize_best_state(force_rebuild: bool = False) -> None:
     _persist_best_state(
         best_source,
         best_report,
+        test_metrics=champion_test_metrics,
         stage_started_at=reference_stage_started_at,
         stage_iteration=reference_stage_iteration,
     )
@@ -3651,6 +3834,7 @@ def initialize_best_state(force_rebuild: bool = False) -> None:
             validation_window_count=VALIDATION_WINDOW_COUNT,
             test_window_count=TEST_WINDOW_COUNT,
             data_range_text=_discord_data_range_text(),
+            test_metrics=champion_test_metrics,
         ),
         context="initialize_baseline",
     )
@@ -3763,6 +3947,7 @@ def _build_journal_entry(
         ],
         "exit_range_scan": candidate.exit_range_scan or {},
         "exit_range_scan_result": candidate.exit_range_scan_result or {},
+        "plateau_probe": candidate.plateau_probe_result or {},
         "cluster_key": str(candidate_signature.get("cluster_key", "")).strip()
         or cluster_key_for_components("", candidate.change_tags),
         "quality_score": quality_score,
@@ -4063,10 +4248,18 @@ def _smoke_candidate(candidate: StrategyCandidate) -> list[dict[str, Any]]:
         raise CandidateRuntimeFailure("smoke_test", exc) from exc
 
 
-def _evaluate_candidate(candidate: StrategyCandidate) -> EvaluationReport:
+def _evaluate_candidate(
+    candidate: StrategyCandidate,
+    base_source: str | None = None,
+) -> EvaluationReport:
     _activate_candidate(candidate)
+    resolved_base_source = base_source if base_source is not None else best_source
     try:
-        return evaluate_current_strategy(allow_early_reject=True)
+        return evaluate_current_strategy(
+            allow_early_reject=True,
+            plateau_probe_candidate=candidate,
+            plateau_probe_base_source=resolved_base_source,
+        )
     except EarlyRejection:
         raise
     except Exception as exc:
@@ -4087,6 +4280,94 @@ def _format_exit_range_scan_log(result: dict[str, Any]) -> str:
             f"fee={float(row.get('mean_fee_drag', 0.0)):.2f}%"
         )
     return "; ".join(compact)
+
+
+def _split_window_evenly(window: ResearchWindow, *, parts: int, label_prefix: str) -> list[ResearchWindow]:
+    start_dt = datetime.strptime(window.start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(window.end_date, "%Y-%m-%d")
+    total_days = (end_dt - start_dt).days + 1
+    actual_parts = max(1, min(int(parts), total_days))
+    base_size, remainder = divmod(total_days, actual_parts)
+    windows: list[ResearchWindow] = []
+    cursor = start_dt
+    for index in range(actual_parts):
+        window_days = base_size + (1 if index < remainder else 0)
+        part_end = cursor + timedelta(days=window_days - 1)
+        windows.append(
+            ResearchWindow(
+                group=window.group,
+                label=f"{label_prefix}{index + 1}",
+                start_date=cursor.strftime("%Y-%m-%d"),
+                end_date=part_end.strftime("%Y-%m-%d"),
+                weight=window.weight,
+            )
+        )
+        cursor = part_end + timedelta(days=1)
+    return windows
+
+
+def _plateau_probe_windows() -> list[ResearchWindow]:
+    return _split_window_evenly(_validation_window(), parts=3, label_prefix="val_probe")
+
+
+def _format_plateau_probe_log(result: dict[str, Any]) -> str:
+    rows = result.get("summary", []) if isinstance(result, dict) else []
+    compact = []
+    for row in rows[:5]:
+        compact.append(
+            f"{row.get('value')}=>score={float(row.get('mean_period_score', 0.0)):.2f},"
+            f"ret={float(row.get('mean_return', 0.0)):.2f}%,"
+            f"dd={float(row.get('max_drawdown', 0.0)):.2f}%"
+        )
+    return "; ".join(compact)
+
+
+def _run_candidate_plateau_probe(
+    candidate: StrategyCandidate,
+    *,
+    base_source: str,
+) -> dict[str, Any]:
+    if not RUNTIME.plateau_probe_enabled:
+        return {
+            "enabled": False,
+            "skipped_reason": "plateau_probe_disabled",
+        }
+    spec = infer_exit_range_scan_spec(
+        base_source,
+        candidate.strategy_code,
+        candidate.exit_range_scan,
+        max_values=RUNTIME.exit_range_scan_max_values,
+    )
+    if spec is None:
+        return {
+            "enabled": False,
+            "skipped_reason": "no_exit_param_probe_target",
+        }
+
+    probe_windows = _plateau_probe_windows()
+    write_heartbeat(
+        "plateau_probing",
+        message=f"iteration {iteration_counter} plateau probe",
+        phase="plateau_probe",
+        current_window=spec.param,
+        window_index=0,
+        window_count=len(probe_windows),
+    )
+    outcome = run_plateau_probe(
+        repo_root=REPO_ROOT,
+        spec=spec,
+        current_exit_params=active_exit_params(),
+        windows=probe_windows,
+        workers=RUNTIME.exit_range_scan_workers,
+    )
+    result_payload = outcome.to_dict()
+    log_info(
+        f"plateau probe: param={outcome.param}, values={list(outcome.values)}, "
+        f"center={outcome.center_period_score:.2f}, best={outcome.best_period_score:.2f}, "
+        f"gap={outcome.center_gap:.2f}, score_span={outcome.score_span:.2f}, "
+        f"dd_span={outcome.drawdown_span:.2f}; {_format_plateau_probe_log(result_payload)}"
+    )
+    return result_payload
 
 
 def _maybe_apply_exit_range_scan(candidate: StrategyCandidate, *, base_source: str) -> StrategyCandidate:
@@ -4179,6 +4460,13 @@ def _candidate_with_repair(
                 raise CandidateBehavioralNoop(current, behavior_diff)
             current = _maybe_apply_exit_range_scan(current, base_source=base_source)
             report = _evaluate_candidate(current)
+            plateau_probe_result = {}
+            if isinstance(report.artifacts, dict):
+                raw_plateau_probe = report.artifacts.get("plateau_probe")
+                if isinstance(raw_plateau_probe, dict):
+                    plateau_probe_result = dict(raw_plateau_probe)
+            if plateau_probe_result:
+                current = replace(current, plateau_probe_result=plateau_probe_result)
             return current, report
         except CandidateRuntimeFailure as exc:
             error_message = "".join(
@@ -4212,11 +4500,12 @@ def _candidate_with_repair(
 
 def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str:
     global best_source, best_report, champion_source, champion_report
-    global champion_shadow_test_metrics, reference_stage_started_at, reference_stage_iteration
+    global champion_test_metrics, reference_stage_started_at, reference_stage_iteration
 
     if best_report is None:
         raise RuntimeError("reference state is not initialized")
 
+    _drain_rejected_test_futures()
     write_strategy_source(RUNTIME.paths.strategy_file, best_source)
     reload_strategy_module()
 
@@ -4637,27 +4926,27 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
         champion_report = candidate_report
         reference_stage_started_at = datetime.now(UTC).isoformat()
         reference_stage_iteration = iteration_id
-        hidden_test_result: dict[str, Any] | None = None
-        shadow_test_metrics: dict[str, float] | None = None
+        test_result: dict[str, Any] | None = None
+        test_metrics: dict[str, float] | None = None
         try:
-            hidden_test_result = evaluate_hidden_test_result()
-            shadow_test_metrics = summarize_hidden_test_result(hidden_test_result)
+            test_result = evaluate_test_result()
+            test_metrics = summarize_test_result(test_result)
             log_info(
                 "test验收: "
-                f"score={shadow_test_metrics['shadow_test_score']:.2f}, "
-                f"return={shadow_test_metrics['shadow_test_total_return_pct']:.2f}%, "
-                f"segments={int(shadow_test_metrics['shadow_test_segment_count'])}, "
-                f"hit={shadow_test_metrics['shadow_test_hit_rate']:.0%}"
+                f"score={test_metrics['test_score']:.2f}, "
+                f"return={test_metrics['test_total_return_pct']:.2f}%, "
+                f"segments={int(test_metrics['test_segment_count'])}, "
+                f"hit={test_metrics['test_hit_rate']:.0%}"
             )
         except Exception as exc:
             log_info(f"test评估失败，但本轮 champion 已按 val 保留: {exc}")
             logging.exception("test评估失败(iteration=%s)", iteration_id)
-        champion_shadow_test_metrics = shadow_test_metrics or {}
+        champion_test_metrics = test_metrics or {}
 
         _persist_best_state(
             best_source,
             best_report,
-            shadow_test_metrics=shadow_test_metrics,
+            test_metrics=test_metrics,
             stage_started_at=reference_stage_started_at,
             stage_iteration=reference_stage_iteration,
             suppress_initialize_saved_reference_discord_once=True,
@@ -4689,7 +4978,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
         try:
             chart_paths = _generate_new_champion_charts(
                 iteration_id,
-                hidden_test_result=hidden_test_result,
+                test_result=test_result,
             )
             if chart_paths.selection_chart is not None:
                 log_info(f"train+val图已保存: {chart_paths.selection_chart}")
@@ -4705,7 +4994,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
                 candidate=candidate,
                 source=best_source,
                 report=best_report,
-                shadow_test_metrics=shadow_test_metrics,
+                test_metrics=test_metrics,
                 chart_paths=chart_paths,
             )
         except Exception as exc:
@@ -4715,7 +5004,12 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
             _persist_round_artifact(
                 entry_base,
                 strategy_source=best_source,
-                shadow_test_metrics=shadow_test_metrics,
+                test_metrics=test_metrics,
+                test_evaluation={
+                    "status": "completed",
+                    "mode": "accepted_sync",
+                    "completed_at": datetime.now(UTC).isoformat(),
+                },
                 champion_snapshot_dir=champion_snapshot_dir,
                 chart_paths=chart_paths,
             )
@@ -4729,7 +5023,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
             validation_window_count=VALIDATION_WINDOW_COUNT,
             test_window_count=TEST_WINDOW_COUNT,
             data_range_text=_discord_data_range_text(),
-            shadow_test_metrics=shadow_test_metrics,
+            test_metrics=test_metrics,
             candidate=candidate,
         )
         attachments = [chart_paths.validation_chart] if chart_paths.validation_chart is not None else None
@@ -4742,10 +5036,12 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
         )
         return "accepted"
 
-    _append_research_journal_entry(
+    round_dir = _append_research_journal_entry(
         entry_base,
         strategy_source=candidate.strategy_code,
     )
+    if round_dir is not None:
+        _queue_round_artifact_test(round_dir, reason="iteration_rejected")
     if maybe_compact(RUNTIME.paths.journal_file):
         log_info("研究日志已压缩")
     write_strategy_source(RUNTIME.paths.strategy_file, best_source)
@@ -4784,6 +5080,7 @@ def run_iteration(iteration_id: int, use_model_optimization: bool = True) -> str
 
 def _sleep_with_stop(seconds: int) -> None:
     for _ in range(max(0, seconds)):
+        _drain_rejected_test_futures()
         if RUNTIME.paths.stop_file.exists():
             return
         time.sleep(1)
@@ -4833,7 +5130,12 @@ def main() -> int:
     if args.no_optimize:
         return 0
 
+    queued_backfill = _queue_pending_round_artifact_tests(reason="startup_backfill")
+    if queued_backfill > 0:
+        log_info(f"已补挂历史 reject test 队列: {queued_backfill} 条")
+
     while True:
+        _drain_rejected_test_futures()
         if RUNTIME.paths.stop_file.exists():
             write_heartbeat("stopped", message="stop file detected")
             return 0
@@ -4882,6 +5184,7 @@ def main() -> int:
         if outcome == "stopped":
             return 0
 
+        _drain_rejected_test_futures()
         write_heartbeat(
             "sleeping",
             message=f"iteration {iteration_counter} sleeping",

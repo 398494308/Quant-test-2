@@ -33,9 +33,11 @@ from research_v2.charting import PerformanceChartPaths, charts_available, render
 from research_v2.config import GateConfig, ScoringConfig
 from research_v2.evaluation import (
     EvaluationReport,
+    ValidationBlockReport,
     _annualized_return_score,
     _collect_daily_path,
     _collect_trend_path,
+    _robustness_penalty_payload,
     _trend_score_report,
     partial_eval_gate_snapshot,
     summarize_evaluation,
@@ -80,6 +82,7 @@ from research_v2.prompting import (
     build_strategy_summary_worker_system_prompt,
     build_strategy_runtime_repair_prompt,
 )
+from research_v2.round_artifacts import load_round_artifact_metadata, persist_round_artifact
 from research_v2.strategy_code import (
     REQUIRED_FUNCTIONS,
     REQUIRED_TOP_LEVEL_CONSTANTS,
@@ -217,6 +220,24 @@ class BacktestFixesTest(unittest.TestCase):
         self.assertEqual(len(points), 1)
         self.assertAlmostEqual(points[0]["equity"], 101000.0)
         self.assertAlmostEqual(points[0]["market_close"], 35250.0)
+
+    def test_update_protective_stops_uses_signal_specific_break_even_buffer(self):
+        position = {
+            "entry_signal": "long_pullback",
+            "entry_price": 100.0,
+            "stop_price": 90.0,
+            "peak_pnl_pct": 50.0,
+            "favorable_price": 102.0,
+        }
+        exit_params = dict(backtest.EXIT_PARAMS)
+        exit_params["break_even_activation_pct"] = 39.0
+        exit_params["break_even_buffer_pct"] = 0.35
+        exit_params["long_pullback_break_even_buffer_pct"] = 0.28
+        exit_params["trailing_activation_pct"] = 999.0
+
+        backtest._update_protective_stops(position, exit_params, leverage=20.0)
+
+        self.assertAlmostEqual(position["stop_price"], 100.28)
 
     def test_closed_trade_rollup_treats_tp1_and_final_exit_as_one_trade(self):
         position = {
@@ -514,6 +535,7 @@ class EvaluationFixesTest(unittest.TestCase):
             0.80 * report.metrics["capture_score"]
             + 0.20 * report.metrics["timed_return_score"]
             - expected_drawdown_penalty
+            - report.metrics["robustness_penalty_score"]
         )
         self.assertAlmostEqual(report.metrics["drawdown_penalty_score"], expected_drawdown_penalty)
         self.assertAlmostEqual(report.metrics["promotion_score"], expected_promotion_score)
@@ -693,9 +715,12 @@ class EvaluationFixesTest(unittest.TestCase):
         self.assertAlmostEqual(report.metrics["drawdown_penalty_score"], expected_drawdown_penalty)
         self.assertAlmostEqual(
             report.metrics["promotion_score"],
-            0.80 * report.metrics["capture_score"]
-            + 0.20 * report.metrics["timed_return_score"]
-            - expected_drawdown_penalty,
+            (
+                0.80 * report.metrics["capture_score"]
+                + 0.20 * report.metrics["timed_return_score"]
+                - expected_drawdown_penalty
+                - report.metrics["robustness_penalty_score"]
+            ),
         )
 
     def test_summarize_evaluation_drawdown_risk_penalizes_persistent_underwater_path(self):
@@ -787,6 +812,47 @@ class EvaluationFixesTest(unittest.TestCase):
             persistent_underwater_report.metrics["promotion_score"],
             fast_recovery_report.metrics["promotion_score"],
         )
+
+    def test_robustness_penalty_payload_caps_total_penalty_and_tracks_plateau(self):
+        block_report = ValidationBlockReport(
+            block_scores=(0.32, 0.18, -0.05),
+            mean_score=0.15,
+            std_score=0.25,
+            min_score=-0.05,
+            tail_score=-0.05,
+            fail_count=1,
+            used_block_count=3,
+        )
+        payload = _robustness_penalty_payload(
+            promotion_gap=0.29,
+            block_report=block_report,
+            scoring=ScoringConfig(),
+            plateau_probe={
+                "enabled": True,
+                "param": "stop_max_loss_pct",
+                "values": [70.0, 82.0, 94.0],
+                "current_value": 82.0,
+                "best_value": 94.0,
+                "center_period_score": 0.41,
+                "best_period_score": 0.57,
+                "center_gap": 0.16,
+                "score_span": 0.14,
+                "drawdown_span": 9.2,
+                "current_is_best": False,
+            },
+        )
+
+        self.assertAlmostEqual(payload["gap_penalty_score"], 0.10)
+        self.assertAlmostEqual(payload["block_std_penalty_score"], 0.03)
+        self.assertAlmostEqual(payload["block_floor_penalty_score"], 0.06)
+        self.assertAlmostEqual(payload["block_tail_penalty_score"], 0.03)
+        self.assertAlmostEqual(payload["block_fail_penalty_score"], 0.03)
+        self.assertAlmostEqual(payload["plateau_penalty_score"], 0.15)
+        self.assertAlmostEqual(payload["validation_block_tail_gap"], 0.20)
+        self.assertAlmostEqual(payload["robustness_penalty_score_raw"], 0.40)
+        self.assertAlmostEqual(payload["robustness_penalty_score"], 0.25)
+        self.assertEqual(payload["plateau_probe_enabled"], 1.0)
+        self.assertEqual(payload["plateau_current_is_best"], 0.0)
 
     def test_summarize_evaluation_emits_funnel_and_low_activity_soft_signal(self):
         eval_window = type("Window", (), {"group": "eval", "label": "train1", "start_date": "2026-01-01", "end_date": "2026-01-10"})()
@@ -1644,10 +1710,10 @@ class JournalPromptFixesTest(unittest.TestCase):
         )
 
         self.assertIn("promotion_score` 高于当前 champion", prompt)
-        self.assertIn("连续趋势抓取分 `5:5`", prompt)
-        self.assertIn("按日收益路径年化分", prompt)
+        self.assertIn("权重 `8:2`", prompt)
+        self.assertIn("按日收益年化补分", prompt)
         self.assertIn("分段回撤惩罚", prompt)
-        self.assertIn("固定窗口风险做基础扣分", prompt)
+        self.assertIn("鲁棒性软惩罚", prompt)
         self.assertNotIn("promotion_delta >", prompt)
         self.assertIn("当前回合任务", prompt)
         self.assertIn("本轮阅读顺序（必须执行）", prompt)
@@ -3712,6 +3778,52 @@ class FreqtradeAdapterFixesTest(unittest.TestCase):
             self.assertTrue((memory_root / "wiki/direction_board.json").exists())
             self.assertIn("blocked_cuts", load_failure_wiki_index(memory_root))
 
+    def test_journal_summary_memory_snapshots_strip_test_observation_fields(self):
+        entries = [
+            {
+                "iteration": 5,
+                "candidate_id": "current_stage_candidate",
+                "outcome": "rejected",
+                "stop_stage": "full_eval",
+                "promotion_score": 0.12,
+                "quality_score": 0.21,
+                "promotion_delta": -0.03,
+                "gate_reason": "未超过当前champion晋级分",
+                "decision_reason": "未超过当前champion晋级分",
+                "change_tags": ["ownership_takeover"],
+                "edited_regions": ["strategy"],
+                "system_changed_regions": ["strategy"],
+                "hypothesis": "当前 stage",
+                "score_regime": "trend_capture_v4",
+                "test_metrics": {
+                    "test_score": 0.91,
+                    "test_sharpe_ratio": 0.55,
+                },
+                "test_evaluation": {
+                    "status": "completed",
+                    "mode": "rejected_async",
+                },
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            memory_root = Path(tmpdir) / "memory"
+            build_journal_prompt_summary(
+                entries,
+                limit=8,
+                current_score_regime="trend_capture_v4",
+                active_stage_iteration=5,
+                memory_root=memory_root,
+            )
+
+            current_stage_payload = json.loads(
+                (memory_root / "summaries/current_stage_rounds.json").read_text()
+            )
+            serialized = json.dumps(current_stage_payload, ensure_ascii=False)
+            self.assertNotIn("test_metrics", serialized)
+            self.assertNotIn("test_evaluation", serialized)
+            self.assertNotIn("test_score", serialized)
+
     def test_journal_summary_writes_duplicate_watchlist_markdown(self):
         entries = [
             {
@@ -4671,12 +4783,12 @@ class ReferenceStateFixesTest(unittest.TestCase):
         original_best_source = research_script.best_source
         original_champion_source = research_script.champion_source
         original_champion_report = research_script.champion_report
-        original_champion_shadow = research_script.champion_shadow_test_metrics
+        original_champion_test = research_script.champion_test_metrics
         try:
             research_script.best_source = working_base_source
             research_script.champion_source = champion_source
             research_script.champion_report = champion_report
-            research_script.champion_shadow_test_metrics = {"shadow_test_score": 1.23}
+            research_script.champion_test_metrics = {"test_score": 1.23}
             payload = research_script._reference_manifest_payload(
                 working_base_source,
                 working_base_report,
@@ -4687,7 +4799,7 @@ class ReferenceStateFixesTest(unittest.TestCase):
             research_script.best_source = original_best_source
             research_script.champion_source = original_champion_source
             research_script.champion_report = original_champion_report
-            research_script.champion_shadow_test_metrics = original_champion_shadow
+            research_script.champion_test_metrics = original_champion_test
 
         self.assertEqual(payload["reference_role"], "baseline")
         self.assertEqual(payload["benchmark_role"], "baseline")
@@ -5180,7 +5292,7 @@ class RefactorHelperRegressionTest(unittest.TestCase):
                 "def strategy():\n    return 'ok'\n",
                 report,
                 score_regime="trend_capture_v11_piecewise_drawdown_penalty",
-                shadow_test_metrics={"shadow_test_score": 1.2},
+                test_metrics={"test_score": 1.2},
                 stage_started_at="2026-04-20T00:00:00+00:00",
                 stage_iteration=9,
             )
@@ -5188,6 +5300,7 @@ class RefactorHelperRegressionTest(unittest.TestCase):
             payload = load_saved_reference_state(best_state_file)
             self.assertEqual(payload["reference_role"], "baseline")
             self.assertEqual(payload["reference_stage_iteration"], 9)
+            self.assertEqual(payload["test_metrics"]["test_score"], 1.2)
             self.assertFalse(champion_strategy_file.exists())
             self.assertTrue(best_strategy_file.exists())
 
@@ -5226,7 +5339,7 @@ class RefactorHelperRegressionTest(unittest.TestCase):
                 candidate=candidate,
                 source=candidate.strategy_code,
                 report=report,
-                shadow_test_metrics={"shadow_test_score": 1.5},
+                test_metrics={"test_score": 1.5},
                 chart_paths=PerformanceChartPaths(
                     validation_chart=validation_chart,
                     selection_chart=selection_chart,
@@ -5237,8 +5350,231 @@ class RefactorHelperRegressionTest(unittest.TestCase):
             self.assertEqual(metadata["candidate_id"], "champion_1")
             self.assertEqual(metadata["validation_chart"], "validation.png")
             self.assertEqual(metadata["selection_chart"], "selection.png")
+            self.assertEqual(metadata["test_metrics"]["test_score"], 1.5)
             self.assertTrue((snapshot_dir / "validation.png").exists())
             self.assertTrue((snapshot_dir / "selection.png").exists())
+
+
+class RejectedTestQueueTest(unittest.TestCase):
+    def _entry(self, *, iteration: int, outcome: str = "rejected", stop_stage: str = "full_eval") -> dict[str, object]:
+        return {
+            "iteration": iteration,
+            "timestamp": "2026-04-28T00:03:00+00:00",
+            "candidate_id": f"cand_{iteration}",
+            "outcome": outcome,
+            "stop_stage": stop_stage,
+            "score_regime": research_script.SCORE_REGIME,
+            "reference_role": "champion",
+            "primary_direction": "long",
+            "gate_reason": "未超过当前champion晋级分",
+            "decision_reason": "未超过当前champion晋级分",
+            "note": "",
+            "promotion_score": 0.44,
+            "quality_score": 0.51,
+            "promotion_delta": -0.02,
+            "reference_code_hash": "reference_hash",
+            "change_tags": ["drawdown_control"],
+            "edited_regions": ["strategy"],
+            "system_changed_regions": ["strategy"],
+            "diff_summary": ["adjust stop logic"],
+            "metrics": {
+                "capture_score": 0.62,
+                "timed_return_score": 0.28,
+            },
+        }
+
+    def test_queue_round_artifact_test_marks_pending_status(self):
+        strategy_source = "def strategy():\n    return None\n"
+        original_runtime = research_script.RUNTIME
+        original_executor = research_script.rejected_test_executor
+        original_futures = research_script.rejected_test_futures
+        original_queued = research_script.queued_rejected_test_round_dirs
+
+        class FakeExecutor:
+            def __init__(self):
+                self.calls = []
+
+            def submit(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+                return object()
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_root = Path(temp_dir)
+                temp_paths = replace(
+                    research_script.RUNTIME.paths,
+                    repo_root=temp_root,
+                    round_artifacts_dir=temp_root / "backups/research_v2_round_artifacts",
+                )
+                research_script.RUNTIME = replace(research_script.RUNTIME, paths=temp_paths)
+                research_script.rejected_test_executor = FakeExecutor()
+                research_script.rejected_test_futures = {}
+                research_script.queued_rejected_test_round_dirs = set()
+                round_dir = persist_round_artifact(
+                    temp_paths.round_artifacts_dir,
+                    repo_root=temp_root,
+                    entry=self._entry(iteration=5),
+                    strategy_source=strategy_source,
+                    windows={"test_start_date": "2026-01-01", "test_end_date": "2026-04-20"},
+                    gates={},
+                    scoring={},
+                    data_fingerprints={},
+                    engine_fingerprints={},
+                )
+
+                with mock.patch.object(research_script, "_ensure_rejected_test_executor"):
+                    queued = research_script._queue_round_artifact_test(round_dir, reason="unit_test")
+
+                self.assertTrue(queued)
+                metadata = load_round_artifact_metadata(round_dir)
+                self.assertEqual(metadata["test_evaluation"]["status"], "pending")
+                self.assertEqual(metadata["test_evaluation"]["mode"], "rejected_async")
+                self.assertEqual(len(research_script.rejected_test_futures), 1)
+        finally:
+            research_script.RUNTIME = original_runtime
+            research_script.rejected_test_executor = original_executor
+            research_script.rejected_test_futures = original_futures
+            research_script.queued_rejected_test_round_dirs = original_queued
+
+    def test_drain_rejected_test_futures_persists_completed_metrics(self):
+        strategy_source = "def strategy():\n    return None\n"
+        original_runtime = research_script.RUNTIME
+        original_futures = research_script.rejected_test_futures
+        original_queued = research_script.queued_rejected_test_round_dirs
+
+        class CompletedFuture:
+            def done(self):
+                return True
+
+            def result(self):
+                return {
+                    "test_metrics": {
+                        "test_total_return_pct": 3.5,
+                        "test_sharpe_ratio": 0.77,
+                        "test_max_drawdown": 8.2,
+                    }
+                }
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_root = Path(temp_dir)
+                temp_paths = replace(
+                    research_script.RUNTIME.paths,
+                    repo_root=temp_root,
+                    round_artifacts_dir=temp_root / "backups/research_v2_round_artifacts",
+                )
+                research_script.RUNTIME = replace(research_script.RUNTIME, paths=temp_paths)
+                round_dir = persist_round_artifact(
+                    temp_paths.round_artifacts_dir,
+                    repo_root=temp_root,
+                    entry=self._entry(iteration=6),
+                    strategy_source=strategy_source,
+                    windows={"test_start_date": "2026-01-01", "test_end_date": "2026-04-20"},
+                    gates={},
+                    scoring={},
+                    data_fingerprints={},
+                    engine_fingerprints={},
+                    test_evaluation={
+                        "status": "pending",
+                        "mode": "rejected_async",
+                        "queued_at": "2026-04-28T00:03:01+00:00",
+                    },
+                )
+                future = CompletedFuture()
+                research_script.rejected_test_futures = {
+                    future: {
+                        "round_dir": round_dir,
+                        "iteration": 6,
+                        "candidate_id": "cand_6",
+                        "queued_at": "2026-04-28T00:03:01+00:00",
+                    }
+                }
+                research_script.queued_rejected_test_round_dirs = {str(round_dir.resolve())}
+
+                research_script._drain_rejected_test_futures()
+
+                metadata = load_round_artifact_metadata(round_dir)
+                self.assertEqual(metadata["test_evaluation"]["status"], "completed")
+                self.assertEqual(metadata["test_evaluation"]["mode"], "rejected_async")
+                self.assertEqual(metadata["test_metrics"]["test_total_return_pct"], 3.5)
+                self.assertEqual(metadata["test_metrics"]["test_sharpe_ratio"], 0.77)
+                self.assertEqual(metadata["test_metrics"]["test_max_drawdown"], 8.2)
+                self.assertEqual(research_script.rejected_test_futures, {})
+                self.assertEqual(research_script.queued_rejected_test_round_dirs, set())
+        finally:
+            research_script.RUNTIME = original_runtime
+            research_script.rejected_test_futures = original_futures
+            research_script.queued_rejected_test_round_dirs = original_queued
+
+
+class PlateauProbeIntegrationTest(unittest.TestCase):
+    def test_run_candidate_plateau_probe_uses_validation_triplet_and_keeps_candidate_read_only(self):
+        candidate = StrategyCandidate(
+            candidate_id="cand_plateau",
+            hypothesis="观察退出平台",
+            change_plan="只读扫描退出参数邻域",
+            closest_failed_cluster="",
+            novelty_proof="观察平台，不自动改代码",
+            change_tags=("stop",),
+            edited_regions=("EXIT_PARAMS",),
+            expected_effects=("确认 val 平台形态",),
+            core_factors=(),
+            strategy_code="def strategy():\n    return None\n",
+            exit_range_scan={"raw": "stop_max_loss_pct | 72,84,96 | probe"},
+        )
+
+        class FakeOutcome:
+            param = "stop_max_loss_pct"
+            values = (72.0, 84.0, 96.0)
+            center_period_score = 0.44
+            best_period_score = 0.53
+            center_gap = 0.09
+            score_span = 0.11
+            drawdown_span = 6.5
+
+            def to_dict(self):
+                return {
+                    "enabled": True,
+                    "param": self.param,
+                    "values": list(self.values),
+                    "current_value": 84.0,
+                    "best_value": 96.0,
+                    "center_period_score": self.center_period_score,
+                    "best_period_score": self.best_period_score,
+                    "center_gap": self.center_gap,
+                    "score_span": self.score_span,
+                    "drawdown_span": self.drawdown_span,
+                    "current_is_best": False,
+                    "summary": [],
+                    "reason": "probe",
+                }
+
+        captured = {}
+
+        def fake_run_plateau_probe(**kwargs):
+            captured["windows"] = kwargs["windows"]
+            captured["workers"] = kwargs["workers"]
+            captured["current_exit_params"] = dict(kwargs["current_exit_params"])
+            return FakeOutcome()
+
+        spec = type(
+            "Spec",
+            (),
+            {"param": "stop_max_loss_pct", "values": (72.0, 84.0, 96.0), "reason": "probe"},
+        )()
+
+        with mock.patch.object(research_script, "infer_exit_range_scan_spec", return_value=spec), \
+             mock.patch.object(research_script, "run_plateau_probe", side_effect=fake_run_plateau_probe), \
+             mock.patch.object(research_script, "active_exit_params", return_value={"stop_max_loss_pct": 84.0}):
+            strategy_before = candidate.strategy_code
+            payload = research_script._run_candidate_plateau_probe(candidate, base_source="base_source")
+
+        self.assertEqual(payload["param"], "stop_max_loss_pct")
+        self.assertEqual(len(captured["windows"]), 3)
+        self.assertTrue(all(window.group == "validation" for window in captured["windows"]))
+        self.assertEqual(captured["workers"], research_script.RUNTIME.exit_range_scan_workers)
+        self.assertEqual(captured["current_exit_params"]["stop_max_loss_pct"], 84.0)
+        self.assertEqual(candidate.strategy_code, strategy_before)
 
 
 class DiscordSummaryFormattingTest(unittest.TestCase):
@@ -5354,12 +5690,12 @@ class DiscordSummaryFormattingTest(unittest.TestCase):
             validation_window_count=1,
             test_window_count=1,
             data_range_text="train 2023-07-01~2024-12-31 / val 2025-01-01~2025-12-31 / test 2026-01-01~2026-03-31",
-            shadow_test_metrics={
-                "shadow_test_total_return_pct": 3.21,
-                "shadow_test_closed_trades": 9.0,
-                "shadow_test_max_drawdown": 7.4,
-                "shadow_test_fee_drag_pct": 0.6,
-                "shadow_test_sharpe_ratio": 0.35,
+            test_metrics={
+                "test_total_return_pct": 3.21,
+                "test_closed_trades": 9.0,
+                "test_max_drawdown": 7.4,
+                "test_fee_drag_pct": 0.6,
+                "test_sharpe_ratio": 0.35,
             },
         )
 

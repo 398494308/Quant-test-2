@@ -25,36 +25,37 @@
 | 项目 | 数值 |
 | --- | --- |
 | 当前角色 | champion |
-| 当前 reference stage 起点轮次 | 1 |
+| 当前 champion hash | e66af6f30f0b4e0610d3ccb68a67545c8ebea67cf6853b3dc2ba961a4d9eefa9 |
+| 当前 reference stage 起点轮次 | 3 |
 | gate | 通过 |
-| score regime（保存态 / 仓库默认） | trend_capture_v11_piecewise_drawdown_penalty / trend_capture_v11_piecewise_drawdown_penalty |
-| quality_score（train连续趋势分） | 1.0474 |
-| promotion_score（保存态） | 0.3845 |
-| capture_score / timed_return_score / turn_protection_score | 0.9145 / 2.1362 / 0.5685 |
-| drawdown_risk_score / drawdown_penalty_score（保存态） | 1.6870 / 0.7744 |
-| train/val连续抓取分 | 1.0474 / 0.7817 |
-| train+val期间收益 | 1069.50% |
-| val期间收益 | 256.71% |
-| train+val多/空捕获 | 0.41 / 0.65 |
-| Sharpe(train+val / val) | 1.38 / 1.71 |
-| hidden test收益 / Sharpe | -37.65% / -1.26 |
+| score regime（保存态 / 仓库默认） | trend_capture_v12_robustness_plateau_penalty / trend_capture_v12_robustness_plateau_penalty |
+| quality_score（train连续趋势分） | 0.8144 |
+| promotion_score（保存态） | 0.7798 |
+| capture_score / timed_return_score / turn_protection_score | 0.6697 / 2.3792 / 0.6744 |
+| drawdown_risk_score / drawdown_penalty_score（保存态） | 1.1593 / 0.2319 |
+| train/val连续抓取分 | 0.8144 / 0.5250 |
+| train+val期间收益 | 1263.42% |
+| val期间收益 | 285.39% |
+| train+val多/空捕获 | 0.32 / 0.28 |
+| Sharpe(train+val / val) | 1.42 / 1.89 |
+| test收益 / Sharpe | -2.64% / 0.33 |
+| train+val交易数量 | 256 |
 
 当前轮次留档除了 `journal` 与 `memory/raw` 外，还额外维护一条最小可复现链路：
 
 - `backups/research_v2_round_artifacts/sources/`：按 `code_hash` 去重保存策略源码
-- `backups/research_v2_round_artifacts/rounds/`：每轮一个目录，只保留策略快照、关键评分、窗口/评分配置，以及数据与引擎指纹
-- 新 champion 轮次会在这份最小归档里额外引用 `champion_history` 和图表路径，但不会把 hidden test 信息回灌给研究 prompt
-| train+val交易数量 | 415 |
+- `backups/research_v2_round_artifacts/rounds/`：每轮一个目录，保留策略快照、关键评分、`test` 关键指标、`test` 异步状态，以及窗口/评分配置和数据/引擎指纹
+- 新 champion 轮次会在这份最小归档里额外引用 `champion_history` 和图表路径；`test` 结果只做留档，不会回灌给研究 prompt
 
 说明：
 
-- 上表按当前 [state/research_macd_aggressive_v2_best.json](../state/research_macd_aggressive_v2_best.json) 的保存态整理，已是 `2026-04-27` 这次重启后的最新快照。
-- 仓库默认评分已经切到 `trend_capture_v11_piecewise_drawdown_penalty`；研究器启动时先从已保存 champion 重算新口径，再继续后续轮次。本次重启后的首轮已正常完成，并刷新出新的 champion。
-- 新口径下 `drawdown_risk_score` 仍是固定窗口 `Ulcer` 风格风险分；`promotion_score` 不再直接使用单一线性扣分，而是额外记录 `drawdown_penalty_score` 作为分段惩罚项。
-- 当前人工方向已经从“继续补多头收益”切到“保护已有收益、减少利润回吐和深回撤”；长期软引导在 [config/research_v2_operator_focus.md](../config/research_v2_operator_focus.md)，当前 champion 人工观察卡已清空，先让新评分自然运行。
+- 上表按当前 [state/research_macd_aggressive_v2_best.json](../state/research_macd_aggressive_v2_best.json) 的最近保存态整理；若你刚切到 `v12` 但还没重启研究器，`promotion_score` 与 `robustness_penalty_score` 会在下一次启动时按新口径重算。
+- 仓库默认评分已经切到 `trend_capture_v12_robustness_plateau_penalty`；研究器启动时会先从已保存 champion 重算新口径，再继续后续轮次。
+- 新口径下 `drawdown_risk_score` 仍是固定窗口 `Ulcer` 风格风险分；`promotion_score` 在分段回撤惩罚之外，又额外接了一层轻量鲁棒性软惩罚。
+- 当前人工方向已经从“继续补多头收益”切到“保护已有收益、减少利润回吐和深回撤”；长期软引导在 [config/research_v2_operator_focus.md](../config/research_v2_operator_focus.md)，当前 champion 人工观察卡在 [config/research_v2_champion_review.md](../config/research_v2_champion_review.md) 中已写回，并且只对当前 hash 生效。
 - `state/research_macd_aggressive_v2_best.json` 里如果还带旧字段，例如 `working_base`，那只是历史兼容读取入口；新状态写回只使用单一 active reference 语义。
 - 若只切换 `score_regime` 后重启，研究器现在会优先从 `backups/strategy_macd_aggressive_v2_best.py` 载入已保存 champion，并按新评分口径重算；不会再误用工作区里的当前候选文件做启动基线。
-- 当前运行状态以 [state/research_macd_aggressive_v2_heartbeat.json](../state/research_macd_aggressive_v2_heartbeat.json) 为准。
+- 当前运行状态以 [state/research_macd_aggressive_v2_heartbeat.json](../state/research_macd_aggressive_v2_heartbeat.json) 为准；本文更新时 heartbeat 显示 `iteration 5`、phase=`model_regenerate_edit_worker`，仍在围绕这版 champion 做后续重生尝试。
 - `real-money-test/` 这条执行壳子现在默认转为 `OKX Demo Trading`：策略必须先冻结为固定副本，`demo` 只认 `OKX_DEMO_*` 凭证，旧 `dry-run` 代码保留但不再默认使用，播报也切到 `demo` 卡口径。
 - 如果你想把 `demo` 账户里的更大余额压到固定测试规模，当前壳子支持通过 `OKX_DEMO_AVAILABLE_CAPITAL` 给 `freqtrade` 注入单 bot 资金上限；例如 `1000` 表示只按 `1000 USDT` 规模运行。
 
@@ -74,7 +75,7 @@
 - 滚动步长：`21` 天
 - `smoke` 窗口数：`5`
 - 主循环等待：`10s`
-- `test`：只在新 champion 后运行，作为只读观察集，不参与晋升
+- `test`：新 champion 同步运行；已完成完整评估但未保留的候选也会后台异步运行，只保留关键指标，不生成图片，也不参与晋升
 - provider 恢复等待：`90s`
 
 ## 评分与晋升
@@ -95,10 +96,12 @@
   `train/val` 固定窗口回撤风险分按 `5:5` 平均后的原始风险指标；窗口内用 `Ulcer` 风格回撤深度与持续时间衡量利润回吐压力
 - `drawdown_penalty_score`
   由 `drawdown_risk_score` 映射出的分段惩罚项；先做基础扣分，超过拐点后按更陡斜率追加扣分
+- `robustness_penalty_score`
+  轻量鲁棒性软惩罚，只看 `train/val` 落差、`val` 分块稳定性，以及退出参数邻域在 `val` 3 段上的平台形态；总扣分封顶 `0.25`
 - `turn_protection_score`
   `train/val` 趋势掉头窗口保护分按 `5:5` 平均后的诊断分，不再直接进入晋级主公式
 - `promotion_score`
-  最终晋级分。以 `capture_score` 为主，加少量 `timed_return_score`，再减去 `drawdown_penalty_score`
+  最终晋级分。以 `capture_score` 为主，加少量 `timed_return_score`，再减去 `drawdown_penalty_score` 与 `robustness_penalty_score`
 
 当前默认公式：
 
@@ -112,11 +115,13 @@
 
 `drawdown_penalty_score = 0.20 * drawdown_risk_score + 1.00 * max(drawdown_risk_score - 1.25, 0.0)`
 
-`promotion_score = 0.80 * capture_score + 0.20 * timed_return_score - drawdown_penalty_score`
+`promotion_score = 0.80 * capture_score + 0.20 * timed_return_score - drawdown_penalty_score - robustness_penalty_score`
 
 `drawdown_risk_score` 直接复用现有 `train/val` 日收益路径，不新增回测。两侧都按固定 `28` 天窗口滚动切分，再对每个窗口计算 `Ulcer` 风格回撤值，最后用 `median + P75` 的加权聚合成风险分。这样 `train` 的滚动窗口路径和 `val` 的整年路径会落到同一时间单位上比较，也不会被一次单日极端点完全主导。
 
 `drawdown_penalty_score` 在此基础上再做一层分段映射：低于 `1.25` 时只按基础权重扣分，超过 `1.25` 后每增加一单位风险都按更陡斜率继续扣分。目的不是把所有回撤都打死，而是显著压低“收益爆炸但回撤也很深”的候选，让研究器更偏向收益仍强、但利润回吐更可控的方案。
+
+`robustness_penalty_score` 不引入新的硬 gate。它只作为软降权层，主要压低三类“看起来能赢、但泛化味道差”的候选：`train/val` 落差偏大、`val` 内部分块明显不稳、以及退出参数只在一个很尖的邻域点上有效。若本轮没有触发退出参数平台观察，则 `plateau` 相关部分记为 `0`。
 
 `turn_protection_score` 仍复用现有主要趋势段，只在相邻趋势方向反转时切掉头保护窗口，衡量窗口内策略权益从运行高点到后续低点的最大回吐。它现在保留给诊断和人工复盘，不再直接进入晋级主公式。
 
@@ -124,7 +129,9 @@
 
 - 先过 `gate`
 - 再满足 `promotion_score` 高于当前 active reference
-- 只有刷新 champion 时才额外跑隐藏 `test`
+- 刷新 champion 时会同步跑 `test`
+- 已完成完整评估但未保留的候选也会后台异步补跑 `test`
+- reject / duplicate_skipped 的 `test` 结果只进 round artifact、通知和人工观察，不参与 prompt、不参与晋升
 
 `test` 只做验收，不参与 prompt，不参与当前轮次调参。
 
@@ -187,12 +194,13 @@
 4. reviewer system prompt
 5. edit / repair / summary 各自的 system prompt
 6. planner runtime prompt
-7. `config/research_v2_champion_review.md`
-8. `wiki/reviewer_summary_card.md`
-9. `wiki/direction_board.md`
-10. `wiki/latest_history_package.md`
-11. `wiki/failure_wiki.md`
-12. `wiki/duplicate_watchlist.md`
+7. `config/research_v2_operator_focus.md`
+8. `config/research_v2_champion_review.md`
+9. `wiki/reviewer_summary_card.md`
+10. `wiki/direction_board.md`
+11. `wiki/latest_history_package.md`
+12. `wiki/failure_wiki.md`
+13. `wiki/duplicate_watchlist.md`
 
 其中第 6 层现在只保留精简前台记忆：
 

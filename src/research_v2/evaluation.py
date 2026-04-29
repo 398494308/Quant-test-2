@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from statistics import median
-from typing import Any
+from typing import Any, Mapping
 
 from research_v2.config import GateConfig, ScoringConfig
 
@@ -20,6 +20,7 @@ class EvaluationReport:
     gate_reason: str
     summary_text: str
     prompt_summary_text: str
+    artifacts: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -97,6 +98,7 @@ class ValidationBlockReport:
     mean_score: float
     std_score: float
     min_score: float
+    tail_score: float
     fail_count: int
     used_block_count: int
 
@@ -841,6 +843,175 @@ def _promotion_drawdown_penalty(drawdown_risk_score: float, scoring: ScoringConf
     return base_penalty + excess_penalty
 
 
+def _upper_band_penalty(
+    value: float,
+    *,
+    warn_threshold: float,
+    fail_threshold: float,
+    warn_penalty: float,
+    fail_penalty: float,
+) -> float:
+    candidate = max(0.0, float(value))
+    if candidate <= float(warn_threshold):
+        return 0.0
+    if candidate <= float(fail_threshold):
+        return max(0.0, float(warn_penalty))
+    return max(0.0, float(fail_penalty))
+
+
+def _lower_band_penalty(
+    value: float,
+    *,
+    warn_threshold: float,
+    fail_threshold: float,
+    warn_penalty: float,
+    fail_penalty: float,
+) -> float:
+    candidate = float(value)
+    if candidate >= float(warn_threshold):
+        return 0.0
+    if candidate >= float(fail_threshold):
+        return max(0.0, float(warn_penalty))
+    return max(0.0, float(fail_penalty))
+
+
+def _plateau_penalty_payload(
+    plateau_probe: Mapping[str, Any] | None,
+    scoring: ScoringConfig,
+) -> dict[str, float]:
+    payload = dict(plateau_probe or {}) if isinstance(plateau_probe, Mapping) else {}
+    enabled = bool(payload.get("enabled"))
+    if not enabled:
+        return {
+            "enabled": 0.0,
+            "current_value": 0.0,
+            "best_value": 0.0,
+            "center_period_score": 0.0,
+            "best_period_score": 0.0,
+            "center_gap": 0.0,
+            "score_span": 0.0,
+            "drawdown_span": 0.0,
+            "current_is_best": 0.0,
+            "penalty_score": 0.0,
+        }
+
+    center_gap = max(0.0, float(payload.get("center_gap", 0.0) or 0.0))
+    score_span = max(0.0, float(payload.get("score_span", 0.0) or 0.0))
+    drawdown_span = max(0.0, float(payload.get("drawdown_span", 0.0) or 0.0))
+    current_is_best = bool(payload.get("current_is_best"))
+
+    penalty_score = _upper_band_penalty(
+        center_gap,
+        warn_threshold=scoring.robustness_plateau_center_gap_warn_threshold,
+        fail_threshold=scoring.robustness_plateau_center_gap_fail_threshold,
+        warn_penalty=scoring.robustness_plateau_center_gap_warn_penalty,
+        fail_penalty=scoring.robustness_plateau_center_gap_fail_penalty,
+    )
+    if score_span > float(scoring.robustness_plateau_score_span_threshold):
+        penalty_score += max(0.0, float(scoring.robustness_plateau_extra_penalty))
+    if drawdown_span > float(scoring.robustness_plateau_drawdown_span_threshold):
+        penalty_score += max(0.0, float(scoring.robustness_plateau_extra_penalty))
+    if (not current_is_best) and center_gap > float(scoring.robustness_plateau_center_gap_warn_threshold):
+        penalty_score += max(0.0, float(scoring.robustness_plateau_extra_penalty))
+
+    return {
+        "enabled": 1.0,
+        "current_value": float(payload.get("current_value", 0.0) or 0.0),
+        "best_value": float(payload.get("best_value", 0.0) or 0.0),
+        "center_period_score": float(payload.get("center_period_score", 0.0) or 0.0),
+        "best_period_score": float(payload.get("best_period_score", 0.0) or 0.0),
+        "center_gap": center_gap,
+        "score_span": score_span,
+        "drawdown_span": drawdown_span,
+        "current_is_best": 1.0 if current_is_best else 0.0,
+        "penalty_score": penalty_score,
+    }
+
+
+def _robustness_penalty_payload(
+    *,
+    promotion_gap: float,
+    block_report: ValidationBlockReport,
+    scoring: ScoringConfig,
+    plateau_probe: Mapping[str, Any] | None = None,
+) -> dict[str, float]:
+    positive_gap = max(0.0, float(promotion_gap))
+    blocks_enabled = int(block_report.used_block_count) >= 2
+    tail_gap = (
+        max(0.0, float(block_report.mean_score) - float(block_report.tail_score))
+        if blocks_enabled
+        else 0.0
+    )
+    plateau_payload = _plateau_penalty_payload(plateau_probe, scoring)
+
+    gap_penalty_score = _upper_band_penalty(
+        positive_gap,
+        warn_threshold=scoring.robustness_gap_warn_threshold,
+        fail_threshold=scoring.robustness_gap_fail_threshold,
+        warn_penalty=scoring.robustness_gap_warn_penalty,
+        fail_penalty=scoring.robustness_gap_fail_penalty,
+    )
+    block_std_penalty_score = 0.0
+    block_floor_penalty_score = 0.0
+    block_tail_penalty_score = 0.0
+    block_fail_penalty_score = 0.0
+    if blocks_enabled:
+        block_std_penalty_score = _upper_band_penalty(
+            float(block_report.std_score),
+            warn_threshold=scoring.robustness_block_std_warn_threshold,
+            fail_threshold=scoring.robustness_block_std_fail_threshold,
+            warn_penalty=scoring.robustness_block_std_warn_penalty,
+            fail_penalty=scoring.robustness_block_std_fail_penalty,
+        )
+        block_floor_penalty_score = _lower_band_penalty(
+            float(block_report.min_score),
+            warn_threshold=scoring.robustness_block_floor_warn_threshold,
+            fail_threshold=scoring.robustness_block_floor_fail_threshold,
+            warn_penalty=scoring.robustness_block_floor_warn_penalty,
+            fail_penalty=scoring.robustness_block_floor_fail_penalty,
+        )
+        block_tail_penalty_score = _upper_band_penalty(
+            tail_gap,
+            warn_threshold=scoring.robustness_block_tail_warn_threshold,
+            fail_threshold=scoring.robustness_block_tail_fail_threshold,
+            warn_penalty=scoring.robustness_block_tail_warn_penalty,
+            fail_penalty=scoring.robustness_block_tail_fail_penalty,
+        )
+        block_fail_penalty_score = max(0.0, float(scoring.robustness_block_fail_penalty_per_block)) * min(
+            int(scoring.robustness_block_fail_penalty_cap_count),
+            max(0, int(block_report.fail_count)),
+        )
+    raw_penalty_score = (
+        gap_penalty_score
+        + block_std_penalty_score
+        + block_floor_penalty_score
+        + block_tail_penalty_score
+        + block_fail_penalty_score
+        + plateau_payload["penalty_score"]
+    )
+    penalty_score = min(max(0.0, float(scoring.robustness_penalty_cap)), raw_penalty_score)
+    return {
+        "validation_block_tail_gap": tail_gap,
+        "gap_penalty_score": gap_penalty_score,
+        "block_std_penalty_score": block_std_penalty_score,
+        "block_floor_penalty_score": block_floor_penalty_score,
+        "block_tail_penalty_score": block_tail_penalty_score,
+        "block_fail_penalty_score": block_fail_penalty_score,
+        "plateau_penalty_score": plateau_payload["penalty_score"],
+        "robustness_penalty_score_raw": raw_penalty_score,
+        "robustness_penalty_score": penalty_score,
+        "plateau_probe_enabled": plateau_payload["enabled"],
+        "plateau_current_value": plateau_payload["current_value"],
+        "plateau_best_value": plateau_payload["best_value"],
+        "plateau_center_period_score": plateau_payload["center_period_score"],
+        "plateau_best_period_score": plateau_payload["best_period_score"],
+        "plateau_center_gap": plateau_payload["center_gap"],
+        "plateau_score_span": plateau_payload["score_span"],
+        "plateau_drawdown_span": plateau_payload["drawdown_span"],
+        "plateau_current_is_best": plateau_payload["current_is_best"],
+    }
+
+
 def _trend_score_report(points: list[dict[str, Any]]) -> TrendScoreReport:
     if len(points) < 6:
         return TrendScoreReport(
@@ -1153,6 +1324,7 @@ def _validation_block_report(
             mean_score=fallback_score,
             std_score=0.0,
             min_score=fallback_score,
+            tail_score=fallback_score,
             fail_count=1 if fallback_score < 0.0 else 0,
             used_block_count=0,
         )
@@ -1164,6 +1336,7 @@ def _validation_block_report(
             mean_score=fallback_score,
             std_score=0.0,
             min_score=fallback_score,
+            tail_score=fallback_score,
             fail_count=1 if fallback_score < 0.0 else 0,
             used_block_count=0,
         )
@@ -1186,6 +1359,7 @@ def _validation_block_report(
             mean_score=fallback_score,
             std_score=0.0,
             min_score=fallback_score,
+            tail_score=fallback_score,
             fail_count=1 if fallback_score < 0.0 else 0,
             used_block_count=0,
         )
@@ -1195,6 +1369,7 @@ def _validation_block_report(
         mean_score=_mean(block_scores),
         std_score=_std(block_scores),
         min_score=min(block_scores),
+        tail_score=block_scores[-1],
         fail_count=sum(1 for score in block_scores if score < 0.0),
         used_block_count=len(block_scores),
     )
@@ -1218,6 +1393,10 @@ def _period_score(trend_report: TrendScoreReport) -> float:
     return 0.70 * trend_report.trend_score + 0.30 * trend_report.return_score
 
 
+def period_score_from_result(result: dict[str, Any] | None) -> float:
+    return _period_score(_trend_report_from_result(result))
+
+
 def _trade_side_counts(result: dict[str, Any] | None) -> tuple[int, int]:
     trades = list((result or {}).get("trades_detail", []))
     long_count = 0
@@ -1236,7 +1415,7 @@ def _validation_weakest_axis(
     block_report: ValidationBlockReport,
 ) -> str:
     if block_report.used_block_count >= 2 and block_report.block_scores:
-        tail_score = float(block_report.block_scores[-1])
+        tail_score = float(block_report.tail_score)
         if tail_score < block_report.mean_score - 0.15:
             return "val后半段明显偏弱"
 
@@ -1251,31 +1430,49 @@ def _validation_weakest_axis(
     return f"val短板={weakest_label}"
 
 
-def summarize_hidden_test_result(result: dict[str, Any] | None) -> dict[str, float]:
+def normalize_test_metrics_payload(metrics: Mapping[str, Any] | None) -> dict[str, float]:
+    if not isinstance(metrics, Mapping):
+        return {}
+    normalized: dict[str, float] = {}
+    for raw_key, raw_value in metrics.items():
+        key = str(raw_key).strip()
+        if not key:
+            continue
+        if key.startswith("shadow_test_"):
+            key = f"test_{key[len('shadow_test_'):]}"
+        if not key.startswith("test_"):
+            continue
+        try:
+            normalized[key] = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+    return normalized
+
+
+def summarize_test_result(result: dict[str, Any] | None) -> dict[str, float]:
     trend_report = _trend_report_from_result(result)
     long_trades, short_trades = _trade_side_counts(result)
     daily_returns = [float(value) for value in (result or {}).get("daily_returns", [])]
     return {
-        "shadow_test_score": _period_score(trend_report),
-        "shadow_test_trend_capture_score": trend_report.trend_score,
-        "shadow_test_return_score": trend_report.return_score,
-        "shadow_test_arrival_score": trend_report.arrival_score,
-        "shadow_test_escort_score": trend_report.escort_score,
-        "shadow_test_turn_score": trend_report.turn_score,
-        "shadow_test_bull_capture_score": trend_report.bull_score,
-        "shadow_test_bear_capture_score": trend_report.bear_score,
-        "shadow_test_hit_rate": trend_report.hit_rate,
-        "shadow_test_segment_count": float(trend_report.segment_count),
-        "shadow_test_path_return_pct": trend_report.path_return_pct,
-        "shadow_test_total_return_pct": float((result or {}).get("return", 0.0)),
-        "shadow_test_max_drawdown": float((result or {}).get("max_drawdown", 0.0)),
-        "shadow_test_fee_drag_pct": float((result or {}).get("fee_drag_pct", 0.0)),
-        "shadow_test_sharpe_ratio": _annualized_sharpe(daily_returns),
-        "shadow_test_closed_trades": float((result or {}).get("trades", long_trades + short_trades)),
-        "shadow_test_long_closed_trades": float(long_trades),
-        "shadow_test_short_closed_trades": float(short_trades),
+        "test_score": _period_score(trend_report),
+        "test_trend_capture_score": trend_report.trend_score,
+        "test_return_score": trend_report.return_score,
+        "test_arrival_score": trend_report.arrival_score,
+        "test_escort_score": trend_report.escort_score,
+        "test_turn_score": trend_report.turn_score,
+        "test_bull_capture_score": trend_report.bull_score,
+        "test_bear_capture_score": trend_report.bear_score,
+        "test_hit_rate": trend_report.hit_rate,
+        "test_segment_count": float(trend_report.segment_count),
+        "test_path_return_pct": trend_report.path_return_pct,
+        "test_total_return_pct": float((result or {}).get("return", 0.0)),
+        "test_max_drawdown": float((result or {}).get("max_drawdown", 0.0)),
+        "test_fee_drag_pct": float((result or {}).get("fee_drag_pct", 0.0)),
+        "test_sharpe_ratio": _annualized_sharpe(daily_returns),
+        "test_closed_trades": float((result or {}).get("trades", long_trades + short_trades)),
+        "test_long_closed_trades": float(long_trades),
+        "test_short_closed_trades": float(short_trades),
     }
-
 
 # ==================== 总分计算 ====================
 

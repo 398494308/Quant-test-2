@@ -296,7 +296,7 @@ def build_strategy_research_prompt(
     reference_metrics: dict[str, Any] | None = None,
     benchmark_label: str = "champion",
     current_base_role: str = "champion",
-    score_regime: str = "trend_capture_v11_piecewise_drawdown_penalty",
+    score_regime: str = "trend_capture_v12_robustness_plateau_penalty",
     current_complexity_headroom_text: str = "",
     session_mode: str = "resume",
     operator_focus_text: str = "",
@@ -361,7 +361,8 @@ def build_strategy_research_prompt(
 - 围绕一个可证伪假设，先产出一个简洁 round brief，交给后续 edit worker 落码。
 - 本轮目标是改变真实交易路径，不是只制造源码 diff；若后续落码后的 smoke 行为完全不变，会被系统按 `behavioral_noop` 拒收。
 - 当前评分口径是 `{score_regime}`；只要 `gate` 通过，且 `promotion_score` 高于当前 {benchmark_label}，候选就有资格刷新当前 active reference。
-- `promotion_score` 现在以 `train/val` 连续趋势抓取分 `5:5` 为主，加少量按日收益路径年化分，再减去分段回撤惩罚；回撤先按固定窗口风险做基础扣分，超过拐点后按更陡斜率继续加罚；`test` 只做只读观察，不参与晋升。
+- `promotion_score` 现在以连续趋势抓取主分与按日收益年化补分权重 `8:2` 为主体，再减去分段回撤惩罚和轻量鲁棒性软惩罚；鲁棒性只看 `train/val` 落差、`val` 分块稳定性，以及退出参数邻域在 `val` 3 段上的平台形态。
+- `test` 只做只读观察，不参与晋升，也不能作为下一轮 prompt 的证据源。
 - `train` 滚动窗口均值/中位数、`val` 分块稳定性和过拟合集中度仍保留为 gate/诊断，但不再是 `promotion_score` 主公式的一部分。
 
 当前 active reference 角色：`{current_base_role}`
@@ -420,7 +421,7 @@ def build_strategy_research_prompt(
 - 这份 round brief 只是 `draft`；主进程还会交给 `reviewer` 审稿。若 reviewer 打回，本轮必须先吸收其反馈再重写，不允许绕过审稿直接进入落码。
 - `primary_direction` 必须是你本轮主动施力的主方向，不要把所有联动改动都往里塞。
 - `change_plan` 必须具体到你希望 worker 改哪条规则块、阈值或最终放行链。
-- 如果本轮主要改 `EXIT_PARAMS` 里的连续数值，可以用 `exit_range_scan` 给一个 3 点小范围；扫描只用于轻量预筛，最终仍只保留一个完整候选。
+- 如果本轮主要改 `EXIT_PARAMS` 里的连续数值，可以用 `exit_range_scan` 给一个 3 点小范围；扫描只用于轻量预筛，最终仍只保留一个完整候选。系统会在 full eval 后额外做一次只读 `plateau_probe`，只看 `val` 3 段平台，不会自动改代码。
 - `novelty_proof` 不是自我辩护。{_novelty_proof_rule()}
 - 不允许把“未执行代码改动”“blocked”“no_edit”“no_change”这类占位回复当成完成。
 - 如果辅助记忆缺失，就直接基于当前源码做单假设判断，不要停在解释阶段。

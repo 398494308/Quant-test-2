@@ -26,19 +26,20 @@ flowchart TB
     K -- 是 --> M[主进程判卷<br/>diff / smoke / behavioral_noop]
     M --> N[可选 exit_range_scan<br/>单参数 3 点轻量预筛]
     N --> O[full eval<br/>train walk-forward + val]
-    O --> P[gate + promotion_score]
-    P --> Q[summary_worker<br/>按真实 diff 回写摘要]
-    Q --> R{刷新 champion?}
+    O --> P[可选 plateau_probe<br/>只读观察 val 3 段平台]
+    P --> Q[gate + promotion_score]
+    Q --> R[summary_worker<br/>按真实 diff 回写摘要]
+    R --> S{刷新 champion?}
 
-    R -- 否 --> S[写回 journal / wiki<br/>reviewer_summary_card / direction_board]
-    S --> E
+    S -- 否 --> T[写回 journal / wiki<br/>reviewer_summary_card / direction_board]
+    T --> E
 
-    R -- 是 --> T[更新 best/champion/策略快照]
-    T --> U[只读 test 验收<br/>2026-01-01 到 2026-04-20]
-    U --> V[生成图表 / Discord 播报 / champion_history 归档]
-    V --> W[重置 stage 和 planner session]
-    W --> X[旧 champion_review 自动失效<br/>除非人工更新 hash]
-    X --> E
+    S -- 是 --> U[更新 best/champion/策略快照]
+    U --> V[只读 test 验收<br/>2026-01-01 到 2026-04-20]
+    V --> W[生成图表 / Discord 播报 / champion_history 归档]
+    W --> X[重置 stage 和 planner session]
+    X --> Y[旧 champion_review 自动失效<br/>除非人工更新 hash]
+    Y --> E
 ```
 
 ## 核心原则
@@ -47,7 +48,7 @@ flowchart TB
 - `planner` 负责想方向，不直接写代码；`reviewer` 负责拦坏方向，不替 planner 发明方向。
 - `edit_worker` 只把 reviewer 放行后的方向落到 `src/strategy_macd_aggressive.py`。
 - 主进程负责判卷，不负责想策略。
-- `test` 只在新 champion 后运行，只做只读验收，不参与晋升，也不进入普通调参循环。
+- `test` 对新 champion 同步运行；对已完成完整评估但未保留的候选会后台异步补跑，只做只读留档，不参与晋升，也不进入普通调参循环。
 - 人工卡都是软引导，不是硬 gate；当前 champion 人工观察卡必须 hash 命中才会给 planner 看。
 
 ## 当前数据与评分口径
@@ -55,12 +56,14 @@ flowchart TB
 - 标的：`BTC-USDT-SWAP`，策略按 `20x` 合约研究。
 - 事实层：`15m`；`1h / 4h` 由 `15m` 聚合，只做确认层。
 - 执行层：优先使用 `1m` 回测成交。
-- 评分口径：`trend_capture_v11_piecewise_drawdown_penalty`。
+- 评分口径：`trend_capture_v12_robustness_plateau_penalty`。
 - `train`：`2023-07-01` 到 `2024-12-31`。
 - `val`：`2025-01-01` 到 `2025-12-31`。
 - `test`：`2026-01-01` 到 `2026-04-20`。
 - 晋升条件：先过 `gate`，再要求 `promotion_score` 高于当前 active reference。
-- `promotion_score` 以 `train/val` 连续趋势抓取分 `5:5` 为主，加少量按日收益路径年化分，再减去分段回撤惩罚：回撤先按固定窗口风险做基础扣分，超过拐点后按更陡斜率追加扣分。
+- `promotion_score` 以连续趋势抓取主分与按日收益年化补分 `8:2` 为主体，再减去分段回撤惩罚和轻量鲁棒性软惩罚。
+- 鲁棒性软惩罚只看 `train/val` 落差、`val` 分块稳定性，以及退出参数邻域在 `val` 3 段上的平台形态。
+- `test` 只做只读观察；reject / duplicate_skipped 的异步 `test` 只进留档，不进 prompt、不进晋升。
 
 ## 每一轮怎么跑
 
@@ -73,10 +76,11 @@ flowchart TB
 7. 若出现 no-edit、语法错误、缺 helper、校验失败等技术问题，`repair_worker` 只修技术错误。
 8. 主进程检查真实 diff、重复源码、smoke 行为和关键漏斗变化。
 9. 如果 brief 指定单个连续型 `EXIT_PARAMS` 的 `exit_range_scan`，主进程最多扫 3 个值，只做轻量预筛。
-10. 主进程跑完整 `train walk-forward + val`，并执行 gate 与 promotion 判断。
-11. `summary_worker` 按最终真实 diff 回写候选摘要。
-12. 没有刷新 champion：写回 `journal / wiki / reviewer_summary_card / direction_board`，进入下一轮。
-13. 刷新 champion：更新策略快照，只在此时跑 `test`，生成图表和 Discord 播报，归档 `champion_history`，然后重置 stage 与 planner session。
+10. 主进程跑完整 `train walk-forward + val`；若本轮动了允许观察的退出参数，再额外做一次只读 `plateau_probe`，只看 `val` 3 段平台，不改代码、不改基底。
+11. 主进程执行 gate 与 promotion 判断。
+12. `summary_worker` 按最终真实 diff 回写候选摘要。
+13. 没有刷新 champion：写回 `journal / wiki / reviewer_summary_card / direction_board`；若该轮已完成 full eval，则后台异步补跑 `test` 关键指标留档，然后进入下一轮。
+14. 刷新 champion：更新策略快照，同步跑 `test`，生成图表和 Discord 播报，归档 `champion_history`，然后重置 stage 与 planner session。
 
 ## 各角色职责
 
@@ -185,7 +189,7 @@ python3 scripts/download_aggressive_data.py
 - `backups/strategy_macd_aggressive_v2_champion.py`：当前 champion 策略快照，仅保留在本机运行环境。
 - `backups/strategy_macd_aggressive_v2_candidate.py`：运行中的候选快照，不应随手提交。
 - `backups/champion_history/`：每次新 champion 的独立归档。
-- `backups/research_v2_round_artifacts/`：每轮最小可复现归档；源码按 `code_hash` 去重，accepted 轮次会额外引用 champion 图表/快照。
+- `backups/research_v2_round_artifacts/`：每轮最小可复现归档；源码按 `code_hash` 去重，accepted 轮次会额外引用 champion 图表/快照；rejected full eval 轮次会异步补写 `test` 关键指标。
 - `reports/research_v2_charts/`：selection / validation 图表。
 - `logs/macd_aggressive_research_v2.log`：主日志。
 - `logs/macd_aggressive_research_v2_model_calls.jsonl`：模型调用日志。

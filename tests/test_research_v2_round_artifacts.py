@@ -7,7 +7,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from research_v2.round_artifacts import persist_round_artifact
+from research_v2.round_artifacts import (
+    load_round_artifact_metadata,
+    persist_round_artifact,
+    update_round_artifact_test_payload,
+)
 from research_v2.strategy_code import source_hash
 
 
@@ -139,13 +143,13 @@ class RoundArtifactsTest(unittest.TestCase):
                 scoring={},
                 data_fingerprints={},
                 engine_fingerprints={},
-                shadow_test_metrics={"shadow_test_score": 0.91},
+                test_metrics={"test_score": 0.91},
                 champion_snapshot_dir=champion_snapshot_dir,
                 chart_paths={"validation_chart": chart_path},
             )
 
             metadata = json.loads((round_dir / "metadata.json").read_text())
-            self.assertEqual(metadata["shadow_test_metrics"]["shadow_test_score"], 0.91)
+            self.assertEqual(metadata["test_metrics"]["test_score"], 0.91)
             self.assertEqual(
                 metadata["champion_artifacts"]["snapshot_dir"],
                 "backups/champion_history/snapshot_a",
@@ -154,6 +158,64 @@ class RoundArtifactsTest(unittest.TestCase):
                 metadata["champion_artifacts"]["validation_chart"],
                 "reports/research_v2_charts/validation.png",
             )
+
+    def test_load_round_artifact_metadata_normalizes_legacy_test_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            round_dir = Path(tmpdir) / "round"
+            round_dir.mkdir(parents=True, exist_ok=True)
+            (round_dir / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "iteration": 7,
+                        "candidate_id": "cand_legacy",
+                        "shadow_test_metrics": {
+                            "shadow_test_score": 0.42,
+                            "shadow_test_sharpe_ratio": 1.11,
+                        },
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+            metadata = load_round_artifact_metadata(round_dir)
+            self.assertEqual(metadata["test_metrics"]["test_score"], 0.42)
+            self.assertEqual(metadata["test_metrics"]["test_sharpe_ratio"], 1.11)
+            self.assertNotIn("shadow_test_metrics", metadata)
+
+    def test_update_round_artifact_test_payload_writes_test_status(self) -> None:
+        strategy_source = "def strategy():\n    return 'ok'\n"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            artifacts_root = repo_root / "backups/research_v2_round_artifacts"
+            round_dir = persist_round_artifact(
+                artifacts_root,
+                repo_root=repo_root,
+                entry=self._entry(iteration=5, timestamp="2026-04-28T00:05:00+00:00", candidate_id="cand_e"),
+                strategy_source=strategy_source,
+                windows={},
+                gates={},
+                scoring={},
+                data_fingerprints={},
+                engine_fingerprints={},
+            )
+
+            update_round_artifact_test_payload(
+                round_dir,
+                test_metrics={"test_score": 0.55, "test_sharpe_ratio": 0.88},
+                test_evaluation={
+                    "status": "completed",
+                    "mode": "rejected_async",
+                    "queued_at": "2026-04-28T00:05:01+00:00",
+                    "completed_at": "2026-04-28T00:05:09+00:00",
+                },
+            )
+
+            metadata = load_round_artifact_metadata(round_dir)
+            self.assertEqual(metadata["test_metrics"]["test_score"], 0.55)
+            self.assertEqual(metadata["test_metrics"]["test_sharpe_ratio"], 0.88)
+            self.assertEqual(metadata["test_evaluation"]["status"], "completed")
+            self.assertEqual(metadata["test_evaluation"]["mode"], "rejected_async")
 
 
 if __name__ == "__main__":

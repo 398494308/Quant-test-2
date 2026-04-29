@@ -119,10 +119,23 @@ def summarize_evaluation_impl(
     capture_drop = train_capture_score - validation_capture_score
     promotion_gap = capture_drop
     overfit_report = mod._overfit_risk_report(selection_trend_report, capture_drop)
+    plateau_probe_payload = (
+        dict(_kwargs.get("plateau_probe"))
+        if isinstance(_kwargs.get("plateau_probe"), dict)
+        else {}
+    )
+    robustness_penalty_payload = mod._robustness_penalty_payload(
+        promotion_gap=promotion_gap,
+        block_report=validation_block_report,
+        scoring=scoring,
+        plateau_probe=plateau_probe_payload,
+    )
+    robustness_penalty_score = robustness_penalty_payload["robustness_penalty_score"]
     promotion_score = (
         scoring.promotion_capture_weight * capture_score
         + scoring.promotion_timed_return_weight * timed_return_score
         - drawdown_penalty_score
+        - robustness_penalty_score
     )
     validation_long_trades, validation_short_trades = mod._trade_side_counts(validation_source)
     selection_long_trades, selection_short_trades = mod._trade_side_counts(selection_source)
@@ -232,15 +245,28 @@ def summarize_evaluation_impl(
         mod._format_funnel_line("val连续漏斗(short)", validation_funnel_counts["short"]),
         f"val短板: {validation_weakest_axis}",
         (
-            "val分块门控分(均值/std/最差/负分块): "
+            "val分块门控分(均值/std/最差/尾块/尾块gap/负分块): "
             f"{validation_block_report.mean_score:.2f} / "
             f"{validation_block_report.std_score:.2f} / "
             f"{validation_block_report.min_score:.2f} / "
+            f"{validation_block_report.tail_score:.2f} / "
+            f"{robustness_penalty_payload['validation_block_tail_gap']:.2f} / "
             f"{validation_block_report.fail_count}"
             + (
                 f" (分块数={validation_block_report.used_block_count})"
                 if validation_block_report.used_block_count > 0 else " (未启用)"
             )
+        ),
+        (
+            "鲁棒性软惩罚(gap/std/floor/tail/fail/plateau/raw/cap后): "
+            f"{robustness_penalty_payload['gap_penalty_score']:.2f} / "
+            f"{robustness_penalty_payload['block_std_penalty_score']:.2f} / "
+            f"{robustness_penalty_payload['block_floor_penalty_score']:.2f} / "
+            f"{robustness_penalty_payload['block_tail_penalty_score']:.2f} / "
+            f"{robustness_penalty_payload['block_fail_penalty_score']:.2f} / "
+            f"{robustness_penalty_payload['plateau_penalty_score']:.2f} / "
+            f"{robustness_penalty_payload['robustness_penalty_score_raw']:.2f} / "
+            f"{robustness_penalty_score:.2f}"
         ),
         (
             "train+val集中度诊断: "
@@ -269,6 +295,17 @@ def summarize_evaluation_impl(
         "窗口明细:",
         *mod._build_window_lines(results, include_validation=True),
     ]
+    if plateau_probe_payload.get("enabled"):
+        summary_lines.append(
+            "val平台观察(只读): "
+            f"{plateau_probe_payload.get('param', '-')} current={robustness_penalty_payload['plateau_current_value']:.4f}, "
+            f"best={robustness_penalty_payload['plateau_best_value']:.4f}, "
+            f"center={robustness_penalty_payload['plateau_center_period_score']:.2f}, "
+            f"best_score={robustness_penalty_payload['plateau_best_period_score']:.2f}, "
+            f"gap={robustness_penalty_payload['plateau_center_gap']:.2f}, "
+            f"score_span={robustness_penalty_payload['plateau_score_span']:.2f}, "
+            f"dd_span={robustness_penalty_payload['plateau_drawdown_span']:.2f}"
+        )
     if low_activity_payload["lines"]:
         summary_lines.extend(["", *low_activity_payload["lines"]])
     if weakest_signals:
@@ -282,6 +319,7 @@ def summarize_evaluation_impl(
             f"- 当前基底: 质量分(train连续趋势分)={quality_score:.2f}，晋级分={promotion_score:.2f}，"
             f"抓取主分={capture_score:.2f}，收益补充分={timed_return_score:.2f}，"
             f"回撤风险分={drawdown_risk_score:.2f}，回撤罚分={drawdown_penalty_score:.2f}，"
+            f"鲁棒性软惩罚={robustness_penalty_score:.2f}，"
             f"gate={gate_reason}"
         ),
         f"- 当前主短板: {validation_weakest_axis}",
@@ -308,7 +346,7 @@ def summarize_evaluation_impl(
             f"- 当前评分组成: train/val 连续趋势抓取={train_capture_score:.2f}/{validation_capture_score:.2f}，"
             f"train/val 按日收益年化分={train_timed_return_score:.2f}/{validation_timed_return_score:.2f}，"
             f"train/val 固定窗口回撤风险分={train_drawdown_risk_score:.2f}/{validation_drawdown_risk_score:.2f}，"
-            f"回撤罚分={drawdown_penalty_score:.2f}"
+            f"回撤罚分={drawdown_penalty_score:.2f}，鲁棒性软惩罚={robustness_penalty_score:.2f}"
         ),
         (
             f"- train+val 状态: 趋势分/收益分={selection_trend_report.trend_score:.2f}/"
@@ -322,7 +360,8 @@ def summarize_evaluation_impl(
             f"窗口 Ulcer(train/val blended)="
             f"{train_drawdown_risk_report.blended_ulcer_pct:.2f}/{validation_drawdown_risk_report.blended_ulcer_pct:.2f}%，"
             f"手续费拖累={avg_fee_drag:.2f}%，"
-            f"train/val 抓取分差={promotion_gap:.2f}"
+            f"train/val 抓取分差={promotion_gap:.2f}，"
+            f"val尾块gap={robustness_penalty_payload['validation_block_tail_gap']:.2f}"
         ),
         (
             f"- 集中度诊断: {overfit_report.risk_level}({overfit_report.risk_score:.0f})，"
@@ -331,6 +370,15 @@ def summarize_evaluation_impl(
             f"处置={mod.overfit_reference_action(overfit_report.risk_score, overfit_report.hard_fail)}"
         ),
     ]
+    if plateau_probe_payload.get("enabled"):
+        prompt_lines.append(
+            f"- val平台观察: {plateau_probe_payload.get('param', '-')} "
+            f"center/best={robustness_penalty_payload['plateau_center_period_score']:.2f}/"
+            f"{robustness_penalty_payload['plateau_best_period_score']:.2f}，"
+            f"gap={robustness_penalty_payload['plateau_center_gap']:.2f}，"
+            f"score_span={robustness_penalty_payload['plateau_score_span']:.2f}，"
+            f"dd_span={robustness_penalty_payload['plateau_drawdown_span']:.2f}"
+        )
     if low_activity_payload["prompt_line"]:
         prompt_lines.append(low_activity_payload["prompt_line"])
     if weakest_signals:
@@ -452,8 +500,27 @@ def summarize_evaluation_impl(
         "validation_block_score_mean": validation_block_report.mean_score,
         "validation_block_score_std": validation_block_report.std_score,
         "validation_block_score_min": validation_block_report.min_score,
+        "validation_block_tail_score": validation_block_report.tail_score,
+        "validation_block_tail_gap": robustness_penalty_payload["validation_block_tail_gap"],
         "validation_block_fail_count": float(validation_block_report.fail_count),
         "validation_block_count_used": float(validation_block_report.used_block_count),
+        "gap_penalty_score": robustness_penalty_payload["gap_penalty_score"],
+        "block_std_penalty_score": robustness_penalty_payload["block_std_penalty_score"],
+        "block_floor_penalty_score": robustness_penalty_payload["block_floor_penalty_score"],
+        "block_tail_penalty_score": robustness_penalty_payload["block_tail_penalty_score"],
+        "block_fail_penalty_score": robustness_penalty_payload["block_fail_penalty_score"],
+        "plateau_penalty_score": robustness_penalty_payload["plateau_penalty_score"],
+        "robustness_penalty_score_raw": robustness_penalty_payload["robustness_penalty_score_raw"],
+        "robustness_penalty_score": robustness_penalty_score,
+        "plateau_probe_enabled": robustness_penalty_payload["plateau_probe_enabled"],
+        "plateau_current_value": robustness_penalty_payload["plateau_current_value"],
+        "plateau_best_value": robustness_penalty_payload["plateau_best_value"],
+        "plateau_center_period_score": robustness_penalty_payload["plateau_center_period_score"],
+        "plateau_best_period_score": robustness_penalty_payload["plateau_best_period_score"],
+        "plateau_center_gap": robustness_penalty_payload["plateau_center_gap"],
+        "plateau_score_span": robustness_penalty_payload["plateau_score_span"],
+        "plateau_drawdown_span": robustness_penalty_payload["plateau_drawdown_span"],
+        "plateau_current_is_best": robustness_penalty_payload["plateau_current_is_best"],
         "overfit_risk_score": overfit_report.risk_score,
         "overfit_top1_positive_share": overfit_report.top1_positive_share,
         "overfit_chain_positive_share": overfit_report.max_chain_positive_share,
@@ -477,4 +544,7 @@ def summarize_evaluation_impl(
         gate_reason=gate_reason,
         summary_text="\n".join(summary_lines),
         prompt_summary_text="\n".join(prompt_lines),
+        artifacts={
+            "plateau_probe": plateau_probe_payload,
+        },
     )

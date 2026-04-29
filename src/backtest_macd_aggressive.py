@@ -774,12 +774,13 @@ def _refresh_stop_after_resize(position, market_state, exit_p, leverage):
 def _update_protective_stops(position, exit_p, leverage):
     side = _position_side(position)
     break_even_activation_pct = float(_exit_value(exit_p, position, "break_even_activation_pct"))
+    break_even_buffer_pct = float(_exit_value(exit_p, position, "break_even_buffer_pct"))
     if position["peak_pnl_pct"] >= break_even_activation_pct:
         if side == "short":
-            breakeven_price = position["entry_price"] * (1.0 - float(exit_p["break_even_buffer_pct"]) / 100.0)
+            breakeven_price = position["entry_price"] * (1.0 - break_even_buffer_pct / 100.0)
             position["stop_price"] = min(position["stop_price"], breakeven_price)
         else:
-            breakeven_price = position["entry_price"] * (1.0 + float(exit_p["break_even_buffer_pct"]) / 100.0)
+            breakeven_price = position["entry_price"] * (1.0 + break_even_buffer_pct / 100.0)
             position["stop_price"] = max(position["stop_price"], breakeven_price)
 
     trailing_activation_pct = float(_exit_value(exit_p, position, "trailing_activation_pct"))

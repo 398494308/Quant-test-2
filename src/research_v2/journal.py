@@ -273,6 +273,24 @@ def _strategy_relevant_entries(entries: list[dict[str, Any]]) -> list[dict[str, 
     return [entry for entry in entries if not _entry_is_technical_generation_invalid(entry)]
 
 
+def _strip_test_observation_fields(value: Any) -> Any:
+    if isinstance(value, dict):
+        cleaned: dict[str, Any] = {}
+        for raw_key, raw_value in value.items():
+            key = str(raw_key).strip()
+            if key in {"test_metrics", "test_evaluation", "shadow_test_metrics"}:
+                continue
+            if key.startswith("test_") or key.startswith("shadow_test_"):
+                continue
+            cleaned[key] = _strip_test_observation_fields(raw_value)
+        return cleaned
+    if isinstance(value, list):
+        return [_strip_test_observation_fields(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_strip_test_observation_fields(item) for item in value)
+    return value
+
+
 def _round_result_basin_value(value: Any, *, digits: int = RESULT_BASIN_ROUND_DIGITS) -> float:
     return round(_score_value(value), digits)
 
@@ -2969,6 +2987,16 @@ def _write_prompt_memory_snapshots(
     summary_text: str,
 ) -> None:
     paths = _memory_archive_paths(memory_root)
+    sanitized_all_entries = [
+        _strip_test_observation_fields(entry)
+        for entry in all_entries
+    ]
+    sanitized_current_stage_entries = [
+        _strip_test_observation_fields(entry)
+        for entry in current_stage_entries
+    ]
+    sanitized_past_stage_summaries = _strip_test_observation_fields(past_stage_summaries)
+    sanitized_all_time_tables = _strip_test_observation_fields(all_time_tables)
     for key in (
         "current_stage",
         "past_stages",
@@ -2985,30 +3013,30 @@ def _write_prompt_memory_snapshots(
         json.dumps(
             {
                 "stage_meta": current_stage_meta,
-                "entries": current_stage_entries,
+                "entries": sanitized_current_stage_entries,
             },
             ensure_ascii=False,
             indent=2,
         )
     )
-    paths["past_stages"].write_text(json.dumps(past_stage_summaries, ensure_ascii=False, indent=2))
-    paths["all_time_tables"].write_text(json.dumps(all_time_tables, ensure_ascii=False, indent=2))
+    paths["past_stages"].write_text(json.dumps(sanitized_past_stage_summaries, ensure_ascii=False, indent=2))
+    paths["all_time_tables"].write_text(json.dumps(sanitized_all_time_tables, ensure_ascii=False, indent=2))
     paths["latest_prompt"].write_text(summary_text)
     failure_wiki_payload = build_failure_wiki_payload(
-        all_entries,
+        sanitized_all_entries,
         score_regime=str(current_stage_meta.get("score_regime", "")).strip(),
-        current_stage_entries=current_stage_entries,
+        current_stage_entries=sanitized_current_stage_entries,
     )
     paths["failure_wiki_json"].write_text(json.dumps(failure_wiki_payload, ensure_ascii=False, indent=2))
     paths["failure_wiki_md"].write_text(format_failure_wiki_markdown(failure_wiki_payload))
     paths["duplicate_watchlist_md"].write_text(
         format_duplicate_watchlist_markdown(
-            all_entries,
+            sanitized_all_entries,
             score_regime=str(current_stage_meta.get("score_regime", "")).strip(),
         )
     )
     direction_board_payload = build_direction_board_payload(
-        all_entries,
+        sanitized_all_entries,
         score_regime=str(current_stage_meta.get("score_regime", "")).strip(),
         active_reference_code_hash=str(current_stage_meta.get("active_reference_code_hash", "")).strip(),
     )

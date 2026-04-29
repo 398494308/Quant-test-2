@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from research_v2.charting import PerformanceChartPaths
-from research_v2.evaluation import EvaluationReport
+from research_v2.evaluation import EvaluationReport, normalize_test_metrics_payload
 from research_v2.strategy_code import StrategyCandidate, source_hash, write_strategy_source
 
 
@@ -35,7 +35,7 @@ def archive_champion_snapshot(
     candidate: StrategyCandidate,
     source: str,
     report: EvaluationReport,
-    shadow_test_metrics: dict[str, float] | None = None,
+    test_metrics: dict[str, float] | None = None,
     chart_paths: PerformanceChartPaths | None = None,
 ) -> Path:
     code_hash = source_hash(source)
@@ -75,7 +75,7 @@ def archive_champion_snapshot(
         "gate_reason": report.gate_reason,
         "validation_chart": validation_chart_name,
         "selection_chart": selection_chart_name,
-        "shadow_test_metrics": dict(shadow_test_metrics or {}),
+        "test_metrics": normalize_test_metrics_payload(test_metrics),
     }
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2))
     return snapshot_dir

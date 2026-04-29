@@ -710,8 +710,6 @@ def _flow_signal_metrics(market_state, hourly, fourh, params, side):
 
 def _flow_entry_ok(market_state, hourly, fourh, params, side=None, strong=False):
     entry_side = side if side in {"long", "short"} else "short"
-    if entry_side == "long":
-        return True
     return _flow_confirmation_ok(market_state, hourly, fourh, params, entry_side, strong=strong)
 
 
@@ -1444,6 +1442,7 @@ def _long_durable_hold_active(market_state):
 def long_outer_context_ok(context, market_state, params):
     long_state = _build_long_trend_state(context, market_state, params)
     context["long_outer_lane"] = ""
+    fourh_quality_score = _fourh_trend_quality_long_score(market_state, params)
     reclaim_ready = (
         context["current"]["close"] > market_state["ema_fast"] > market_state["ema_slow"]
         and market_state["macd_line"] > market_state["signal_line"]
@@ -1461,9 +1460,14 @@ def long_outer_context_ok(context, market_state, params):
     context["long_reclaim_ready"] = reclaim_ready
     intraday_support_ready = long_state["intraday_bull"] or reclaim_ready
     hourly_support_ready = long_state["hourly_bull"] or long_state["hourly_neutral"]
+    fourh_not_bear = not (
+        context["fourh"]["close"] < context["fourh"]["ema_slow"]
+        and context["fourh"]["trend_spread_pct"] < 0.0
+        and context["fourh"]["ema_slow_slope_pct"] < 0.0
+    )
     fourh_context_ready = (
-        long_state["fourh_bull_base"]
-        and _fourh_trend_quality_long_score(market_state, params) > 0.5
+        fourh_not_bear
+        and fourh_quality_score > 0.5
     )
     base_ownership_ready = intraday_support_ready and fourh_context_ready
     hourly_repair_ready = (

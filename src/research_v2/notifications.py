@@ -9,7 +9,7 @@ from pathlib import Path
 
 import requests
 
-from research_v2.evaluation import EvaluationReport
+from research_v2.evaluation import EvaluationReport, normalize_test_metrics_payload
 from research_v2.strategy_code import StrategyCandidate
 
 
@@ -239,10 +239,11 @@ def build_discord_summary_message(
     validation_window_count: int,
     test_window_count: int = 0,
     data_range_text: str | None = None,
-    shadow_test_metrics: dict[str, float] | None = None,
+    test_metrics: dict[str, float] | None = None,
     candidate: StrategyCandidate | None = None,
 ) -> str:
     metrics = report.metrics
+    normalized_test_metrics = normalize_test_metrics_payload(test_metrics)
     selection_return_pct = float(metrics.get("selection_total_return_pct", metrics.get("full_period_return_pct", 0.0)))
     validation_return_pct = float(metrics.get("validation_total_return_pct", metrics.get("validation_avg_return", 0.0)))
     selection_trade_count = int(metrics.get("selection_closed_trades", metrics.get("total_trades", 0.0)))
@@ -250,20 +251,21 @@ def build_discord_summary_message(
     if validation_window_count > 0:
         window_text += f" / val连续 {validation_window_count} 个"
     if test_window_count > 0:
-        window_text += " / test连续 1 个" if shadow_test_metrics is not None else " / test 仅新 champion 时运行"
+        window_text += " / test连续 1 个" if normalized_test_metrics else " / test 仅新 champion 时运行"
     rows = [
         ("数据范围", data_range_text or "-"),
         ("本轮窗口", window_text),
         ("train+val期间收益", f"{selection_return_pct:.2f}%"),
         ("val期间收益", f"{validation_return_pct:.2f}%" if validation_window_count > 0 else "-"),
+        ("晋级分/鲁棒性软惩罚", f"{metrics.get('promotion_score', 0.0):.2f} / {metrics.get('robustness_penalty_score', 0.0):.2f}"),
         (
             "Sharpe(train / val / test)",
             (
                 f"{metrics.get('eval_sharpe_ratio', 0.0):.2f} / "
                 f"{metrics.get('validation_sharpe_ratio', 0.0):.2f} / "
-                f"{shadow_test_metrics.get('shadow_test_sharpe_ratio', 0.0):.2f}"
+                f"{normalized_test_metrics.get('test_sharpe_ratio', 0.0):.2f}"
             )
-            if shadow_test_metrics is not None
+            if normalized_test_metrics
             else f"{metrics.get('eval_sharpe_ratio', 0.0):.2f} / {metrics.get('validation_sharpe_ratio', 0.0):.2f} / -"
         ),
         ("train+val交易数量", str(selection_trade_count)),
@@ -279,16 +281,16 @@ def build_discord_summary_message(
             f"{metrics.get('selection_fee_drag_pct', metrics.get('avg_fee_drag', 0.0)):.2f}%"
         ),
     ]
-    if shadow_test_metrics is not None:
+    if normalized_test_metrics:
         rows[4:4] = [
-            ("test期间收益", f"{shadow_test_metrics.get('shadow_test_total_return_pct', 0.0):.2f}%"),
-            ("test交易数量", str(int(shadow_test_metrics.get("shadow_test_closed_trades", 0.0)))),
+            ("test期间收益", f"{normalized_test_metrics.get('test_total_return_pct', 0.0):.2f}%"),
+            ("test交易数量", str(int(normalized_test_metrics.get("test_closed_trades", 0.0)))),
         ]
         rows.append(
             (
                 "test期间回撤/手续费拖累",
-                f"{shadow_test_metrics.get('shadow_test_max_drawdown', 0.0):.2f}% / "
-                f"{shadow_test_metrics.get('shadow_test_fee_drag_pct', 0.0):.2f}%"
+                f"{normalized_test_metrics.get('test_max_drawdown', 0.0):.2f}% / "
+                f"{normalized_test_metrics.get('test_fee_drag_pct', 0.0):.2f}%"
             )
         )
 
@@ -321,6 +323,29 @@ def build_discord_summary_message(
             "Exit Range Scan：",
             "```text",
             _render_markdown_table(scan_rows),
+            "```",
+        ])
+    plateau_result = getattr(candidate, "plateau_probe_result", None) if candidate is not None else None
+    if isinstance(plateau_result, dict) and plateau_result.get("enabled"):
+        plateau_rows = [
+            ("参数", str(plateau_result.get("param", "-"))),
+            ("观察值", " / ".join(str(item) for item in plateau_result.get("values", [])[:5]) or "-"),
+            (
+                "center/best",
+                f"{float(plateau_result.get('center_period_score', 0.0)):.2f} / "
+                f"{float(plateau_result.get('best_period_score', 0.0)):.2f}",
+            ),
+            (
+                "gap/span/dd_span",
+                f"{float(plateau_result.get('center_gap', 0.0)):.2f} / "
+                f"{float(plateau_result.get('score_span', 0.0)):.2f} / "
+                f"{float(plateau_result.get('drawdown_span', 0.0)):.2f}",
+            ),
+        ]
+        parts.extend([
+            "Plateau Probe：",
+            "```text",
+            _render_markdown_table(plateau_rows),
             "```",
         ])
     return "\n".join(parts)

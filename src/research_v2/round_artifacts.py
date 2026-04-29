@@ -10,12 +10,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping
 
+from research_v2.evaluation import normalize_test_metrics_payload
 from research_v2.strategy_code import source_hash, write_strategy_source
 
 
 ROUND_STRATEGY_FILE_NAME = "strategy_macd_aggressive.py"
 ROUND_METADATA_FILE_NAME = "metadata.json"
-ROUND_ARTIFACT_SCHEMA_VERSION = 1
+ROUND_ARTIFACT_SCHEMA_VERSION = 2
 
 
 def _safe_slug(text: Any, *, default: str) -> str:
@@ -49,6 +50,66 @@ def _copy_jsonable_mapping(mapping: Mapping[str, Any] | None) -> dict[str, Any]:
     if not mapping:
         return {}
     return json.loads(json.dumps(dict(mapping), ensure_ascii=False, default=str))
+
+
+def _metadata_path(round_dir: Path) -> Path:
+    return round_dir / ROUND_METADATA_FILE_NAME
+
+
+def load_round_artifact_metadata(round_dir: Path) -> dict[str, Any]:
+    metadata_path = _metadata_path(round_dir)
+    if not metadata_path.exists():
+        return {}
+    try:
+        payload = json.loads(metadata_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    test_metrics = normalize_test_metrics_payload(
+        payload.get("test_metrics") or payload.get("shadow_test_metrics")
+    )
+    payload["test_metrics"] = test_metrics
+    payload.pop("shadow_test_metrics", None)
+    payload["test_evaluation"] = _copy_jsonable_mapping(payload.get("test_evaluation"))
+    payload["plateau_probe"] = _copy_jsonable_mapping(payload.get("plateau_probe"))
+    return payload
+
+
+def write_round_artifact_metadata(round_dir: Path, metadata: Mapping[str, Any]) -> Path:
+    metadata_path = _metadata_path(round_dir)
+    payload = _copy_jsonable_mapping(metadata)
+    payload["schema_version"] = max(
+        ROUND_ARTIFACT_SCHEMA_VERSION,
+        int(payload.get("schema_version", 0) or 0),
+    )
+    payload["test_metrics"] = normalize_test_metrics_payload(
+        payload.get("test_metrics") if isinstance(payload, Mapping) else None
+    )
+    payload.pop("shadow_test_metrics", None)
+    payload["test_evaluation"] = _copy_jsonable_mapping(payload.get("test_evaluation"))
+    payload["plateau_probe"] = _copy_jsonable_mapping(payload.get("plateau_probe"))
+    temp_path = metadata_path.with_suffix(".json.tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+    temp_path.replace(metadata_path)
+    return metadata_path
+
+
+def update_round_artifact_test_payload(
+    round_dir: Path,
+    *,
+    test_metrics: Mapping[str, Any] | None = None,
+    test_evaluation: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    metadata = load_round_artifact_metadata(round_dir)
+    if not metadata:
+        raise FileNotFoundError(f"missing round artifact metadata: {round_dir}")
+    if test_metrics is not None:
+        metadata["test_metrics"] = normalize_test_metrics_payload(test_metrics)
+    if test_evaluation is not None:
+        metadata["test_evaluation"] = _copy_jsonable_mapping(test_evaluation)
+    write_round_artifact_metadata(round_dir, metadata)
+    return metadata
 
 
 def _source_pool_path(artifacts_root: Path, code_hash: str) -> Path:
@@ -135,7 +196,8 @@ def persist_round_artifact(
     scoring: Mapping[str, Any],
     data_fingerprints: Mapping[str, Any],
     engine_fingerprints: Mapping[str, Any],
-    shadow_test_metrics: Mapping[str, Any] | None = None,
+    test_metrics: Mapping[str, Any] | None = None,
+    test_evaluation: Mapping[str, Any] | None = None,
     champion_snapshot_dir: Path | None = None,
     chart_paths: Mapping[str, Path | None] | None = None,
 ) -> Path:
@@ -213,7 +275,9 @@ def persist_round_artifact(
         },
         "score_components": score_components,
         "metrics": metrics_payload,
-        "shadow_test_metrics": _copy_jsonable_mapping(shadow_test_metrics),
+        "test_metrics": normalize_test_metrics_payload(test_metrics),
+        "test_evaluation": _copy_jsonable_mapping(test_evaluation),
+        "plateau_probe": _copy_jsonable_mapping(entry.get("plateau_probe")),
         "evaluation_context": {
             "windows": _copy_jsonable_mapping(windows),
             "gates": _copy_jsonable_mapping(gates),
@@ -229,6 +293,5 @@ def persist_round_artifact(
             chart_paths=chart_paths,
         ),
     }
-    metadata_path = round_dir / ROUND_METADATA_FILE_NAME
-    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2))
+    write_round_artifact_metadata(round_dir, metadata)
     return round_dir

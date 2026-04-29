@@ -23,7 +23,10 @@ def build_journal_prompt_summary_impl(
     reference_metrics: dict[str, Any] | None = None,
     memory_root: Path | None = None,
 ) -> str:
-    all_entries = list(entries)
+    all_entries = [
+        mod._strip_test_observation_fields(entry)
+        for entry in entries
+    ]
     active_score_regime = current_score_regime or mod._latest_score_regime(all_entries)
     if current_iteration <= 0:
         current_iteration = max(
