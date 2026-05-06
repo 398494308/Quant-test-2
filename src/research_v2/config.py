@@ -62,6 +62,7 @@ def _load_scoring_config(windows: "WindowConfig") -> "ScoringConfig":
         promotion_capture_weight=_env_float("MACD_V2_PROMOTION_CAPTURE_WEIGHT", 0.45),
         promotion_timed_return_weight=_env_float("MACD_V2_PROMOTION_TIMED_RETURN_WEIGHT", 0.30),
         promotion_sharpe_floor_weight=_env_float("MACD_V2_PROMOTION_SHARPE_FLOOR_WEIGHT", 0.25),
+        promotion_trade_activity_weight=_env_float("MACD_V2_PROMOTION_TRADE_ACTIVITY_WEIGHT", 0.10),
         promotion_drawdown_base_weight=_env_float("MACD_V2_PROMOTION_DRAWDOWN_BASE_WEIGHT", 0.20),
         promotion_drawdown_knee=_env_float("MACD_V2_PROMOTION_DRAWDOWN_KNEE", 1.25),
         promotion_drawdown_excess_weight=_env_float("MACD_V2_PROMOTION_DRAWDOWN_EXCESS_WEIGHT", 1.00),
@@ -154,7 +155,7 @@ class GateConfig:
     min_validation_bull_capture: float
     min_validation_bear_capture: float
     max_fee_drag_pct: float
-    min_validation_closed_trades: int
+    min_validation_closed_trades: int = 0
     validation_block_count: int = 3
     min_validation_block_floor: float = -0.20
     max_validation_block_failures: int = 1
@@ -165,6 +166,7 @@ class ScoringConfig:
     promotion_capture_weight: float = 0.45
     promotion_timed_return_weight: float = 0.30
     promotion_sharpe_floor_weight: float = 0.25
+    promotion_trade_activity_weight: float = 0.10
     promotion_drawdown_base_weight: float = 0.20
     promotion_drawdown_knee: float = 1.25
     promotion_drawdown_excess_weight: float = 1.00
@@ -287,7 +289,7 @@ def load_research_runtime_config(repo_root: Path) -> ResearchRuntimeConfig:
         min_validation_bull_capture=_env_float("MACD_V2_MIN_VALIDATION_BULL_CAPTURE", 0.00),
         min_validation_bear_capture=_env_float("MACD_V2_MIN_VALIDATION_BEAR_CAPTURE", 0.00),
         max_fee_drag_pct=_env_float("MACD_V2_MAX_FEE_DRAG_PCT", 11.5),
-        min_validation_closed_trades=_env_int("MACD_V2_MIN_VALIDATION_CLOSED_TRADES", 180),
+        min_validation_closed_trades=_env_int("MACD_V2_MIN_VALIDATION_CLOSED_TRADES", 0),
         validation_block_count=_env_int("MACD_V2_VALIDATION_BLOCK_COUNT", 3),
         min_validation_block_floor=_env_float("MACD_V2_MIN_VALIDATION_BLOCK_FLOOR", -0.35),
         max_validation_block_failures=_env_int("MACD_V2_MAX_VALIDATION_BLOCK_FAILURES", 1),

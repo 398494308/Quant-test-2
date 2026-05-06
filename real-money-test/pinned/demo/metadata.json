@@ -1,9 +1,9 @@
 {
   "mode": "demo",
-  "pinned_at": "2026-04-28T12:30:29.482441+08:00",
-  "source_path": "backups/strategy_macd_aggressive_v2_champion.py",
-  "source_name": "strategy_macd_aggressive_v2_champion.py",
-  "code_sha256": "7b8cca02dbf9ca0219853788d41192490597eace860612c03af696d6bdf64814",
-  "code_hash_short": "7b8cca02dbf9",
+  "pinned_at": "2026-05-04T13:11:22.268636+08:00",
+  "source_path": "backups/research_v2_round_artifacts/rounds/20260501T151704Z_i0046_bootstrap_s74_long_stop_confirm_delay_rejected_391d8a98732a/strategy_macd_aggressive.py",
+  "source_name": "strategy_macd_aggressive.py",
+  "code_sha256": "391d8a98732a840f38487763e5971903fd914ccfb7bad4d8fa4c6fc38dc046d6",
+  "code_hash_short": "391d8a98732a",
   "target_path": "real-money-test/pinned/demo/strategy_macd_aggressive.py"
 }

@@ -20,11 +20,12 @@ class ResearchRuntimeConfigTest(unittest.TestCase):
             config_dir.mkdir(parents=True, exist_ok=True)
             (config_dir / "research_v2.env").write_text(
                 "\n".join(
-                    [
-                        "MACD_V2_MIN_VALIDATION_CLOSED_TRADES=192",
+                        [
+                        "MACD_V2_MIN_VALIDATION_CLOSED_TRADES=0",
                         "MACD_V2_PROMOTION_CAPTURE_WEIGHT=0.45",
                         "MACD_V2_PROMOTION_TIMED_RETURN_WEIGHT=0.30",
                         "MACD_V2_PROMOTION_SHARPE_FLOOR_WEIGHT=0.25",
+                        "MACD_V2_PROMOTION_TRADE_ACTIVITY_WEIGHT=0.10",
                         "MACD_V2_ROBUSTNESS_PENALTY_CAP=0.31",
                         "MACD_V2_ROBUSTNESS_GAP_WARN_THRESHOLD=0.17",
                         "MACD_V2_ROBUSTNESS_GAP_FAIL_THRESHOLD=0.23",
@@ -50,10 +51,11 @@ class ResearchRuntimeConfigTest(unittest.TestCase):
             with mock.patch.dict(os.environ, {}, clear=True):
                 runtime = load_research_runtime_config(repo_root)
 
-            self.assertEqual(runtime.gates.min_validation_closed_trades, 192)
+            self.assertEqual(runtime.gates.min_validation_closed_trades, 0)
             self.assertAlmostEqual(runtime.scoring.promotion_capture_weight, 0.45)
             self.assertAlmostEqual(runtime.scoring.promotion_timed_return_weight, 0.30)
             self.assertAlmostEqual(runtime.scoring.promotion_sharpe_floor_weight, 0.25)
+            self.assertAlmostEqual(runtime.scoring.promotion_trade_activity_weight, 0.10)
             self.assertAlmostEqual(runtime.scoring.robustness_penalty_cap, 0.31)
             self.assertAlmostEqual(runtime.scoring.robustness_gap_warn_threshold, 0.17)
             self.assertAlmostEqual(runtime.scoring.robustness_gap_fail_threshold, 0.23)

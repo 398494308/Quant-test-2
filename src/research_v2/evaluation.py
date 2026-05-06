@@ -451,30 +451,30 @@ def _low_activity_signal_payload(
     selection_counts: dict[str, dict[str, int]],
     validation_closed_trades: int,
     selection_closed_trades: int,
-    min_validation_closed_trades: int = 180,
+    min_validation_closed_trades: int = 0,
 ) -> dict[str, Any]:
     _ = (
         validation_counts,
         selection_counts,
         selection_closed_trades,
     )
-    trade_floor = max(1, int(min_validation_closed_trades))
-    if validation_closed_trades > 0 and validation_closed_trades < trade_floor:
-        return {
-            "count": 1,
-            "lines": [
-                "val交易笔数偏少"
-                f"（{validation_closed_trades}/{trade_floor}），当前方向更像低频段而不是你要的中频运行态"
-            ],
-            "prompt_line": "",
-            "tags": ("low_validation_trades",),
-        }
     return {
         "count": 0,
         "lines": [],
         "prompt_line": "",
         "tags": (),
     }
+
+
+def _trade_activity_score(actual: int, target: int) -> float:
+    diff = abs(int(actual) - int(target))
+    if diff <= 50:
+        return 1.0
+    if diff <= 100:
+        return 0.67
+    if diff <= 150:
+        return 0.33
+    return 0.0
 
 
 # ==================== 趋势切段评分 ====================

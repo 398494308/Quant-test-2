@@ -149,17 +149,25 @@ def summarize_evaluation_impl(
     )
     train_val_sharpe_floor = robustness_penalty_payload["train_val_sharpe_floor"]
     sharpe_floor_score = mod._clamp(train_val_sharpe_floor / 2.0, 0.0, 1.0)
-    promotion_score = (
-        scoring.promotion_capture_weight * capture_score
-        + scoring.promotion_timed_return_weight * timed_return_score
-        + scoring.promotion_sharpe_floor_weight * sharpe_floor_score
-        - drawdown_penalty_score
-        - robustness_penalty_score
-    )
     validation_long_trades, validation_short_trades = mod._trade_side_counts(validation_source)
     selection_long_trades, selection_short_trades = mod._trade_side_counts(selection_source)
     validation_closed_trades = int(validation_source.get("trades", validation_long_trades + validation_short_trades))
     selection_closed_trades = int(selection_source.get("trades", selection_long_trades + selection_short_trades))
+    train_closed_trades = max(0, selection_closed_trades - validation_closed_trades)
+    train_trade_activity_score = mod._trade_activity_score(train_closed_trades, 300)
+    validation_trade_activity_score = mod._trade_activity_score(validation_closed_trades, 150)
+    trade_activity_score = (
+        mod.TRAIN_VAL_SCORE_WEIGHT * train_trade_activity_score
+        + mod.TRAIN_VAL_SCORE_WEIGHT * validation_trade_activity_score
+    )
+    promotion_score = (
+        scoring.promotion_capture_weight * capture_score
+        + scoring.promotion_timed_return_weight * timed_return_score
+        + scoring.promotion_sharpe_floor_weight * sharpe_floor_score
+        + scoring.promotion_trade_activity_weight * trade_activity_score
+        - drawdown_penalty_score
+        - robustness_penalty_score
+    )
     eval_funnel_counts = mod._aggregate_funnel_counts(results, "eval")
     validation_funnel_counts = mod._result_funnel_counts(validation_source)
     selection_funnel_counts = mod._result_funnel_counts(selection_source)
@@ -193,10 +201,6 @@ def summarize_evaluation_impl(
         gate_reasons.append(f"val空头捕获偏低({validation_trend_report.bear_score:.2f})")
     if avg_fee_drag > gates.max_fee_drag_pct:
         gate_reasons.append(f"手续费拖累过高({avg_fee_drag:.2f}%)")
-    if validation_closed_trades < gates.min_validation_closed_trades:
-        gate_reasons.append(
-            f"val交易笔数偏少({validation_closed_trades}/{gates.min_validation_closed_trades})"
-        )
     if validation_block_report.used_block_count >= 2:
         if validation_block_report.min_score < gates.min_validation_block_floor:
             gate_reasons.append(
@@ -234,6 +238,10 @@ def summarize_evaluation_impl(
             "train/val按日收益年化分 / 收益补充分 / 固定窗口回撤风险分 / 回撤罚分 / 晋级分: "
             f"{train_timed_return_score:.2f} / {validation_timed_return_score:.2f} / "
             f"{timed_return_score:.2f} / {drawdown_risk_score:.2f} / {drawdown_penalty_score:.2f} / {promotion_score:.2f}"
+        ),
+        (
+            "train/val交易活跃度分 / 混合分: "
+            f"{train_trade_activity_score:.2f} / {validation_trade_activity_score:.2f} / {trade_activity_score:.2f}"
         ),
         f"train/val Sharpe floor / 归一化分: {train_val_sharpe_floor:.2f} / {sharpe_floor_score:.2f}",
         (
@@ -317,7 +325,7 @@ def summarize_evaluation_impl(
         f"train 4h唯一路径点 / 重叠点 / 被覆盖点: {eval_path.unique_points} / {eval_path.overlap_points} / {eval_path.dropped_points}",
         f"funding覆盖(train均值 / val / train+val): {eval_funding_coverage:.0%} / {validation_funding_coverage:.0%} / {selection_funding_coverage:.0%}",
         f"最大回撤 / 手续费拖累: {worst_drawdown:.2f}% / {avg_fee_drag:.2f}%",
-        f"总交易 / train交易 / val交易 / 爆仓: {total_trades} / {eval_trades} / {validation_trades} / {liquidations}",
+        f"train+val连续交易 / train连续交易 / val连续交易 / 爆仓: {selection_closed_trades} / {train_closed_trades} / {validation_closed_trades} / {liquidations}",
         f"质量分(train连续趋势分) / 晋级分: {quality_score:.2f} / {promotion_score:.2f}",
         f"Gate: {gate_reason}",
         "",
@@ -374,6 +382,7 @@ def summarize_evaluation_impl(
         (
             f"- 当前评分组成: train/val 连续趋势抓取混合分={train_capture_score:.2f}/{validation_capture_score:.2f}，"
             f"train/val 按日收益年化分={train_timed_return_score:.2f}/{validation_timed_return_score:.2f}，"
+            f"train/val 交易活跃度分={train_trade_activity_score:.2f}/{validation_trade_activity_score:.2f}，混合分={trade_activity_score:.2f}，"
             f"Sharpe floor归一化分={sharpe_floor_score:.2f}，"
             f"train/val 固定窗口回撤风险分={train_drawdown_risk_score:.2f}/{validation_drawdown_risk_score:.2f}，"
             f"回撤罚分={drawdown_penalty_score:.2f}，鲁棒性软惩罚={robustness_penalty_score:.2f}"
@@ -516,6 +525,10 @@ def summarize_evaluation_impl(
         "validation_bear_segment_count": float(validation_trend_report.bear_segment_count),
         "validation_long_closed_trades": float(validation_long_trades),
         "validation_short_closed_trades": float(validation_short_trades),
+        "train_closed_trades": float(train_closed_trades),
+        "train_trade_activity_score": train_trade_activity_score,
+        "validation_trade_activity_score": validation_trade_activity_score,
+        "trade_activity_score": trade_activity_score,
         "selection_long_closed_trades": float(selection_long_trades),
         "selection_short_closed_trades": float(selection_short_trades),
         "validation_closed_trades": float(validation_closed_trades),

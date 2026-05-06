@@ -402,7 +402,7 @@ def build_strategy_research_prompt(
     promotion_accept_quality_drop_margin: float = 0.03,
     validation_block_count: int = 4,
     min_validation_block_floor: float = 0.05,
-    min_validation_closed_trades: int = 180,
+    min_validation_closed_trades: int = 0,
     max_dev_validation_gap: float = 0.30,
     robustness_sharpe_gap_warn_threshold: float = 0.15,
     robustness_sharpe_gap_fail_threshold: float = 0.30,
@@ -454,7 +454,7 @@ def build_strategy_research_prompt(
 - 围绕一个可证伪假设先写 round brief，交给后续 edit worker 落码。
 - 本轮目标是改变真实交易路径，不是只制造源码 diff；若 smoke 行为完全不变，会被系统按 `behavioral_noop` 拒收。
 - 当前评分口径是 `{score_regime}`；只要 `gate` 通过，且 `promotion_score` 达到当前 {benchmark_label} 之上的最小晋级边际，候选才有资格刷新当前 active reference。
-- `promotion_score` 现在以 `capture_score / timed_return_score / Sharpe floor score = 0.45 / 0.30 / 0.25` 为主体；其中 `timed_return_score` 仍是按日收益年化补分，再减去分段回撤惩罚和轻量鲁棒性软惩罚。
+- `promotion_score` 现在以 `capture_score / timed_return_score / Sharpe floor score / trade_activity_score = 0.45 / 0.30 / 0.25 / 0.10` 为主体；其中 `trade_activity_score` 的目标是 `train≈300`、`val≈150`，偏离越远分越低，`timed_return_score` 仍是按日收益年化补分，再减去分段回撤惩罚和轻量鲁棒性软惩罚。
 - `capture_score` 不再只偏向少数最大趋势段；`train/val` 连续趋势抓取分采用“段等权均分 50% + 原权重均分 50%”的混合方式。
 - 鲁棒性重点看 `train/val` 抓取落差、`train/val` Sharpe 平衡、`val` 分块稳定性，以及退出参数邻域在 `val` 分段上的平台形态。
 - `train` 滚动窗口均值/中位数、过拟合集中度仍保留为 gate/诊断，但不再是 `promotion_score` 主公式的一部分。
@@ -488,7 +488,7 @@ def build_strategy_research_prompt(
 当前口径的 gate / 评分提醒：
 - val 趋势段命中率 >= 35%
 - val 趋势捕获分 >= 0.05
-- val 年内平仓数 >= {min_validation_closed_trades}（当前目标约每月 15 笔）
+- 交易活跃度已并入主评分：train 目标约 300 笔，val 目标约 150 笔，越接近越好；不再作为硬 gate
 - train 与 val 分数落差 <= {max_dev_validation_gap:.2f}
 - val 多头捕获 >= 0.00，val 空头捕获 >= 0.00
 - val 会再切成 {validation_block_count} 个连续时间分块：最差分块 >= {min_validation_block_floor:.2f}，负分块最多 1 个

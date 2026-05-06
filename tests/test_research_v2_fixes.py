@@ -550,11 +550,13 @@ class EvaluationFixesTest(unittest.TestCase):
             0.45 * report.metrics["capture_score"]
             + 0.30 * report.metrics["timed_return_score"]
             + 0.25 * report.metrics["sharpe_floor_score"]
+            + 0.10 * report.metrics["trade_activity_score"]
             - expected_drawdown_penalty
             - report.metrics["robustness_penalty_score"]
         )
         self.assertAlmostEqual(report.metrics["drawdown_penalty_score"], expected_drawdown_penalty)
         self.assertAlmostEqual(report.metrics["promotion_score"], expected_promotion_score)
+        self.assertIn("trade_activity_score", report.metrics)
         self.assertGreaterEqual(report.metrics["drawdown_risk_score"], 0.0)
         self.assertEqual(report.metrics["validation_block_count_used"], 0.0)
         self.assertEqual(report.metrics["eval_unique_trend_points"], 15.0)
@@ -735,6 +737,7 @@ class EvaluationFixesTest(unittest.TestCase):
                 0.45 * report.metrics["capture_score"]
                 + 0.30 * report.metrics["timed_return_score"]
                 + 0.25 * report.metrics["sharpe_floor_score"]
+                + 0.10 * report.metrics["trade_activity_score"]
                 - expected_drawdown_penalty
                 - report.metrics["robustness_penalty_score"]
             ),
@@ -1749,12 +1752,12 @@ class JournalPromptFixesTest(unittest.TestCase):
         )
 
         self.assertIn("最小晋级边际", prompt)
-        self.assertIn("0.45 / 0.30 / 0.25", prompt)
+        self.assertIn("0.45 / 0.30 / 0.25 / 0.10", prompt)
         self.assertIn("按日收益年化补分", prompt)
         self.assertIn("Sharpe floor", prompt)
         self.assertIn("分段回撤惩罚", prompt)
         self.assertIn("鲁棒性软惩罚", prompt)
-        self.assertIn("val 年内平仓数 >= 180", prompt)
+        self.assertIn("交易活跃度已并入主评分", prompt)
         self.assertIn("默认优先找更稳的平台", prompt)
         self.assertNotIn("promotion_delta >", prompt)
         self.assertIn("当前回合任务", prompt)

@@ -12,6 +12,9 @@ SIDEWAYS_MAX_HOURLY_ADX = 18.0
 SIDEWAYS_MAX_FOURH_ADX = 16.0
 LONG_PARTIAL_TAKE_PROFIT_PRICE_PCT = 0.05
 LONG_PARTIAL_TAKE_PROFIT_CLOSE_FRACTION = 0.50
+LONG_TRAILING_MULTIPLIER = 1.5
+LONG_EXIT_PROFIT_PROTECT_TRIGGER_MULT = 1.25
+LONG_EXIT_PROFIT_PROTECT_GIVEBACK_MULT = 1.25
 SIDEWAYS_RELEASE_RELAX = {
     "spread_floor_mult": 0.88,
     "slope_floor_mult": 0.90,
@@ -88,19 +91,20 @@ EXIT_PARAMS = {
     "breakout_tp1_close_fraction": 0.16,
     "breakout_tp1_pnl_pct": 80.0,
     "breakout_trailing_activation_pct": 95.0,
-    "breakout_trailing_giveback_pct": 19.4,
-    "dynamic_hold_adx_strong_threshold": 26.0,
-    "dynamic_hold_adx_threshold": 16.0,
+    "breakout_trailing_giveback_pct": 20.0,
+    "dynamic_hold_adx_strong_threshold": 20.0,
+    "dynamic_hold_adx_threshold": 12.5,
     "dynamic_hold_extension_bars": 96,
     "dynamic_hold_max_bars": 384,
     "entry_delay_minutes": 1,
     "execution_use_1m": 1,
     "funding_fee_enabled": 1,
     "leverage": 20,
-    "long_breakout_stop_atr_mult": 5.90,
+    "long_breakout_stop_atr_mult": 7.40,
+    "long_breakout_trailing_giveback_pct": 32.0,
     "long_pullback_break_even_buffer_pct": 0.28,
-    "long_pullback_stop_atr_mult": 5.90,
-    "long_pullback_trailing_giveback_pct": 11.760,
+    "long_pullback_stop_atr_mult": 7.40,
+    "long_pullback_trailing_giveback_pct": 24.0,
     "max_concurrent_positions": 4,
     "max_hold_bars": 288,
     "okx_maker_fee_rate": 0.0002,
@@ -108,31 +112,32 @@ EXIT_PARAMS = {
     "position_fraction": 0.17,
     "position_size_max": 30000,
     "position_size_min": 5000,
-    "pyramid_adx_min": 19.0,
+    "pyramid_adx_min": 17.0,
     "pyramid_enabled": 1,
     "pyramid_max_times": 2,
     "pyramid_size_ratio": 0.28,
-    "pyramid_trigger_pnl": 22.9,
+    "pyramid_trigger_pnl": 4.08,
     "regime_close_below_hourly_fast": 0,
     "regime_exit_confirm_bars": 1,
     "regime_exit_enabled": 1,
     "regime_hist_floor": -110.0,
-    "regime_price_confirm_buffer_pct": 0.012,
+    "regime_price_confirm_buffer_pct": 0.008,
     "short_breakdown_break_even_activation_pct": 25.7,
     "short_breakdown_max_hold_bars": 96,
     "short_breakdown_stop_atr_mult": 2.1,
     "short_breakdown_tp1_close_fraction": 0.22,
     "short_breakdown_tp1_pnl_pct": 31.4,
     "short_breakdown_trailing_activation_pct": 40.0,
-    "short_breakdown_trailing_giveback_pct": 6.2307,
+    "short_breakdown_trailing_giveback_pct": 5.0,
     "slippage_pct": 0.0003,
     "stop_atr_mult": 3.1,
     "stop_max_loss_pct": 75.7,
     "tp1_close_fraction": 0.50,
     "tp1_pnl_pct": 85.0,
+    "take_profit": 0.04,
     "trading_fee_enabled": 1,
     "trailing_activation_pct": 110.4,
-    "trailing_giveback_pct": 13.44,
+    "trailing_giveback_pct": 10.0,
 }
 # EXIT_PARAMS_END
 
@@ -143,6 +148,7 @@ ENTRY_SIGNAL_ALIASES = {
     "long_reaccel": "long_pullback",
     "long_relay": "long_pullback",
     "long_impulse": "long_pullback",
+    "long_reversal_long": "long_pullback",
     "long_reversal_sniper": "long_pullback",
     "long_retest": "long_pullback",
     "short_breakdown": "short_breakdown",
@@ -157,6 +163,7 @@ ENTRY_PATH_TAGS = {
     "long_reaccel": "long_reaccel",
     "long_relay": "long_relay",
     "long_impulse": "long_impulse",
+    "long_reversal_long": "long_reversal_long",
     "long_reversal_sniper": "long_reversal_sniper",
     "long_retest": "long_retest",
     "short_breakdown": "short_impulse",
@@ -170,12 +177,22 @@ ENTRY_PATH_TAGS = {
 FUNNEL_SIDES = ("long", "short")
 FUNNEL_STAGES = ("sideways_pass", "outer_context_pass", "path_pass", "final_veto_pass")
 _FUNNEL_DIAGNOSTICS = {}
+_PENDING_LONG_STOP_BAR = None
+_PENDING_LONG_STOP_PRICE = None
 LONG_PULLBACK_HOLD_TAGS = {"long_retest", "long_reaccel", "long_relay"}
 LONG_PYRAMID_MAX_ADDS = 2
 INTRADAY_BULL_EMA_PERIOD = 50
 INTRADAY_BULL_ADX_MIN = 20.0
 LONG_TIME_EXIT_MIN_HOLD_BARS = 48
 LONG_TIME_EXIT_MAX_PRICE_MOVE_PCT = 0.02
+LONG_TREND_QUALITY_HOURLY_EMA_OFFSET_MULT = 0.84
+ENTRY_ADX_TARGET_PERIOD = 10.0
+ENTRY_ADX_PIVOT = 10.0
+REVERSAL_LONG_FLOW_SCORE_MIN = 0.70
+REVERSAL_LONG_QUALITY_SCORE_MIN = 0.50
+LONG_ROLLOVER_MIN_SCORE_DELTA = 0.12
+LONG_FINAL_VETO_EXTENSION_RELAX_MULT = 1.18
+LONG_FINAL_VETO_DISTANCE_RELAX_MULT = 1.18
 
 
 def _empty_funnel_bucket():
@@ -205,6 +222,73 @@ def get_funnel_diagnostics():
 reset_funnel_diagnostics()
 
 
+def _clear_pending_long_stop():
+    global _PENDING_LONG_STOP_BAR
+    global _PENDING_LONG_STOP_PRICE
+    _PENDING_LONG_STOP_BAR = None
+    _PENDING_LONG_STOP_PRICE = None
+
+
+def _apply_long_stop_confirm_delay(positions, idx, current_bar):
+    global _PENDING_LONG_STOP_BAR
+    global _PENDING_LONG_STOP_PRICE
+    long_positions = [position for position in positions if _position_side(position) == "long"]
+    if not long_positions or current_bar is None:
+        _clear_pending_long_stop()
+        return False
+
+    lead_position = long_positions[0]
+    entry_price = max(float(lead_position.get("entry_price", 0.0)), 0.0)
+    if entry_price <= 0.0:
+        _clear_pending_long_stop()
+        return False
+    disarmed_stop_price = entry_price * 0.01
+    current_stop_price = max(float(lead_position.get("stop_price", 0.0)), 0.0)
+    reference_stop_price = max(float(lead_position.get("_long_stop_reference_price", 0.0)), 0.0)
+    if current_stop_price > max(disarmed_stop_price * 1.5, 1e-9):
+        reference_stop_price = max(reference_stop_price, current_stop_price)
+    elif reference_stop_price <= 0.0:
+        reference_stop_price = current_stop_price
+    lead_position["_long_stop_reference_price"] = reference_stop_price
+
+    peak_pnl_pct = float(lead_position.get("peak_pnl_pct", 0.0))
+    break_even_activation_pct = float(
+        _exit_param_value_for_signal(lead_position.get("entry_signal", ""), "break_even_activation_pct")
+    )
+    trailing_activation_pct = float(
+        _exit_param_value_for_signal(lead_position.get("entry_signal", ""), "trailing_activation_pct")
+    )
+    delay_eligible = (
+        peak_pnl_pct < break_even_activation_pct
+        and peak_pnl_pct < trailing_activation_pct
+    )
+    if not delay_eligible or reference_stop_price <= 0.0 or disarmed_stop_price <= 0.0:
+        lead_position["stop_price"] = max(current_stop_price, reference_stop_price)
+        _clear_pending_long_stop()
+        return False
+
+    if _PENDING_LONG_STOP_BAR is not None:
+        bar_gap = idx - int(_PENDING_LONG_STOP_BAR)
+        pending_stop_price = max(float(_PENDING_LONG_STOP_PRICE or 0.0), reference_stop_price)
+        if bar_gap == 1:
+            if float(current_bar.get("low", 0.0)) <= pending_stop_price:
+                lead_position["stop_price"] = max(current_stop_price, pending_stop_price)
+                return True
+            _clear_pending_long_stop()
+        elif bar_gap > 1:
+            _clear_pending_long_stop()
+
+    if float(current_bar.get("low", 0.0)) <= reference_stop_price:
+        _PENDING_LONG_STOP_BAR = idx
+        _PENDING_LONG_STOP_PRICE = reference_stop_price
+
+    lead_position["stop_price"] = min(
+        current_stop_price if current_stop_price > 0.0 else reference_stop_price,
+        disarmed_stop_price,
+    )
+    return False
+
+
 def normalize_entry_signal(signal, fallback_side=""):
     text = str(signal or "").strip()
     normalized = ENTRY_SIGNAL_ALIASES.get(text, "")
@@ -224,6 +308,22 @@ def normalize_entry_signal(signal, fallback_side=""):
     return text
 
 
+def _exit_param_value_for_signal(signal, key):
+    signal_text = str(signal or "").strip()
+    exact_key = f"{signal_text}_{key}"
+    if exact_key in EXIT_PARAMS:
+        return EXIT_PARAMS[exact_key]
+    if signal_text in {"long_breakout", "short_breakdown"}:
+        breakout_key = f"breakout_{key}"
+        if breakout_key in EXIT_PARAMS:
+            return EXIT_PARAMS[breakout_key]
+    elif signal_text in {"long_pullback", "short_bounce_fail"}:
+        pullback_key = f"pullback_{key}"
+        if pullback_key in EXIT_PARAMS:
+            return EXIT_PARAMS[pullback_key]
+    return EXIT_PARAMS[key]
+
+
 def _avg(data, start, end, key):
     total = 0.0
     count = 0
@@ -231,6 +331,38 @@ def _avg(data, start, end, key):
         total += data[i][key]
         count += 1
     return total / count if count else 0.0
+
+
+def _entry_adx_value(adx_value):
+    adx = max(float(adx_value), 0.0)
+    baseline_period = 14.0
+    if ENTRY_ADX_TARGET_PERIOD <= 0.0 or ENTRY_ADX_TARGET_PERIOD >= baseline_period:
+        return adx
+    if adx <= ENTRY_ADX_PIVOT:
+        return adx
+    period_ratio = baseline_period / ENTRY_ADX_TARGET_PERIOD
+    return ENTRY_ADX_PIVOT + (adx - ENTRY_ADX_PIVOT) * period_ratio
+
+
+def _entry_market_state(market_state):
+    if not isinstance(market_state, dict):
+        return market_state
+    adjusted_state = dict(market_state)
+    if "adx" in adjusted_state:
+        adjusted_state["adx"] = _entry_adx_value(adjusted_state["adx"])
+    hourly = market_state.get("hourly")
+    if isinstance(hourly, dict):
+        adjusted_hourly = dict(hourly)
+        if "adx" in adjusted_hourly:
+            adjusted_hourly["adx"] = _entry_adx_value(adjusted_hourly["adx"])
+        adjusted_state["hourly"] = adjusted_hourly
+    fourh = market_state.get("four_hour")
+    if isinstance(fourh, dict):
+        adjusted_fourh = dict(fourh)
+        if "adx" in adjusted_fourh:
+            adjusted_fourh["adx"] = _entry_adx_value(adjusted_fourh["adx"])
+        adjusted_state["four_hour"] = adjusted_fourh
+    return adjusted_state
 
 
 def _ema(data, start, end, key, period):
@@ -510,6 +642,131 @@ def _long_entry_addition_available(positions):
     return long_positions < long_capacity
 
 
+def _long_signal_strength_score(
+    context,
+    market_state,
+    params,
+    long_breakout_path,
+    long_pullback_path,
+    long_reaccel_path,
+    long_ownership_relay=False,
+):
+    flow_metrics = _flow_signal_metrics(market_state, context["hourly"], context["fourh"], params, "long")
+    fourh_quality_score = _fourh_trend_quality_long_score(market_state, params)
+    long_quality_score = 0.65 * float(_trend_quality_long(market_state)) + 0.35 * fourh_quality_score
+    path_key = ""
+    if long_breakout_path:
+        path_key = "long_breakout"
+    elif long_pullback_path:
+        path_key = "long_pullback"
+    elif long_reaccel_path:
+        path_key = "long_reaccel"
+    elif long_ownership_relay:
+        path_key = "long_relay"
+    path_bonus = {
+        "long_breakout": 0.10,
+        "long_pullback": 0.04,
+        "long_reaccel": 0.12,
+        "long_relay": 0.06,
+    }.get(path_key, 0.0)
+    return (
+        0.52 * long_quality_score
+        + 0.22 * min(max(flow_metrics["score"] / 8.0, 0.0), 1.0)
+        + 0.14 * min(max(flow_metrics["directional_bias"], 0.0), 0.12) / 0.12
+        + 0.12 * float(_trend_followthrough_long(market_state, context["breakout_high"], context["current"]["close"]))
+        + path_bonus
+    )
+
+
+def _active_long_rollover_applied(
+    positions,
+    context,
+    market_state,
+    params,
+    long_breakout_path,
+    long_pullback_path,
+    long_reaccel_path,
+    long_ownership_relay=False,
+):
+    if not positions:
+        return False
+    lead_position = positions[0]
+    if _position_side(lead_position) != "long":
+        return False
+    entry_price = float(lead_position.get("entry_price", 0.0))
+    current_close = float(context["current"]["close"])
+    if entry_price <= 0.0 or current_close <= entry_price:
+        return False
+    if not (long_signal_path_ok(long_breakout_path, long_pullback_path, long_reaccel_path) or long_ownership_relay):
+        return False
+    try:
+        strong_trend_bypass = _long_strong_trend_bypass(context, market_state, params)
+    except (KeyError, TypeError):
+        strong_trend_bypass = False
+    if not long_final_veto_clear(
+        context,
+        market_state,
+        params,
+        long_breakout_path,
+        long_pullback_path,
+        long_reaccel_path,
+        long_ownership_relay,
+        strong_trend_bypass=strong_trend_bypass,
+    ):
+        return False
+    if not _trend_followthrough_long(
+        market_state,
+        context["breakout_high"],
+        current_close,
+    ):
+        return False
+    path_tag = str(
+        lead_position.get("entry_path_tag")
+        or lead_position.get("entry_path_key")
+        or lead_position.get("entry_signal")
+        or ""
+    ).strip()
+    normalized_tag = ENTRY_PATH_TAGS.get(path_tag, path_tag)
+    current_score = float(
+        lead_position.get(
+            "entry_strength_score",
+            {
+                "long_impulse": 0.66,
+                "long_retest": 0.60,
+                "long_reaccel": 0.72,
+                "long_relay": 0.62,
+                "long_reversal_long": 0.64,
+                "long_reversal_sniper": 0.68,
+            }.get(normalized_tag, 0.60),
+        )
+    )
+    new_score = _long_signal_strength_score(
+        context,
+        market_state,
+        params,
+        long_breakout_path,
+        long_pullback_path,
+        long_reaccel_path,
+        long_ownership_relay,
+    )
+    if new_score < current_score + LONG_ROLLOVER_MIN_SCORE_DELTA:
+        return False
+    path_key = "long_relay"
+    if long_breakout_path:
+        path_key = "long_breakout"
+    elif long_pullback_path:
+        path_key = "long_pullback"
+    elif long_reaccel_path:
+        path_key = "long_reaccel"
+    elif not long_ownership_relay:
+        path_key = "long_pullback"
+    lead_position["hold_bars"] = 0
+    lead_position["entry_path_tag"] = ENTRY_PATH_TAGS.get(path_key, path_key or "long_pullback")
+    lead_position["entry_strength_score"] = new_score
+    lead_position["strengthening_rollovers"] = int(lead_position.get("strengthening_rollovers", 0)) + 1
+    return True
+
+
 def _long_time_exit_active(positions, current_close):
     if not positions or current_close <= 0.0:
         return False
@@ -533,6 +790,126 @@ def _long_time_exit_active(positions, current_close):
     avg_entry_price = weighted_entry / total_size
     price_move_pct = (current_close - avg_entry_price) / max(avg_entry_price, 1e-9)
     return price_move_pct < LONG_TIME_EXIT_MAX_PRICE_MOVE_PCT
+
+
+def _long_profit_protect_exit_active(positions, current_bar, current_close):
+    if not positions or current_close <= 0.0:
+        return False
+    long_positions = [position for position in positions if _position_side(position) == "long"]
+    if not long_positions:
+        return False
+
+    total_size = 0.0
+    weighted_entry = 0.0
+    recent_high = max(float((current_bar or {}).get("high", current_close)), current_close)
+    trailing_giveback_pct = None
+    for position in long_positions:
+        size = max(float(position.get("size", 0.0)), 0.0)
+        entry_price = float(position.get("entry_price", 0.0))
+        favorable_price = float(position.get("favorable_price", 0.0))
+        if size <= 0.0 or entry_price <= 0.0:
+            continue
+        total_size += size
+        weighted_entry += entry_price * size
+        recent_high = max(recent_high, favorable_price, entry_price)
+        position_giveback_pct = max(
+            float(_exit_param_value_for_signal(position.get("entry_signal", ""), "trailing_giveback_pct"))
+            * LONG_EXIT_PROFIT_PROTECT_GIVEBACK_MULT,
+            0.0,
+        )
+        if trailing_giveback_pct is None or position_giveback_pct < trailing_giveback_pct:
+            trailing_giveback_pct = position_giveback_pct
+    if total_size <= 0.0:
+        return False
+
+    avg_entry_price = weighted_entry / total_size
+    profit_protect_trigger = max(
+        float(EXIT_PARAMS.get("take_profit", 0.0)) * LONG_EXIT_PROFIT_PROTECT_TRIGGER_MULT,
+        0.0,
+    )
+    unrealized_profit_ratio = (current_close - avg_entry_price) / max(avg_entry_price, 1e-9)
+    if unrealized_profit_ratio < profit_protect_trigger:
+        return False
+
+    leverage = max(float(EXIT_PARAMS.get("leverage", 1.0)), 1.0)
+    tightened_giveback_ratio = max(float(trailing_giveback_pct or 0.0), 0.0) / leverage / 100.0
+    if tightened_giveback_ratio <= 0.0 or recent_high <= 0.0:
+        return False
+    giveback_ratio = (recent_high - current_close) / max(recent_high, 1e-9)
+    return giveback_ratio >= tightened_giveback_ratio
+
+
+def _directional_movement_bias(data, end_idx, lookback):
+    if not data or end_idx <= 0:
+        return 0.0, 0.0
+    start_idx = max(1, end_idx - max(int(lookback), 1) + 1)
+    tr_total = 0.0
+    plus_dm_total = 0.0
+    minus_dm_total = 0.0
+    for idx in range(start_idx, end_idx + 1):
+        current = data[idx]
+        prev = data[idx - 1]
+        up_move = current["high"] - prev["high"]
+        down_move = prev["low"] - current["low"]
+        plus_dm_total += up_move if up_move > down_move and up_move > 0.0 else 0.0
+        minus_dm_total += down_move if down_move > up_move and down_move > 0.0 else 0.0
+        tr_total += max(
+            current["high"] - current["low"],
+            abs(current["high"] - prev["close"]),
+            abs(current["low"] - prev["close"]),
+        )
+    if tr_total <= 1e-9:
+        return 0.0, 0.0
+    return 100.0 * plus_dm_total / tr_total, 100.0 * minus_dm_total / tr_total
+
+
+def _short_profit_lock_exit_active(positions, market_state, current_bar, current_close, data, idx):
+    if not positions or current_close <= 0.0:
+        return False
+    adx_min = 25.0
+    di_lookback = 14
+    di_dominance_ratio = 1.15
+    di_dominance_gap = 4.0
+    trigger_atr_mult = 0.8
+    trail_buffer_atr_mult = 0.3
+    short_positions = [position for position in positions if _position_side(position) == "short"]
+    if not short_positions:
+        return False
+    atr = max(float((market_state or {}).get("atr", 0.0)), 0.0)
+    adx = float((market_state or {}).get("adx", 0.0))
+    if atr <= 0.0 or adx <= adx_min:
+        return False
+
+    total_size = 0.0
+    weighted_entry = 0.0
+    recent_low = min(float((current_bar or {}).get("low", current_close)), current_close)
+    for position in short_positions:
+        size = max(float(position.get("size", 0.0)), 0.0)
+        entry_price = float(position.get("entry_price", 0.0))
+        favorable_price = float(position.get("favorable_price", 0.0))
+        if size <= 0.0 or entry_price <= 0.0:
+            continue
+        total_size += size
+        weighted_entry += entry_price * size
+        if favorable_price > 0.0:
+            recent_low = min(recent_low, favorable_price)
+    if total_size <= 0.0:
+        return False
+
+    plus_di, minus_di = _directional_movement_bias(data, idx, di_lookback)
+    if (
+        minus_di < plus_di * di_dominance_ratio
+        or minus_di - plus_di < di_dominance_gap
+    ):
+        return False
+
+    avg_entry_price = weighted_entry / total_size
+    unrealized_profit = avg_entry_price - current_close
+    if unrealized_profit < atr * trigger_atr_mult:
+        return False
+
+    trailing_exit_price = recent_low + atr * trail_buffer_atr_mult
+    return trailing_exit_price > recent_low and current_close >= trailing_exit_price
 
 
 def _flow_alignment_score(market_state, hourly, fourh, params, side):
@@ -630,8 +1007,6 @@ def _flow_confirmation_ok(market_state, hourly, fourh, params, side, strong=Fals
         return (
             score >= params["breakout_flow_score_min"]
             and intraday_imbalance >= -0.02
-            and hourly_buy_ratio >= 0.495
-            and fourh_buy_ratio >= 0.49
             and fourh_imbalance >= -0.03
         )
 
@@ -710,8 +1085,6 @@ def _flow_signal_metrics(market_state, hourly, fourh, params, side):
 
 def _flow_entry_ok(market_state, hourly, fourh, params, side=None, strong=False):
     entry_side = side if side in {"long", "short"} else "short"
-    if entry_side == "long":
-        return True
     return _flow_confirmation_ok(market_state, hourly, fourh, params, entry_side, strong=strong)
 
 
@@ -1156,7 +1529,10 @@ def _trend_quality_long(market_state):
         confirms += 1
     if metrics["intraday_spread"] >= atr_ratio * 0.28:
         confirms += 1
-    if metrics["hourly_spread"] >= max(SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 1.20, atr_ratio * 0.74):
+    if metrics["hourly_spread"] >= max(
+        SIDEWAYS_MIN_HOURLY_SPREAD_PCT * LONG_TREND_QUALITY_HOURLY_EMA_OFFSET_MULT,
+        atr_ratio * 0.74,
+    ):
         confirms += 1
     if metrics["fourh_spread"] >= max(SIDEWAYS_MIN_FOURH_SPREAD_PCT * 0.70, atr_ratio * 0.66):
         confirms += 1
@@ -1177,7 +1553,7 @@ def _trend_quality_long(market_state):
     )
     if overextended_without_fourh:
         return False
-    return confirms >= 4
+    return confirms >= 3
 
 
 def _fourh_trend_quality_long_score(market_state, params):
@@ -1203,9 +1579,12 @@ def _trend_quality_short(market_state):
     fourh = market_state["four_hour"]
     metrics = _directional_trend_metrics(market_state, "short")
     atr_ratio = metrics["atr_ratio"]
+    intraday_adx_gate = max(p["intraday_adx_min"] * 1.25, 14.5)
+    hourly_adx_gate = max(p["hourly_adx_min"] * 1.25, p["hourly_adx_min"] + 2.0)
+    histogram_pressure_floor = max(p["breakdown_hist_max"] * 0.05, 0.6)
 
     confirms = 0
-    if market_state["adx"] >= max(p["intraday_adx_min"], 14.5):
+    if market_state["adx"] >= intraday_adx_gate:
         confirms += 1
     if metrics["intraday_spread"] >= atr_ratio * 0.30:
         confirms += 1
@@ -1231,7 +1610,7 @@ def _trend_quality_short(market_state):
         and market_state["adx"] >= 15.2
     )
     macd_pressure_ok = (
-        market_state["histogram"] < 0.0
+        market_state["histogram"] <= -histogram_pressure_floor
         and market_state["macd_line"] < market_state["signal_line"]
         and hourly["macd_line"] < hourly["signal_line"]
         and fourh["macd_line"] < fourh["signal_line"]
@@ -1246,7 +1625,7 @@ def _trend_quality_short(market_state):
     return (
         confirms >= 4
         and macd_pressure_ok
-        and (fourh_participation_ok or fresh_pressure_ok or hourly["adx"] >= p["hourly_adx_min"] + 2.0)
+        and (fourh_participation_ok or fresh_pressure_ok or hourly["adx"] >= hourly_adx_gate)
     )
 
 
@@ -1260,11 +1639,20 @@ def _trend_followthrough_long(market_state, trigger_price, current_close):
     hourly = market_state["hourly"]
     fourh = market_state["four_hour"]
     metrics = _directional_trend_metrics(market_state, "long")
+    flow_metrics = _flow_signal_metrics(market_state, hourly, fourh, PARAMS, "long")
     atr_ratio = metrics["atr_ratio"]
     breakout_distance_pct = (current_close - trigger_price) / max(trigger_price, 1e-9)
     hourly_fast_extension = (current_close - hourly["ema_fast"]) / max(current_close, 1e-9)
     hourly_anchor_extension = (current_close - hourly["ema_anchor"]) / max(current_close, 1e-9)
     quality_ready = _trend_quality_long(market_state)
+    flow_supportive = (
+        flow_metrics["score"] >= max(PARAMS["breakout_flow_score_min"] - 1, 4)
+        and flow_metrics["directional_bias"] >= 0.0
+    )
+    strong_flow_supportive = (
+        flow_metrics["score"] >= PARAMS["breakout_flow_score_min"]
+        and flow_metrics["directional_bias"] >= 0.015
+    )
 
     confirms = 0
     if metrics["intraday_spread"] >= atr_ratio * 0.22:
@@ -1277,6 +1665,10 @@ def _trend_followthrough_long(market_state, trigger_price, current_close):
         confirms += 1
     if breakout_distance_pct >= -atr_ratio * 0.01:
         confirms += 1
+    if flow_supportive:
+        confirms += 1
+    if strong_flow_supportive:
+        confirms += 1
 
     mild_continuation = (
         quality_ready
@@ -1287,6 +1679,7 @@ def _trend_followthrough_long(market_state, trigger_price, current_close):
             metrics["hourly_slope"] >= atr_ratio * 0.044
             or metrics["fourh_slope"] >= atr_ratio * 0.020
             or metrics["intraday_spread"] >= atr_ratio * 0.26
+            or strong_flow_supportive
         )
     )
     pullback_recovery = (
@@ -1297,6 +1690,7 @@ def _trend_followthrough_long(market_state, trigger_price, current_close):
         and metrics["fourh_spread"] >= max(SIDEWAYS_MIN_FOURH_SPREAD_PCT * 0.48, atr_ratio * 0.46)
         and metrics["hourly_slope"] >= atr_ratio * 0.022
         and metrics["fourh_slope"] >= 0.0
+        and flow_supportive
     )
 
     stale_chase = (
@@ -1312,7 +1706,55 @@ def _trend_followthrough_long(market_state, trigger_price, current_close):
         return False
     if mild_continuation or pullback_recovery:
         return True
-    return confirms >= 4
+    required_confirms = 4 if quality_ready else 5
+    return confirms >= required_confirms
+
+
+def _hourly_long_exit_regime_weak(market_state, atr_ratio, long_exit_relax_mult):
+    hourly = market_state["hourly"]
+    fourh = market_state["four_hour"]
+    price_buffer_pct = max(float(EXIT_PARAMS.get("regime_price_confirm_buffer_pct", 0.0)), 0.0)
+    price_buffer = max(price_buffer_pct, atr_ratio * (0.20 * long_exit_relax_mult))
+    trend_buffer = max(price_buffer_pct * 0.5, atr_ratio * 0.08)
+    adx_hold_threshold = max(float(EXIT_PARAMS.get("dynamic_hold_adx_threshold", 0.0)), 1.0)
+    adx_strong_threshold = max(
+        float(EXIT_PARAMS.get("dynamic_hold_adx_strong_threshold", adx_hold_threshold)),
+        adx_hold_threshold,
+    )
+    hold_trend_supported = (
+        hourly["adx"] >= adx_hold_threshold
+        and fourh["adx"] >= max(adx_hold_threshold - 1.0, 1.0)
+        and hourly["trend_spread_pct"] > 0.0
+        and fourh["trend_spread_pct"] > 0.0
+    )
+    strong_hold_trend = (
+        hourly["adx"] >= adx_strong_threshold
+        and fourh["adx"] >= max(adx_hold_threshold, 1.0)
+        and hourly["ema_slow_slope_pct"] > -atr_ratio * 0.010
+        and fourh["ema_slow_slope_pct"] >= -atr_ratio * 0.006
+    )
+
+    hourly_price_lost = hourly["close"] <= hourly["ema_fast"] * (1.0 - price_buffer)
+    hourly_structure_weak = (
+        hourly["ema_fast"] <= hourly["ema_anchor"] * (1.0 + trend_buffer)
+        and hourly["trend_spread_pct"] <= max(SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 0.52, atr_ratio * 0.28)
+        and hourly["ema_slow_slope_pct"] <= atr_ratio * 0.018
+    )
+    hourly_flow_weak = (
+        hourly["macd_line"] <= hourly["signal_line"]
+        and hourly["taker_buy_ratio"] <= max(PARAMS["hourly_taker_buy_ratio_min"] + 0.003, 0.5)
+        and hourly["flow_imbalance"] <= max(PARAMS["hourly_flow_confirmation_min"] + 0.01, 0.01)
+    )
+    if strong_hold_trend and hourly["close"] >= hourly["ema_fast"] * (1.0 - price_buffer * 1.35):
+        return False
+    if (
+        hold_trend_supported
+        and hourly["close"] >= hourly["ema_anchor"] * (1.0 - price_buffer * 0.55)
+        and hourly["ema_slow_slope_pct"] >= -atr_ratio * 0.012
+        and fourh["ema_slow_slope_pct"] >= -atr_ratio * 0.008
+    ):
+        return False
+    return hourly_price_lost and hourly_structure_weak and hourly_flow_weak
 
 
 def _trend_followthrough_exit_long(market_state, trigger_price, current_close):
@@ -1324,9 +1766,24 @@ def _trend_followthrough_exit_long(market_state, trigger_price, current_close):
         EXIT_PARAMS["long_breakout_stop_atr_mult"] + EXIT_PARAMS["long_pullback_stop_atr_mult"]
     ) / 2.0
     long_exit_relax_mult = max(long_stop_atr_mult / max(EXIT_PARAMS["stop_atr_mult"], 1e-9), 1.0)
+    adx_hold_threshold = max(float(EXIT_PARAMS.get("dynamic_hold_adx_threshold", 0.0)), 1.0)
+    adx_strong_threshold = max(
+        float(EXIT_PARAMS.get("dynamic_hold_adx_strong_threshold", adx_hold_threshold)),
+        adx_hold_threshold,
+    )
     breakout_distance_pct = (current_close - trigger_price) / max(trigger_price, 1e-9)
     hourly_fast_extension = (current_close - hourly["ema_fast"]) / max(current_close, 1e-9)
     hourly_anchor_extension = (current_close - hourly["ema_anchor"]) / max(current_close, 1e-9)
+    hourly_regime_weak = _hourly_long_exit_regime_weak(market_state, atr_ratio, long_exit_relax_mult)
+    adx_hold_active = (
+        hourly["adx"] >= adx_hold_threshold
+        and fourh["adx"] >= max(adx_hold_threshold - 1.0, 1.0)
+    )
+    strong_adx_hold = (
+        hourly["adx"] >= adx_strong_threshold
+        and fourh["adx"] >= max(adx_hold_threshold, 1.0)
+    )
+    price_tolerance_mult = 1.35 if adx_hold_active else 1.0
 
     confirms = 0
     if metrics["intraday_spread"] >= atr_ratio * 0.18:
@@ -1339,45 +1796,49 @@ def _trend_followthrough_exit_long(market_state, trigger_price, current_close):
         confirms += 1
     if breakout_distance_pct >= -atr_ratio * (0.04 * long_exit_relax_mult):
         confirms += 1
+    if adx_hold_active:
+        confirms += 1
 
     reversal_pressure = (
         market_state["histogram"] <= 0.0
         and market_state["macd_line"] <= market_state["signal_line"]
-        and hourly["close"] <= hourly["ema_fast"] * (1.0 + atr_ratio * (0.10 * long_exit_relax_mult))
-        and hourly["ema_fast"] <= hourly["ema_anchor"] * (1.0 + atr_ratio * (0.05 * long_exit_relax_mult))
+        and hourly["close"] <= hourly["ema_fast"] * (1.0 + atr_ratio * (0.10 * long_exit_relax_mult * price_tolerance_mult))
+        and hourly["ema_fast"] <= hourly["ema_anchor"] * (1.0 + atr_ratio * (0.05 * long_exit_relax_mult * price_tolerance_mult))
         and (
-            breakout_distance_pct <= atr_ratio * (0.04 * long_exit_relax_mult)
-            or hourly_fast_extension <= atr_ratio * (0.06 * long_exit_relax_mult)
+            breakout_distance_pct <= atr_ratio * (0.04 * long_exit_relax_mult * price_tolerance_mult)
+            or hourly_fast_extension <= atr_ratio * (0.06 * long_exit_relax_mult * price_tolerance_mult)
             or metrics["hourly_slope"] <= 0.0
         )
     )
     support_lost = (
-        current_close <= hourly["ema_fast"] * (1.0 + atr_ratio * (0.04 * long_exit_relax_mult))
+        current_close <= hourly["ema_fast"] * (1.0 + atr_ratio * (0.04 * long_exit_relax_mult * price_tolerance_mult))
         and (
-            hourly_fast_extension <= atr_ratio * (0.03 * long_exit_relax_mult)
-            or hourly_anchor_extension <= atr_ratio * (0.10 * long_exit_relax_mult)
-            or breakout_distance_pct <= -atr_ratio * (0.01 * max(long_exit_relax_mult - 1.0, 0.0))
+            hourly_fast_extension <= atr_ratio * (0.03 * long_exit_relax_mult * price_tolerance_mult)
+            or hourly_anchor_extension <= atr_ratio * (0.10 * long_exit_relax_mult * price_tolerance_mult)
+            or breakout_distance_pct <= -atr_ratio * (0.01 * max(long_exit_relax_mult * price_tolerance_mult - 1.0, 0.0))
         )
         and metrics["hourly_slope"] <= atr_ratio * 0.010
-        and metrics["intraday_spread"] <= atr_ratio * (0.24 * long_exit_relax_mult)
+        and metrics["intraday_spread"] <= atr_ratio * (0.24 * long_exit_relax_mult * price_tolerance_mult)
     )
     deeper_reversal = (
-        breakout_distance_pct <= -atr_ratio * (0.02 * long_exit_relax_mult)
-        and hourly_fast_extension <= atr_ratio * (0.02 * long_exit_relax_mult)
+        breakout_distance_pct <= -atr_ratio * (0.02 * long_exit_relax_mult * price_tolerance_mult)
+        and hourly_fast_extension <= atr_ratio * (0.02 * long_exit_relax_mult * price_tolerance_mult)
         and (
             metrics["hourly_slope"] <= 0.0
             or metrics["fourh_slope"] <= atr_ratio * 0.010
             or market_state["histogram"] <= -0.01
         )
     )
-    if reversal_pressure or support_lost or deeper_reversal:
+    if (reversal_pressure or support_lost or deeper_reversal) and hourly_regime_weak:
         return False
     trend_cushion_active = (
         breakout_distance_pct >= atr_ratio * 0.05
         and metrics["hourly_slope"] >= atr_ratio * 0.010
         and metrics["fourh_slope"] >= 0.0
     )
-    required_confirms = 2 if trend_cushion_active else 3
+    required_confirms = 2 if (trend_cushion_active or strong_adx_hold) else 3
+    if hourly_regime_weak:
+        required_confirms += 1
     return confirms >= required_confirms
 
 
@@ -1411,9 +1872,45 @@ def _trend_followthrough_short(market_state, trigger_price, current_close):
             or metrics["fourh_slope"] < atr_ratio * 0.042
         )
     )
+    rebound_pressure = (
+        market_state["histogram"] >= 0.0
+        and market_state["macd_line"] >= market_state["signal_line"]
+        and hourly["close"] >= hourly["ema_fast"] * (1.0 - atr_ratio * 0.04)
+        and (
+            breakdown_distance_pct <= atr_ratio * 0.08
+            or hourly_fast_discount <= atr_ratio * 0.12
+            or metrics["hourly_slope"] <= atr_ratio * 0.056
+        )
+    )
+    trend_floor_lost = (
+        current_close >= hourly["ema_fast"] * (1.0 - atr_ratio * 0.02)
+        and (
+            hourly_fast_discount <= atr_ratio * 0.08
+            or hourly_anchor_discount <= atr_ratio * 0.18
+            or breakdown_distance_pct <= atr_ratio * 0.04
+        )
+        and metrics["hourly_slope"] <= atr_ratio * 0.062
+        and metrics["intraday_spread"] <= atr_ratio * 0.24
+    )
+    reversal_followthrough = (
+        breakdown_distance_pct <= atr_ratio * 0.03
+        and hourly_fast_discount <= atr_ratio * 0.10
+        and (
+            metrics["hourly_slope"] <= atr_ratio * 0.052
+            or metrics["fourh_slope"] <= atr_ratio * 0.024
+            or hourly["macd_line"] >= hourly["signal_line"]
+        )
+    )
     if exhausted_selloff:
         return False
-    return confirms >= (5 if breakdown_distance_pct >= atr_ratio * 0.18 else 4)
+    if rebound_pressure or trend_floor_lost or reversal_followthrough:
+        return False
+    trend_cushion_active = (
+        breakdown_distance_pct >= atr_ratio * 0.14
+        and metrics["hourly_slope"] >= atr_ratio * 0.082
+        and metrics["fourh_slope"] >= atr_ratio * 0.034
+    )
+    return confirms >= (4 if trend_cushion_active else 5)
 
 
 def _trend_followthrough_ok(market_state, side, trigger_price, current_close):
@@ -1430,6 +1927,31 @@ def _active_long_exit_followthrough_ok(positions, market_state, current_close):
     return _trend_followthrough_exit_long(market_state, trigger_price, current_close)
 
 
+def _active_long_exit_signal(positions, market_state, current_bar, current_close):
+    return (
+        not _active_long_exit_followthrough_ok(positions, market_state, current_close)
+        or _long_profit_protect_exit_active(positions, current_bar, current_close)
+    )
+
+
+def _active_short_exit_followthrough_ok(positions, market_state, current_close):
+    if not positions:
+        return True
+    short_positions = [position for position in positions if _position_side(position) == "short"]
+    if not short_positions:
+        return True
+    lead_position = short_positions[0]
+    trigger_price = float(lead_position.get("entry_price", current_close))
+    return _trend_followthrough_short(market_state, trigger_price, current_close)
+
+
+def _active_short_exit_signal(positions, market_state, current_bar, current_close, data, idx):
+    return (
+        not _active_short_exit_followthrough_ok(positions, market_state, current_close)
+        or _short_profit_lock_exit_active(positions, market_state, current_bar, current_close, data, idx)
+    )
+
+
 def _long_durable_hold_active(market_state):
     fourh = market_state["four_hour"]
     if fourh is None:
@@ -1444,6 +1966,7 @@ def _long_durable_hold_active(market_state):
 def long_outer_context_ok(context, market_state, params):
     long_state = _build_long_trend_state(context, market_state, params)
     context["long_outer_lane"] = ""
+    flow_metrics = _flow_signal_metrics(market_state, context["hourly"], context["fourh"], params, "long")
     reclaim_ready = (
         context["current"]["close"] > market_state["ema_fast"] > market_state["ema_slow"]
         and market_state["macd_line"] > market_state["signal_line"]
@@ -1459,24 +1982,6 @@ def long_outer_context_ok(context, market_state, params):
         )
     )
     context["long_reclaim_ready"] = reclaim_ready
-    intraday_support_ready = long_state["intraday_bull"] or reclaim_ready
-    hourly_support_ready = long_state["hourly_bull"] or long_state["hourly_neutral"]
-    fourh_context_ready = (
-        long_state["fourh_bull_base"]
-        and _fourh_trend_quality_long_score(market_state, params) > 0.5
-    )
-    base_ownership_ready = intraday_support_ready and fourh_context_ready
-    hourly_repair_ready = (
-        context["hourly"]["close"] > context["hourly"]["ema_slow"]
-        and context["hourly"]["ema_fast"] >= context["hourly"]["ema_slow"]
-        and context["hourly"]["macd_line"] > context["hourly"]["signal_line"]
-        and context["hourly"]["trend_spread_pct"] >= max(
-            SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 0.46,
-            context["atr_ratio"] * 0.26,
-        )
-        and context["hourly"]["ema_slow_slope_pct"] >= context["atr_ratio"] * 0.014
-        and context["hourly"]["adx"] >= max(params["hourly_adx_min"] - 5.0, 14.0)
-    )
     hourly_turn_repair_ready = (
         context["hourly"]["close"] > context["hourly"]["ema_slow"]
         and context["hourly"]["macd_line"] > context["hourly"]["signal_line"]
@@ -1516,14 +2021,63 @@ def long_outer_context_ok(context, market_state, params):
         )
     )
     context["long_late_mature_guard"] = late_mature_guard
+    fourh_not_strong_bear = not (
+        context["fourh"]["close"] < context["fourh"]["ema_slow"]
+        and context["fourh"]["trend_spread_pct"] <= -max(
+            SIDEWAYS_MIN_FOURH_SPREAD_PCT * 0.62,
+            context["atr_ratio"] * 0.50,
+        )
+        and context["fourh"]["ema_slow_slope_pct"] <= -max(
+            context["atr_ratio"] * 0.020,
+            SIDEWAYS_MIN_FOURH_SPREAD_PCT * 0.14,
+        )
+        and context["fourh"]["macd_line"] < context["fourh"]["signal_line"]
+        and context["fourh"]["adx"] >= max(params["fourh_adx_min"] - 0.8, 11.8)
+    )
+    strong_long_flow = (
+        _flow_confirmation_ok(
+            market_state,
+            context["hourly"],
+            context["fourh"],
+            params,
+            "long",
+            strong=True,
+        )
+        and flow_metrics["directional_bias"] >= 0.035
+        and market_state["histogram"] >= max(params["breakout_hist_min"] + 0.4, 4.8)
+        and market_state["macd_line"] > market_state["signal_line"]
+        and context["hourly"]["macd_line"] >= context["hourly"]["signal_line"]
+    )
+    long_outer_majority_trend = (
+        long_state["hourly_bull"]
+        and (
+            long_state["intraday_bull"]
+            or long_state["fourh_bull_base"]
+        )
+    )
     mature_trend_lane = (
-        base_ownership_ready
-        and (hourly_support_ready or hourly_repair_ready)
+        long_outer_majority_trend
+        and not late_mature_guard
+    )
+    soft_trend_lane = (
+        long_state["intraday_bull"]
+        and long_state["hourly_neutral"]
+        and not long_state["hourly_bull"]
+        and fourh_not_strong_bear
+        and strong_long_flow
+        and context["hourly_fast_extension_pct"] <= max(
+            context["atr_ratio"] * 0.88,
+            SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 2.00,
+        )
+        and context["hourly_anchor_extension_pct"] <= max(
+            context["atr_ratio"] * 1.26,
+            SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 2.96,
+        )
         and not late_mature_guard
     )
     early_turn_outer_lane = (
         reclaim_ready
-        and long_state["fourh_bull_turn"]
+        and (long_state["fourh_bull_turn"] or (fourh_not_strong_bear and strong_long_flow))
         and hourly_turn_repair_ready
         and not long_state["hourly_bull"]
         and not late_mature_guard
@@ -1538,9 +2092,11 @@ def long_outer_context_ok(context, market_state, params):
     )
     if mature_trend_lane:
         context["long_outer_lane"] = "trend"
+    elif soft_trend_lane:
+        context["long_outer_lane"] = "soft_trend"
     elif early_turn_outer_lane:
         context["long_outer_lane"] = "early_turn"
-    return mature_trend_lane or early_turn_outer_lane
+    return mature_trend_lane or soft_trend_lane or early_turn_outer_lane
 
 
 def long_breakout_ok(context, market_state, params):
@@ -1644,6 +2200,10 @@ def long_signal_path_ok(breakout_ok, pullback_ok, reaccel_ok):
     return breakout_ok or pullback_ok or reaccel_ok
 
 
+def _merged_long_core_path_ok(breakout_ok, pullback_ok):
+    return breakout_ok and pullback_ok
+
+
 def _long_reversal_sniper_ok(context):
     current = context.get("current")
     reversal_reference_low = context.get("reversal_reference_low")
@@ -1716,34 +2276,51 @@ def long_final_veto_clear(
     long_quality_score = 0.65 * float(_trend_quality_long(market_state)) + 0.35 * fourh_quality_score
     high_quality_long = long_quality_score >= quality_relax_gate
     atr_ratio = context["atr_ratio"]
-    hourly = context["hourly"]
-    fourh = context["fourh"]
     rsi = market_state["rsi"]
     breakout_distance_pct = context["breakout_distance_pct"]
-    hourly_fast_extension_pct = context["hourly_fast_extension_pct"]
     hourly_anchor_extension_pct = context["hourly_anchor_extension_pct"]
-    sideways_regime = bool(context.get("sideways_regime", False))
+    hourly_fast_discount_pct = context["hourly_fast_discount_pct"]
     strict_rsi_cap = 72.0 if (breakout_ok or reaccel_ok) else 70.0
     relaxed_rsi_cap = strict_rsi_cap + 3.0
-    strict_fast_extension_cap = max(atr_ratio * 1.02, SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 2.22)
-    relaxed_fast_extension_cap = max(atr_ratio * 1.20, SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 2.58)
-    strict_anchor_extension_cap = max(atr_ratio * 1.48, SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 3.34)
-    relaxed_anchor_extension_cap = max(atr_ratio * 1.72, SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 3.72)
-    strict_breakout_distance_cap = atr_ratio * 0.26
-    relaxed_breakout_distance_cap = atr_ratio * 0.34
+    strict_anchor_extension_cap = max(
+        atr_ratio * 1.48 * LONG_FINAL_VETO_EXTENSION_RELAX_MULT,
+        SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 3.34 * LONG_FINAL_VETO_EXTENSION_RELAX_MULT,
+    )
+    relaxed_anchor_extension_cap = max(
+        atr_ratio * 1.72 * LONG_FINAL_VETO_EXTENSION_RELAX_MULT,
+        SIDEWAYS_MIN_HOURLY_SPREAD_PCT * 3.72 * LONG_FINAL_VETO_EXTENSION_RELAX_MULT,
+    )
+    strict_breakout_distance_cap = atr_ratio * 0.26 * LONG_FINAL_VETO_DISTANCE_RELAX_MULT
+    relaxed_breakout_distance_cap = atr_ratio * 0.34 * LONG_FINAL_VETO_DISTANCE_RELAX_MULT
+    pullback_reclaim_room = (
+        (pullback_ok or relay_ok)
+        and hourly_fast_discount_pct <= max(atr_ratio * 0.18, 0.0030)
+    )
+    if pullback_reclaim_room:
+        strict_breakout_distance_cap += max(
+            atr_ratio * 0.05 * LONG_FINAL_VETO_DISTANCE_RELAX_MULT,
+            0.0008 * LONG_FINAL_VETO_DISTANCE_RELAX_MULT,
+        )
+        relaxed_breakout_distance_cap += max(
+            atr_ratio * 0.07 * LONG_FINAL_VETO_DISTANCE_RELAX_MULT,
+            0.0011 * LONG_FINAL_VETO_DISTANCE_RELAX_MULT,
+        )
     mature_extension_clear = (
         breakout_distance_pct <= (relaxed_breakout_distance_cap if high_quality_long else strict_breakout_distance_cap)
-        and hourly_fast_extension_pct <= (
-            relaxed_fast_extension_cap if high_quality_long else strict_fast_extension_cap
-        )
         and hourly_anchor_extension_pct <= (
             relaxed_anchor_extension_cap if high_quality_long else strict_anchor_extension_cap
         )
     )
     rsi_clear = rsi <= (relaxed_rsi_cap if high_quality_long else strict_rsi_cap)
     if strong_trend_bypass:
-        return True
-    if sideways_regime and not _flow_confirmation_ok(market_state, hourly, fourh, params, "long", strong=False):
+        return _trend_quality_ok(market_state, "long")
+    if not _trend_quality_ok(market_state, "long"):
+        return False
+    if not _trend_followthrough_long(
+        market_state,
+        context["breakout_high"],
+        context["current"]["close"],
+    ):
         return False
     if high_quality_long:
         return rsi_clear and mature_extension_clear
@@ -1973,8 +2550,22 @@ def short_final_veto_clear(context, market_state, params, breakdown_ok, bounce_f
 
 
 def _long_entry_signal(data, idx, positions, market_state):
-    signal = strategy(data, idx, positions, market_state)
-    return signal if signal in {"long_breakout", "long_pullback"} else None
+    p = PARAMS
+    entry_market_state = _entry_market_state(market_state)
+    context = _strategy_entry_context(data, idx, positions, entry_market_state, p)
+    if context is None:
+        return None
+    if not long_outer_context_ok(context, entry_market_state, p):
+        return None
+    long_breakout_path = long_breakout_ok(context, entry_market_state, p)
+    long_pullback_path = long_pullback_ok(context, entry_market_state, p)
+    merged_long_core_path = _merged_long_core_path_ok(long_breakout_path, long_pullback_path)
+    long_reaccel_path = long_trend_reaccel_ok(context, entry_market_state, p)
+    if _long_reversal_sniper_ok(context) and merged_long_core_path:
+        return normalize_entry_signal("long_reversal_sniper", fallback_side="long") or None
+    if long_signal_path_ok(merged_long_core_path, merged_long_core_path, long_reaccel_path):
+        return normalize_entry_signal("long_pullback", fallback_side="long") or None
+    return None
 
 
 def _strategy_entry_context(data, idx, positions, market_state, params, allow_sideways=False):
@@ -2057,6 +2648,8 @@ def _long_entry_result(
         path_key = "long_pullback"
     elif long_reaccel_path:
         path_key = "long_reaccel"
+    elif not long_ownership_relay:
+        path_key = "long_pullback"
 
     if as_decision:
         return {
@@ -2099,44 +2692,138 @@ def _short_entry_result(context, market_state, params, short_path_key, *, as_dec
 
 def _short_entry_signal(data, idx, positions, market_state):
     p = PARAMS
-    context = _strategy_entry_context(data, idx, positions, market_state, p)
+    entry_market_state = _entry_market_state(market_state)
+    context = _strategy_entry_context(data, idx, positions, entry_market_state, p)
     if context is None:
         return None
 
-    path_key = _short_entry_path_key(context, market_state, p, require_breakdown_gate=False)
+    path_key = _short_entry_path_key(context, entry_market_state, p, require_breakdown_gate=False)
     if not path_key:
         return None
     return normalize_entry_signal(path_key, fallback_side="short") or None
 
 
+def _reversal_long_on_short_exit_signal(data, idx, positions, market_state, context, *, as_decision):
+    long_signal = _long_entry_signal(data, idx, positions, market_state)
+    if not long_signal:
+        return None
+
+    flow_metrics = _flow_signal_metrics(
+        market_state,
+        context["hourly"],
+        context["fourh"],
+        PARAMS,
+        "long",
+    )
+    flow_score = flow_metrics["score"] / 8.0
+    trend_quality_score = (
+        0.65 * float(_trend_quality_long(market_state))
+        + 0.35 * _fourh_trend_quality_long_score(market_state, PARAMS)
+    )
+    if (
+        not _flow_confirmation_ok(
+            market_state,
+            context["hourly"],
+            context["fourh"],
+            PARAMS,
+            "long",
+            strong=True,
+        )
+        or flow_score < REVERSAL_LONG_FLOW_SCORE_MIN
+        or trend_quality_score < REVERSAL_LONG_QUALITY_SCORE_MIN
+        or not _long_entry_addition_available(positions)
+    ):
+        return None
+
+    if as_decision:
+        path_key = "long_reversal_long"
+        return {
+            "entry_signal": "long_pullback",
+            "entry_side": "long",
+            "entry_path_key": path_key,
+            "entry_path_tag": ENTRY_PATH_TAGS.get(path_key, path_key),
+        }
+    return normalize_entry_signal("long_reversal_long", fallback_side="long") or None
+
+
 def strategy_decision(data, idx, positions, market_state):
     p = PARAMS
-    context = _strategy_entry_context(data, idx, positions, market_state, p, allow_sideways=True)
+    entry_market_state = _entry_market_state(market_state)
+    context = _strategy_entry_context(data, idx, positions, entry_market_state, p, allow_sideways=True)
     if context is None:
         return None
     sideways_regime = bool(context.get("sideways_regime", False))
+    active_side = _position_side(positions[0]) if positions else ""
+    if active_side != "long":
+        _clear_pending_long_stop()
+    long_stop_confirmed = active_side == "long" and _apply_long_stop_confirm_delay(
+        positions,
+        idx,
+        context["current"],
+    )
+    short_exit_active = active_side == "short" and _active_short_exit_signal(
+        positions,
+        market_state,
+        context["current"],
+        context["current"]["close"],
+        data,
+        idx,
+    )
 
     _record_funnel_pass("long", "sideways_pass")
     _record_funnel_pass("short", "sideways_pass")
 
-    long_reversal_sniper = _long_reversal_sniper_ok(context)
-    if long_reversal_sniper and not sideways_regime:
-        _record_funnel_pass("long", "final_veto_pass")
-        if not _long_entry_addition_available(positions):
-            return None
+    if long_stop_confirmed:
         return {
-            "entry_signal": "long_pullback",
-            "entry_side": "long",
-            "entry_path_key": "long_reversal_sniper",
-            "entry_path_tag": ENTRY_PATH_TAGS.get("long_reversal_sniper", "long_reversal_sniper"),
+            "entry_signal": "short_breakdown",
+            "entry_side": "short",
+            "entry_path_key": "short_breakdown",
+            "entry_path_tag": ENTRY_PATH_TAGS.get("short_breakdown", "short_breakdown"),
         }
 
-    if long_outer_context_ok(context, market_state, p):
+    if active_side == "long" and _active_long_exit_signal(
+        positions,
+        market_state,
+        context["current"],
+        context["current"]["close"],
+    ):
+        return {
+            "entry_signal": "short_breakdown",
+            "entry_side": "short",
+            "entry_path_key": "short_breakdown",
+            "entry_path_tag": ENTRY_PATH_TAGS.get("short_breakdown", "short_breakdown"),
+        }
+
+    if short_exit_active:
+        return _reversal_long_on_short_exit_signal(
+            data,
+            idx,
+            positions,
+            entry_market_state,
+            context,
+            as_decision=True,
+        )
+
+    if long_outer_context_ok(context, entry_market_state, p):
         _record_funnel_pass("long", "outer_context_pass")
-        long_breakout_path = long_breakout_ok(context, market_state, p)
-        long_pullback_path = long_pullback_ok(context, market_state, p)
-        long_reaccel_path = long_trend_reaccel_ok(context, market_state, p)
+        long_breakout_path = long_breakout_ok(context, entry_market_state, p)
+        long_pullback_path = long_pullback_ok(context, entry_market_state, p)
+        merged_long_core_path = _merged_long_core_path_ok(long_breakout_path, long_pullback_path)
+        long_breakout_path = merged_long_core_path
+        long_pullback_path = merged_long_core_path
+        long_reaccel_path = long_trend_reaccel_ok(context, entry_market_state, p)
         has_long_signal_path = long_signal_path_ok(long_breakout_path, long_pullback_path, long_reaccel_path)
+        long_reversal_sniper = _long_reversal_sniper_ok(context)
+        if long_reversal_sniper and not sideways_regime and merged_long_core_path:
+            _record_funnel_pass("long", "final_veto_pass")
+            if not _long_entry_addition_available(positions):
+                return None
+            return {
+                "entry_signal": "long_pullback",
+                "entry_side": "long",
+                "entry_path_key": "long_reversal_sniper",
+                "entry_path_tag": ENTRY_PATH_TAGS.get("long_reversal_sniper", "long_reversal_sniper"),
+            }
         long_ownership_relay = False
         if not has_long_signal_path:
             long_quality_override = (
@@ -2151,7 +2838,7 @@ def strategy_decision(data, idx, positions, market_state):
                 and context["current_candle"]["close_pos"] >= max(p["breakout_close_pos_min"] - 0.04, 0.54)
                 and context["current"]["volume"] >= max(context["prev_volume"] * 0.86, context["recent_volume_avg"] * 0.88)
                 and _flow_entry_ok(
-                    market_state,
+                    entry_market_state,
                     context["hourly"],
                     context["fourh"],
                     p,
@@ -2167,9 +2854,20 @@ def strategy_decision(data, idx, positions, market_state):
                 and context["current"]["close"] >= context["breakout_high"] * (1.0 + p["breakout_buffer_pct"])
             ):
                 long_ownership_relay = True
+        if _active_long_rollover_applied(
+            positions,
+            context,
+            entry_market_state,
+            p,
+            long_breakout_path,
+            long_pullback_path,
+            long_reaccel_path,
+            long_ownership_relay,
+        ):
+            return None
         decision = _long_entry_result(
             context,
-            market_state,
+            entry_market_state,
             p,
             positions,
             long_breakout_path,
@@ -2181,12 +2879,12 @@ def strategy_decision(data, idx, positions, market_state):
         if decision is not None:
             return decision
 
-    if not sideways_regime and short_outer_context_ok(context, market_state, p):
+    if not sideways_regime and short_outer_context_ok(context, entry_market_state, p):
         _record_funnel_pass("short", "outer_context_pass")
-        short_path_key = _short_entry_path_key(context, market_state, p, require_breakdown_gate=True)
+        short_path_key = _short_entry_path_key(context, entry_market_state, p, require_breakdown_gate=True)
         decision = _short_entry_result(
             context,
-            market_state,
+            entry_market_state,
             p,
             short_path_key,
             as_decision=True,
@@ -2199,27 +2897,67 @@ def strategy_decision(data, idx, positions, market_state):
 
 def strategy(data, idx, positions, market_state):
     p = PARAMS
-    context = _strategy_entry_context(data, idx, positions, market_state, p, allow_sideways=True)
+    entry_market_state = _entry_market_state(market_state)
+    context = _strategy_entry_context(data, idx, positions, entry_market_state, p, allow_sideways=True)
     if context is None:
         return None
     sideways_regime = bool(context.get("sideways_regime", False))
+    active_side = _position_side(positions[0]) if positions else ""
+    if active_side != "long":
+        _clear_pending_long_stop()
+    long_stop_confirmed = active_side == "long" and _apply_long_stop_confirm_delay(
+        positions,
+        idx,
+        context["current"],
+    )
+    short_exit_active = active_side == "short" and _active_short_exit_signal(
+        positions,
+        market_state,
+        context["current"],
+        context["current"]["close"],
+        data,
+        idx,
+    )
 
     _record_funnel_pass("long", "sideways_pass")
     _record_funnel_pass("short", "sideways_pass")
 
-    long_reversal_sniper = _long_reversal_sniper_ok(context)
-    if long_reversal_sniper and not sideways_regime:
-        _record_funnel_pass("long", "final_veto_pass")
-        if not _long_entry_addition_available(positions):
-            return None
-        return normalize_entry_signal("long_reversal_sniper", fallback_side="long") or None
+    if long_stop_confirmed:
+        return normalize_entry_signal("short_breakdown", fallback_side="short") or None
 
-    if long_outer_context_ok(context, market_state, p):
+    if active_side == "long" and _active_long_exit_signal(
+        positions,
+        market_state,
+        context["current"],
+        context["current"]["close"],
+    ):
+        return normalize_entry_signal("short_breakdown", fallback_side="short") or None
+
+    if short_exit_active:
+        return _reversal_long_on_short_exit_signal(
+            data,
+            idx,
+            positions,
+            entry_market_state,
+            context,
+            as_decision=False,
+        )
+
+    if long_outer_context_ok(context, entry_market_state, p):
         _record_funnel_pass("long", "outer_context_pass")
-        long_breakout_path = long_breakout_ok(context, market_state, p)
-        long_pullback_path = long_pullback_ok(context, market_state, p)
-        long_reaccel_path = long_trend_reaccel_ok(context, market_state, p)
+        long_breakout_path = long_breakout_ok(context, entry_market_state, p)
+        long_pullback_path = long_pullback_ok(context, entry_market_state, p)
+        merged_long_core_path = _merged_long_core_path_ok(long_breakout_path, long_pullback_path)
+        long_breakout_path = merged_long_core_path
+        long_pullback_path = merged_long_core_path
+        long_reaccel_path = long_trend_reaccel_ok(context, entry_market_state, p)
         has_long_signal_path = long_signal_path_ok(long_breakout_path, long_pullback_path, long_reaccel_path)
+        long_reversal_sniper = _long_reversal_sniper_ok(context)
+        if long_reversal_sniper and not sideways_regime and merged_long_core_path:
+            _record_funnel_pass("long", "final_veto_pass")
+            if not _long_entry_addition_available(positions):
+                return None
+            return normalize_entry_signal("long_reversal_sniper", fallback_side="long") or None
         if not has_long_signal_path:
             early_turn_outer_lane = context.get("long_outer_lane") == "early_turn"
             long_handoff_ready = (
@@ -2235,7 +2973,7 @@ def strategy(data, idx, positions, market_state):
                 and context["current"]["volume"] >= max(context["prev_volume"] * 0.94, context["recent_volume_avg"] * 0.94)
                 and context["breakout_reference_stale_gap_pct"] <= max(context["atr_ratio"] * 0.42, 0.0030)
                 and _flow_entry_ok(
-                    market_state,
+                    entry_market_state,
                     context["hourly"],
                     context["fourh"],
                     p,
@@ -2283,7 +3021,7 @@ def strategy(data, idx, positions, market_state):
                 and context["current_candle"]["close_pos"] >= max(p["breakout_close_pos_min"] - 0.02, 0.58)
                 and context["current"]["volume"] >= max(context["prev_volume"] * 0.90, context["recent_volume_avg"] * 0.90)
                 and _flow_entry_ok(
-                    market_state,
+                    entry_market_state,
                     context["hourly"],
                     context["fourh"],
                     p,
@@ -2299,9 +3037,20 @@ def strategy(data, idx, positions, market_state):
                 and context["current"]["close"] >= context["breakout_high"] * (1.0 + p["breakout_buffer_pct"])
             ):
                 long_ownership_relay = True
+        if _active_long_rollover_applied(
+            positions,
+            context,
+            entry_market_state,
+            p,
+            long_breakout_path,
+            long_pullback_path,
+            long_reaccel_path,
+            long_ownership_relay,
+        ):
+            return None
         signal = _long_entry_result(
             context,
-            market_state,
+            entry_market_state,
             p,
             positions,
             long_breakout_path,
@@ -2313,12 +3062,12 @@ def strategy(data, idx, positions, market_state):
         if signal is not None:
             return signal
 
-    if not sideways_regime and short_outer_context_ok(context, market_state, p):
+    if not sideways_regime and short_outer_context_ok(context, entry_market_state, p):
         _record_funnel_pass("short", "outer_context_pass")
-        short_path_key = _short_entry_path_key(context, market_state, p, require_breakdown_gate=True)
+        short_path_key = _short_entry_path_key(context, entry_market_state, p, require_breakdown_gate=True)
         signal = _short_entry_result(
             context,
-            market_state,
+            entry_market_state,
             p,
             short_path_key,
             as_decision=False,
