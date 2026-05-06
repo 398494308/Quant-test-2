@@ -25,7 +25,11 @@ class ResearchRuntimeConfigTest(unittest.TestCase):
                         "MACD_V2_PROMOTION_CAPTURE_WEIGHT=0.45",
                         "MACD_V2_PROMOTION_TIMED_RETURN_WEIGHT=0.30",
                         "MACD_V2_PROMOTION_SHARPE_FLOOR_WEIGHT=0.25",
-                        "MACD_V2_PROMOTION_TRADE_ACTIVITY_WEIGHT=0.10",
+                        "MACD_V2_PROMOTION_TRADE_ACTIVITY_PENALTY_WEIGHT=0.10",
+                        "MACD_V2_TRADE_ACTIVITY_TRAIN_RANGE_LOW=270",
+                        "MACD_V2_TRADE_ACTIVITY_TRAIN_RANGE_HIGH=360",
+                        "MACD_V2_TRADE_ACTIVITY_VALIDATION_RANGE_LOW=180",
+                        "MACD_V2_TRADE_ACTIVITY_VALIDATION_RANGE_HIGH=240",
                         "MACD_V2_ROBUSTNESS_PENALTY_CAP=0.31",
                         "MACD_V2_ROBUSTNESS_GAP_WARN_THRESHOLD=0.17",
                         "MACD_V2_ROBUSTNESS_GAP_FAIL_THRESHOLD=0.23",
@@ -55,7 +59,11 @@ class ResearchRuntimeConfigTest(unittest.TestCase):
             self.assertAlmostEqual(runtime.scoring.promotion_capture_weight, 0.45)
             self.assertAlmostEqual(runtime.scoring.promotion_timed_return_weight, 0.30)
             self.assertAlmostEqual(runtime.scoring.promotion_sharpe_floor_weight, 0.25)
-            self.assertAlmostEqual(runtime.scoring.promotion_trade_activity_weight, 0.10)
+            self.assertAlmostEqual(runtime.scoring.promotion_trade_activity_penalty_weight, 0.10)
+            self.assertEqual(runtime.scoring.trade_activity_train_range_low, 270)
+            self.assertEqual(runtime.scoring.trade_activity_train_range_high, 360)
+            self.assertEqual(runtime.scoring.trade_activity_validation_range_low, 180)
+            self.assertEqual(runtime.scoring.trade_activity_validation_range_high, 240)
             self.assertAlmostEqual(runtime.scoring.robustness_penalty_cap, 0.31)
             self.assertAlmostEqual(runtime.scoring.robustness_gap_warn_threshold, 0.17)
             self.assertAlmostEqual(runtime.scoring.robustness_gap_fail_threshold, 0.23)

@@ -466,15 +466,10 @@ def _low_activity_signal_payload(
     }
 
 
-def _trade_activity_score(actual: int, target: int) -> float:
-    diff = abs(int(actual) - int(target))
-    if diff <= 50:
-        return 1.0
-    if diff <= 100:
-        return 0.67
-    if diff <= 150:
-        return 0.33
-    return 0.0
+def _trade_activity_shortfall(actual: int, preferred_min: int) -> float:
+    floor = max(1, int(preferred_min))
+    trades = max(0, int(actual))
+    return _clamp(max(floor - trades, 0) / floor, 0.0, 1.0)
 
 
 # ==================== 趋势切段评分 ====================

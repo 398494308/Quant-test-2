@@ -143,7 +143,7 @@ DISCORD_CONFIG = load_discord_config()
 EVAL_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "eval")
 VALIDATION_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "validation")
 TEST_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "test")
-SCORE_REGIME = "trend_capture_v14_midfreq_sharpe_floor_balance"
+SCORE_REGIME = "trend_capture_v15_midfreq_trade_floor_penalty"
 MODEL_WORKSPACE_STRATEGY_PATH = Path("src/strategy_macd_aggressive.py")
 PRIMARY_DIRECTION_DOMAINS = frozenset({"long", "short", "mixed", "structure"})
 PLANNER_BRIEF_REQUIRED_FIELDS = ("primary_direction", "hypothesis", "change_plan", "novelty_proof", "change_tags")
@@ -3252,6 +3252,11 @@ def _build_model_round_brief(
         min_validation_block_floor=RUNTIME.gates.min_validation_block_floor,
         min_validation_closed_trades=RUNTIME.gates.min_validation_closed_trades,
         max_dev_validation_gap=RUNTIME.gates.max_dev_validation_gap,
+        trade_activity_train_range_low=RUNTIME.scoring.trade_activity_train_range_low,
+        trade_activity_train_range_high=RUNTIME.scoring.trade_activity_train_range_high,
+        trade_activity_validation_range_low=RUNTIME.scoring.trade_activity_validation_range_low,
+        trade_activity_validation_range_high=RUNTIME.scoring.trade_activity_validation_range_high,
+        promotion_trade_activity_penalty_weight=RUNTIME.scoring.promotion_trade_activity_penalty_weight,
         robustness_sharpe_gap_warn_threshold=RUNTIME.scoring.robustness_sharpe_gap_warn_threshold,
         robustness_sharpe_gap_fail_threshold=RUNTIME.scoring.robustness_sharpe_gap_fail_threshold,
     )

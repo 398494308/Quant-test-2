@@ -39,6 +39,7 @@ from research_v2.evaluation import (
     _collect_daily_path,
     _collect_trend_path,
     _robustness_penalty_payload,
+    _trade_activity_shortfall,
     _trend_score_report,
     _weighted_average,
     partial_eval_gate_snapshot,
@@ -550,13 +551,13 @@ class EvaluationFixesTest(unittest.TestCase):
             0.45 * report.metrics["capture_score"]
             + 0.30 * report.metrics["timed_return_score"]
             + 0.25 * report.metrics["sharpe_floor_score"]
-            + 0.10 * report.metrics["trade_activity_score"]
             - expected_drawdown_penalty
             - report.metrics["robustness_penalty_score"]
+            - report.metrics["trade_activity_penalty"]
         )
         self.assertAlmostEqual(report.metrics["drawdown_penalty_score"], expected_drawdown_penalty)
         self.assertAlmostEqual(report.metrics["promotion_score"], expected_promotion_score)
-        self.assertIn("trade_activity_score", report.metrics)
+        self.assertIn("trade_activity_penalty", report.metrics)
         self.assertGreaterEqual(report.metrics["drawdown_risk_score"], 0.0)
         self.assertEqual(report.metrics["validation_block_count_used"], 0.0)
         self.assertEqual(report.metrics["eval_unique_trend_points"], 15.0)
@@ -737,11 +738,17 @@ class EvaluationFixesTest(unittest.TestCase):
                 0.45 * report.metrics["capture_score"]
                 + 0.30 * report.metrics["timed_return_score"]
                 + 0.25 * report.metrics["sharpe_floor_score"]
-                + 0.10 * report.metrics["trade_activity_score"]
                 - expected_drawdown_penalty
                 - report.metrics["robustness_penalty_score"]
+                - report.metrics["trade_activity_penalty"]
             ),
         )
+
+    def test_trade_activity_shortfall_only_penalizes_below_floor(self):
+        self.assertAlmostEqual(_trade_activity_shortfall(320, 270), 0.0)
+        self.assertAlmostEqual(_trade_activity_shortfall(270, 270), 0.0)
+        self.assertAlmostEqual(_trade_activity_shortfall(180, 270), 90.0 / 270.0)
+        self.assertAlmostEqual(_trade_activity_shortfall(0, 180), 1.0)
 
     def test_summarize_evaluation_drawdown_risk_penalizes_persistent_underwater_path(self):
         scoring = ScoringConfig(
@@ -1752,12 +1759,13 @@ class JournalPromptFixesTest(unittest.TestCase):
         )
 
         self.assertIn("最小晋级边际", prompt)
-        self.assertIn("0.45 / 0.30 / 0.25 / 0.10", prompt)
+        self.assertIn("0.45 / 0.30 / 0.25", prompt)
         self.assertIn("按日收益年化补分", prompt)
         self.assertIn("Sharpe floor", prompt)
         self.assertIn("分段回撤惩罚", prompt)
         self.assertIn("鲁棒性软惩罚", prompt)
-        self.assertIn("交易活跃度已并入主评分", prompt)
+        self.assertIn("单边低频惩罚", prompt)
+        self.assertIn("train 270-360 / val 180-240", prompt)
         self.assertIn("默认优先找更稳的平台", prompt)
         self.assertNotIn("promotion_delta >", prompt)
         self.assertIn("当前回合任务", prompt)

@@ -154,19 +154,26 @@ def summarize_evaluation_impl(
     validation_closed_trades = int(validation_source.get("trades", validation_long_trades + validation_short_trades))
     selection_closed_trades = int(selection_source.get("trades", selection_long_trades + selection_short_trades))
     train_closed_trades = max(0, selection_closed_trades - validation_closed_trades)
-    train_trade_activity_score = mod._trade_activity_score(train_closed_trades, 300)
-    validation_trade_activity_score = mod._trade_activity_score(validation_closed_trades, 150)
-    trade_activity_score = (
-        mod.TRAIN_VAL_SCORE_WEIGHT * train_trade_activity_score
-        + mod.TRAIN_VAL_SCORE_WEIGHT * validation_trade_activity_score
+    train_trade_activity_shortfall = mod._trade_activity_shortfall(
+        train_closed_trades,
+        scoring.trade_activity_train_range_low,
     )
+    validation_trade_activity_shortfall = mod._trade_activity_shortfall(
+        validation_closed_trades,
+        scoring.trade_activity_validation_range_low,
+    )
+    trade_activity_shortfall = (
+        mod.TRAIN_VAL_SCORE_WEIGHT * train_trade_activity_shortfall
+        + mod.TRAIN_VAL_SCORE_WEIGHT * validation_trade_activity_shortfall
+    )
+    trade_activity_penalty = scoring.promotion_trade_activity_penalty_weight * trade_activity_shortfall
     promotion_score = (
         scoring.promotion_capture_weight * capture_score
         + scoring.promotion_timed_return_weight * timed_return_score
         + scoring.promotion_sharpe_floor_weight * sharpe_floor_score
-        + scoring.promotion_trade_activity_weight * trade_activity_score
         - drawdown_penalty_score
         - robustness_penalty_score
+        - trade_activity_penalty
     )
     eval_funnel_counts = mod._aggregate_funnel_counts(results, "eval")
     validation_funnel_counts = mod._result_funnel_counts(validation_source)
@@ -240,8 +247,12 @@ def summarize_evaluation_impl(
             f"{timed_return_score:.2f} / {drawdown_risk_score:.2f} / {drawdown_penalty_score:.2f} / {promotion_score:.2f}"
         ),
         (
-            "train/val交易活跃度分 / 混合分: "
-            f"{train_trade_activity_score:.2f} / {validation_trade_activity_score:.2f} / {trade_activity_score:.2f}"
+            "交易活跃度区间(train/val) / 连续交易 / 短缺率 / 惩罚: "
+            f"{scoring.trade_activity_train_range_low}-{scoring.trade_activity_train_range_high} / "
+            f"{scoring.trade_activity_validation_range_low}-{scoring.trade_activity_validation_range_high} | "
+            f"{train_closed_trades} / {validation_closed_trades} | "
+            f"{train_trade_activity_shortfall:.2f} / {validation_trade_activity_shortfall:.2f} / "
+            f"{trade_activity_penalty:.2f}"
         ),
         f"train/val Sharpe floor / 归一化分: {train_val_sharpe_floor:.2f} / {sharpe_floor_score:.2f}",
         (
@@ -382,7 +393,9 @@ def summarize_evaluation_impl(
         (
             f"- 当前评分组成: train/val 连续趋势抓取混合分={train_capture_score:.2f}/{validation_capture_score:.2f}，"
             f"train/val 按日收益年化分={train_timed_return_score:.2f}/{validation_timed_return_score:.2f}，"
-            f"train/val 交易活跃度分={train_trade_activity_score:.2f}/{validation_trade_activity_score:.2f}，混合分={trade_activity_score:.2f}，"
+            f"train/val 连续交易={train_closed_trades}/{validation_closed_trades}，"
+            f"短缺率={train_trade_activity_shortfall:.2f}/{validation_trade_activity_shortfall:.2f}，"
+            f"低频惩罚={trade_activity_penalty:.2f}，"
             f"Sharpe floor归一化分={sharpe_floor_score:.2f}，"
             f"train/val 固定窗口回撤风险分={train_drawdown_risk_score:.2f}/{validation_drawdown_risk_score:.2f}，"
             f"回撤罚分={drawdown_penalty_score:.2f}，鲁棒性软惩罚={robustness_penalty_score:.2f}"
@@ -526,9 +539,10 @@ def summarize_evaluation_impl(
         "validation_long_closed_trades": float(validation_long_trades),
         "validation_short_closed_trades": float(validation_short_trades),
         "train_closed_trades": float(train_closed_trades),
-        "train_trade_activity_score": train_trade_activity_score,
-        "validation_trade_activity_score": validation_trade_activity_score,
-        "trade_activity_score": trade_activity_score,
+        "train_trade_activity_shortfall": train_trade_activity_shortfall,
+        "validation_trade_activity_shortfall": validation_trade_activity_shortfall,
+        "trade_activity_shortfall": trade_activity_shortfall,
+        "trade_activity_penalty": trade_activity_penalty,
         "selection_long_closed_trades": float(selection_long_trades),
         "selection_short_closed_trades": float(selection_short_trades),
         "validation_closed_trades": float(validation_closed_trades),

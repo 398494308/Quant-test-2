@@ -35,6 +35,14 @@ def _env_float(name: str, default: float) -> float:
     return float(os.getenv(name, str(default)))
 
 
+def _env_float_any(names: tuple[str, ...], default: float) -> float:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is not None:
+            return float(raw)
+    return float(default)
+
+
 def _env_int_tuple(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
     raw = str(os.getenv(name, ",".join(str(item) for item in default))).strip()
     if not raw:
@@ -58,11 +66,27 @@ def _load_scoring_config(windows: "WindowConfig") -> "ScoringConfig":
         "MACD_V2_RISK_WINDOW_STEP_DAYS",
         max(1, risk_window_days // 4),
     )
+    trade_activity_train_range_low = max(1, _env_int("MACD_V2_TRADE_ACTIVITY_TRAIN_RANGE_LOW", 270))
+    trade_activity_train_range_high = max(
+        trade_activity_train_range_low,
+        _env_int("MACD_V2_TRADE_ACTIVITY_TRAIN_RANGE_HIGH", 360),
+    )
+    trade_activity_validation_range_low = max(1, _env_int("MACD_V2_TRADE_ACTIVITY_VALIDATION_RANGE_LOW", 180))
+    trade_activity_validation_range_high = max(
+        trade_activity_validation_range_low,
+        _env_int("MACD_V2_TRADE_ACTIVITY_VALIDATION_RANGE_HIGH", 240),
+    )
     return ScoringConfig(
         promotion_capture_weight=_env_float("MACD_V2_PROMOTION_CAPTURE_WEIGHT", 0.45),
         promotion_timed_return_weight=_env_float("MACD_V2_PROMOTION_TIMED_RETURN_WEIGHT", 0.30),
         promotion_sharpe_floor_weight=_env_float("MACD_V2_PROMOTION_SHARPE_FLOOR_WEIGHT", 0.25),
-        promotion_trade_activity_weight=_env_float("MACD_V2_PROMOTION_TRADE_ACTIVITY_WEIGHT", 0.10),
+        promotion_trade_activity_penalty_weight=_env_float_any(
+            (
+                "MACD_V2_PROMOTION_TRADE_ACTIVITY_PENALTY_WEIGHT",
+                "MACD_V2_PROMOTION_TRADE_ACTIVITY_WEIGHT",
+            ),
+            0.10,
+        ),
         promotion_drawdown_base_weight=_env_float("MACD_V2_PROMOTION_DRAWDOWN_BASE_WEIGHT", 0.20),
         promotion_drawdown_knee=_env_float("MACD_V2_PROMOTION_DRAWDOWN_KNEE", 1.25),
         promotion_drawdown_excess_weight=_env_float("MACD_V2_PROMOTION_DRAWDOWN_EXCESS_WEIGHT", 1.00),
@@ -105,6 +129,10 @@ def _load_scoring_config(windows: "WindowConfig") -> "ScoringConfig":
         drawdown_risk_tail_quantile=_env_float("MACD_V2_DRAWDOWN_RISK_TAIL_QUANTILE", 0.75),
         drawdown_risk_tail_weight=_env_float("MACD_V2_DRAWDOWN_RISK_TAIL_WEIGHT", 0.60),
         drawdown_risk_scale_pct=max(0.1, _env_float("MACD_V2_DRAWDOWN_RISK_SCALE_PCT", 6.0)),
+        trade_activity_train_range_low=trade_activity_train_range_low,
+        trade_activity_train_range_high=trade_activity_train_range_high,
+        trade_activity_validation_range_low=trade_activity_validation_range_low,
+        trade_activity_validation_range_high=trade_activity_validation_range_high,
     )
 
 
@@ -166,7 +194,7 @@ class ScoringConfig:
     promotion_capture_weight: float = 0.45
     promotion_timed_return_weight: float = 0.30
     promotion_sharpe_floor_weight: float = 0.25
-    promotion_trade_activity_weight: float = 0.10
+    promotion_trade_activity_penalty_weight: float = 0.10
     promotion_drawdown_base_weight: float = 0.20
     promotion_drawdown_knee: float = 1.25
     promotion_drawdown_excess_weight: float = 1.00
@@ -209,6 +237,10 @@ class ScoringConfig:
     drawdown_risk_tail_quantile: float = 0.75
     drawdown_risk_tail_weight: float = 0.60
     drawdown_risk_scale_pct: float = 6.0
+    trade_activity_train_range_low: int = 270
+    trade_activity_train_range_high: int = 360
+    trade_activity_validation_range_low: int = 180
+    trade_activity_validation_range_high: int = 240
 
 
 @dataclass(frozen=True)

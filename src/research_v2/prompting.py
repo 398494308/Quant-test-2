@@ -384,7 +384,7 @@ def build_strategy_research_prompt(
     reference_metrics: dict[str, Any] | None = None,
     benchmark_label: str = "champion",
     current_base_role: str = "champion",
-    score_regime: str = "trend_capture_v14_midfreq_sharpe_floor_balance",
+    score_regime: str = "trend_capture_v15_midfreq_trade_floor_penalty",
     current_complexity_headroom_text: str = "",
     session_mode: str = "resume",
     operator_focus_text: str = "",
@@ -404,10 +404,15 @@ def build_strategy_research_prompt(
     min_validation_block_floor: float = 0.05,
     min_validation_closed_trades: int = 0,
     max_dev_validation_gap: float = 0.30,
+    trade_activity_train_range_low: int = 270,
+    trade_activity_train_range_high: int = 360,
+    trade_activity_validation_range_low: int = 180,
+    trade_activity_validation_range_high: int = 240,
+    promotion_trade_activity_penalty_weight: float = 0.10,
     robustness_sharpe_gap_warn_threshold: float = 0.15,
     robustness_sharpe_gap_fail_threshold: float = 0.30,
 ) -> str:
-    _ = current_complexity_headroom_text
+    _ = (current_complexity_headroom_text, min_validation_closed_trades)
     side_bias_guidance = _side_bias_guidance(reference_metrics)
     side_bias_block = f"\n{side_bias_guidance}\n" if side_bias_guidance else ""
     champion_focus_hint = _champion_focus_hint(reference_metrics)
@@ -454,7 +459,7 @@ def build_strategy_research_prompt(
 - 围绕一个可证伪假设先写 round brief，交给后续 edit worker 落码。
 - 本轮目标是改变真实交易路径，不是只制造源码 diff；若 smoke 行为完全不变，会被系统按 `behavioral_noop` 拒收。
 - 当前评分口径是 `{score_regime}`；只要 `gate` 通过，且 `promotion_score` 达到当前 {benchmark_label} 之上的最小晋级边际，候选才有资格刷新当前 active reference。
-- `promotion_score` 现在以 `capture_score / timed_return_score / Sharpe floor score / trade_activity_score = 0.45 / 0.30 / 0.25 / 0.10` 为主体；其中 `trade_activity_score` 的目标是 `train≈300`、`val≈150`，偏离越远分越低，`timed_return_score` 仍是按日收益年化补分，再减去分段回撤惩罚和轻量鲁棒性软惩罚。
+- `promotion_score` 现在以 `capture_score / timed_return_score / Sharpe floor score = 0.45 / 0.30 / 0.25` 为主体；再额外减去 `trade_activity_penalty`。这项低频惩罚的权重是 `{promotion_trade_activity_penalty_weight:.2f}`：希望区间约是 `train {trade_activity_train_range_low}-{trade_activity_train_range_high} / val {trade_activity_validation_range_low}-{trade_activity_validation_range_high}` 笔。高于区间不加分也不扣分，只有低于区间下沿时才按短缺比例扣分。`timed_return_score` 仍是按日收益年化补分，再减去分段回撤惩罚和轻量鲁棒性软惩罚。
 - `capture_score` 不再只偏向少数最大趋势段；`train/val` 连续趋势抓取分采用“段等权均分 50% + 原权重均分 50%”的混合方式。
 - 鲁棒性重点看 `train/val` 抓取落差、`train/val` Sharpe 平衡、`val` 分块稳定性，以及退出参数邻域在 `val` 分段上的平台形态。
 - `train` 滚动窗口均值/中位数、过拟合集中度仍保留为 gate/诊断，但不再是 `promotion_score` 主公式的一部分。
@@ -488,7 +493,7 @@ def build_strategy_research_prompt(
 当前口径的 gate / 评分提醒：
 - val 趋势段命中率 >= 35%
 - val 趋势捕获分 >= 0.05
-- 交易活跃度已并入主评分：train 目标约 300 笔，val 目标约 150 笔，越接近越好；不再作为硬 gate
+- 交易活跃度现在是“单边低频惩罚”：希望区间约是 `train {trade_activity_train_range_low}-{trade_activity_train_range_high} / val {trade_activity_validation_range_low}-{trade_activity_validation_range_high}`；高于区间不奖不罚，低于下沿才会扣分
 - train 与 val 分数落差 <= {max_dev_validation_gap:.2f}
 - val 多头捕获 >= 0.00，val 空头捕获 >= 0.00
 - val 会再切成 {validation_block_count} 个连续时间分块：最差分块 >= {min_validation_block_floor:.2f}，负分块最多 1 个

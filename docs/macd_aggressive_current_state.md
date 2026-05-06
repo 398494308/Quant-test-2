@@ -4,7 +4,7 @@
 
 ## 当前快照
 
-说明：`2026-05-06 17:19`（Asia/Shanghai）已按新的交易活跃度评分口径完成基线重算，并把当前人工压缩版源码写成新的 active reference。下面这张表已经同步到最新 `state/research_macd_aggressive_v2_best.json` 的写回结果；评分公式与 gate 口径以下文为准。
+说明：`2026-05-06 17:56`（Asia/Shanghai）已按新的交易活跃度低频惩罚口径完成一次 `--reset-best` 基线重算，并把当前人工压缩版源码写成新的 active reference。下面这张表已经同步到最新 `state/research_macd_aggressive_v2_best.json` 的写回结果；评分公式与 gate 口径以下文为准。
 
 运行时只有一个 active reference。最新快照在：
 
@@ -28,11 +28,11 @@
 | --- | --- |
 | 当前角色 | baseline |
 | 当前 reference hash | faba5c690d732548f69d42f27d2229103928aab05c1f180399fb69814152cc15 |
-| 当前 reference stage 起点轮次 | 0 |
+| 当前 reference stage 起点轮次 | 1 |
 | gate | train均值分偏低(0.03)；val命中率偏低(22%)；val最差分块过弱(-0.02) |
-| score regime（保存态 / 仓库默认） | trend_capture_v14_midfreq_sharpe_floor_balance / trend_capture_v14_midfreq_sharpe_floor_balance |
+| score regime（保存态 / 仓库默认） | trend_capture_v15_midfreq_trade_floor_penalty / trend_capture_v15_midfreq_trade_floor_penalty |
 | quality_score（train连续趋势分） | 0.1428 |
-| promotion_score（保存态） | -0.1044 |
+| promotion_score（保存态） | -0.2085 |
 | capture_score / timed_return_score / sharpe_floor_score / turn_protection_score | 0.1891 / 0.0786 / 0.1113 / 0.9475 |
 | drawdown_risk_score / drawdown_penalty_score / robustness_penalty_score | 0.3373 / 0.0675 / 0.1900 |
 | train/val连续抓取分 | 0.1428 / 0.2355 |
@@ -43,7 +43,7 @@
 | Sharpe(train / val / train+val) | 0.48 / 0.22 / 0.37 |
 | test收益 / Sharpe | - / - |
 | train/val连续交易 | 28 / 26 |
-| train/val交易活跃度分 / 混合分 | 0.00 / 0.33 / 0.17 |
+| train/val交易短缺率 / 低频惩罚 | 0.8963 / 0.8556 / 0.0876 |
 
 当前轮次留档除了 `journal` 与 `memory/raw` 外，还额外维护一条最小可复现链路：
 
@@ -53,13 +53,13 @@
 
 说明：
 
-- 上表按当前 [state/research_macd_aggressive_v2_best.json](../state/research_macd_aggressive_v2_best.json) 的最近保存态整理；当前 best 写回时间是 `2026-05-06T09:19:23Z`，当前 active reference 是人工压缩后重新评估出来的 `baseline`。
-- 仓库默认评分已经切到 `trend_capture_v14_midfreq_sharpe_floor_balance`；研究器启动时会先从已保存 champion 重算新口径，再继续后续轮次。
+- 上表按当前 [state/research_macd_aggressive_v2_best.json](../state/research_macd_aggressive_v2_best.json) 的最近保存态整理；当前 best 写回时间是 `2026-05-06T09:56:48Z`，当前 active reference 是人工压缩后按 `v15` 重新评估出来的 `baseline`。
+- 仓库默认评分已经切到 `trend_capture_v15_midfreq_trade_floor_penalty`；当前保存态也已完成同口径重算，不再混用旧 `v14` 的主评分结果。
 - 新口径下 `drawdown_risk_score` 仍是固定窗口 `Ulcer` 风格风险分；`promotion_score` 在分段回撤惩罚之外，又额外接了一层轻量鲁棒性软惩罚，当前更明确压 `val` 最差块、尾块和 `train/val` Sharpe gap，弱侧 Sharpe 通过 `sharpe_floor_score` 进入主分。
 - 当前人工方向已经从“继续补多头收益”切到“优先 `train/val` 稳定性、中频覆盖和弱侧修复”；长期软引导在 [config/research_v2_operator_focus.md](../config/research_v2_operator_focus.md)，人工观察卡仍在 [config/research_v2_champion_review.md](../config/research_v2_champion_review.md) 中按 hash 绑定，仅命中当前 hash 时生效。
 - `state/research_macd_aggressive_v2_best.json` 里如果还带旧字段，例如 `working_base`，那只是历史兼容读取入口；新状态写回只使用单一 active reference 语义。
 - 本次重启前已先把当前人工压缩版源码同步到 `backups/strategy_macd_aggressive_v2_best.py`，避免研究器启动时把旧保存态覆盖回主策略文件。
-- 当前运行状态以 [state/research_macd_aggressive_v2_heartbeat.json](../state/research_macd_aggressive_v2_heartbeat.json) 为准；本文更新时研究器已按新口径重启，完成基线重算，并进入 `iteration 1` 的 planner 阶段。
+- 当前运行状态以 [state/research_macd_aggressive_v2_heartbeat.json](../state/research_macd_aggressive_v2_heartbeat.json) 或 `./scripts/manage_research_macd_aggressive_v2.sh status` 为准；本文更新时研究器已按新口径重启，并正在重新加载这份 `v15` baseline。
 - `real-money-test/` 这条执行壳子现在默认转为 `OKX Demo Trading`：策略必须先冻结为固定副本，`demo` 只认 `OKX_DEMO_*` 凭证，旧 `dry-run` 代码保留但不再默认使用，播报也切到 `demo` 卡口径。
 - 如果你想把 `demo` 账户里的更大余额压到固定测试规模，当前壳子支持通过 `OKX_DEMO_AVAILABLE_CAPITAL` 给 `freqtrade` 注入单 bot 资金上限；例如 `1000` 表示只按 `1000 USDT` 规模运行。
 
@@ -107,7 +107,7 @@
 - `turn_protection_score`
   `train/val` 趋势掉头窗口保护分按 `5:5` 平均后的诊断分，不再直接进入晋级主公式
 - `promotion_score`
-  最终晋级分。以 `capture_score` 为主，加入 `timed_return_score` 和 `sharpe_floor_score`，再减去 `drawdown_penalty_score` 与 `robustness_penalty_score`
+  最终晋级分。以 `capture_score` 为主，加入 `timed_return_score` 和 `sharpe_floor_score`，再减去 `drawdown_penalty_score`、`robustness_penalty_score` 和 `trade_activity_penalty`
 
 当前默认公式：
 
@@ -121,7 +121,11 @@
 
 `sharpe_floor_score = clamp(min(train_sharpe_ratio, val_sharpe_ratio) / 2.0, 0.0, 1.0)`
 
-`trade_activity_score = 0.50 * train_trade_activity_score + 0.50 * val_trade_activity_score`
+`train_trade_activity_shortfall = clamp(max(270 - train_closed_trades, 0) / 270, 0.0, 1.0)`
+
+`val_trade_activity_shortfall = clamp(max(180 - validation_closed_trades, 0) / 180, 0.0, 1.0)`
+
+`trade_activity_penalty = 0.10 * (0.50 * train_trade_activity_shortfall + 0.50 * val_trade_activity_shortfall)`
 
 `drawdown_risk_score = 0.50 * train_drawdown_risk_score + 0.50 * val_drawdown_risk_score`
 
@@ -129,11 +133,11 @@
 
 `drawdown_penalty_score = 0.20 * drawdown_risk_score + 1.00 * max(drawdown_risk_score - 1.25, 0.0)`
 
-`promotion_score = 0.45 * capture_score + 0.30 * timed_return_score + 0.25 * sharpe_floor_score + 0.10 * trade_activity_score - drawdown_penalty_score - robustness_penalty_score`
+`promotion_score = 0.45 * capture_score + 0.30 * timed_return_score + 0.25 * sharpe_floor_score - drawdown_penalty_score - robustness_penalty_score - trade_activity_penalty`
 
 这里特意把 `capture_score` 从“更像追最大段”拉回到“既看大段，也看整体覆盖”；同时把 Sharpe 只用作弱侧保底，不再让它通过软惩罚和主分双重影响总分。
 
-`trade_activity_score` 不新增回测。`train` 交易数直接复用现有连续期结果：用 `train+val` 连续回测总交易数减去 `val` 连续回测交易数，得到 `train` 两年的连续交易数；`val` 交易数直接复用现有 `val` 连续回测结果。两侧再按“离目标差多少”做分段记分：与目标差 `<=50 / <=100 / <=150 / >150` 时，对应 `1.00 / 0.67 / 0.33 / 0.00`。
+`trade_activity_penalty` 不新增回测。`train` 交易数直接复用现有连续期结果：用 `train+val` 连续回测总交易数减去 `val` 连续回测交易数，得到 `train` 两年的连续交易数；`val` 交易数直接复用现有 `val` 连续回测结果。当前实现只在交易数低于下沿时扣分：`train` 下沿是 `270`，`val` 下沿是 `180`。高于这些下沿不加分也不扣分；区间上沿 `360 / 240` 主要用于研究提示和人工读数，不额外参与计算。
 
 `drawdown_risk_score` 直接复用现有 `train/val` 日收益路径，不新增回测。两侧都按固定 `28` 天窗口滚动切分，再对每个窗口计算 `Ulcer` 风格回撤值，最后用 `median + P75` 的加权聚合成风险分。这样 `train` 的滚动窗口路径和 `val` 的整年路径会落到同一时间单位上比较，也不会被一次单日极端点完全主导。
 
@@ -166,7 +170,7 @@
 - `val` 分成 `4` 块后，最差块至少 `0.05`
 - `val` 负块数量最多 `1`
 
-交易活跃度不再是硬 gate；它已经进入 `promotion_score` 主公式，目标是 `train≈300`、`val≈150`，越接近越好。
+交易活跃度不再是硬 gate；它已经进入 `promotion_score` 主公式，但现在是“单边低频惩罚”：希望区间约是 `train 270-360 / val 180-240`。高于区间不奖不罚，低于下沿才按短缺比例扣分。
 
 另外仍保留过拟合诊断。严重集中度会直接 veto，普通风险会进入 journal 和历史摘要。
 

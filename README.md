@@ -31,7 +31,7 @@
 - 事实层：`15m`
 - `1h / 4h` 由 `15m` 聚合得到，只做趋势和环境确认
 - 回测执行价优先使用 `1m`
-- 当前评分口径：`trend_capture_v14_midfreq_sharpe_floor_balance`
+- 当前评分口径：`trend_capture_v15_midfreq_trade_floor_penalty`
 
 时间窗口：
 
@@ -43,9 +43,9 @@
 
 - 候选必须先过 `gate`
 - 再满足 `promotion_score` 达到当前 active reference 之上的最小晋级边际；若 `quality_score` 回落，则需要更高边际
-- `promotion_score = 0.45 * capture_score + 0.30 * timed_return_score + 0.25 * sharpe_floor_score - drawdown_penalty_score - robustness_penalty_score`
+- `promotion_score = 0.45 * capture_score + 0.30 * timed_return_score + 0.25 * sharpe_floor_score - drawdown_penalty_score - robustness_penalty_score - trade_activity_penalty`
 - `capture_score` 不再只由最大趋势段主导；`train/val` 连续趋势抓取分改为“段等权均分 50% + 原权重均分 50%”的混合方式
-- `val` 年内平仓数至少 `180` 笔，约等于每月 `15` 笔，交易数只做 gate，不单独加分
+- `trade_activity_penalty` 是单边低频惩罚：希望区间约是 `train 270-360 / val 180-240`。高于区间不加分也不扣分，低于下沿时才按短缺比例扣分，不再单独做交易数硬 gate
 - 鲁棒性软惩罚只看 `train/val` 落差、`val` 分块稳定性，以及退出参数邻域在 `val` 3 段上的平台形态；当前更明确压 `val` 最差块、尾块和 `train/val` Sharpe gap，弱侧 Sharpe 通过 `sharpe_floor_score` 进入主分
 - `train` 滚动窗口均值/中位数、`val` 分块稳定性和过拟合集中度继续用于 gate 和诊断，不再直接进入晋级主公式
 - `test` 对新 champion 同步运行；对已完成完整评估但未保留的候选会后台异步补跑关键指标，只做观察记录，不参与晋升，也不进入 prompt
@@ -123,7 +123,7 @@ flowchart TB
 - `GPT` 更适合固定框架、规则严密、执行链稳定的角色，例如 `reviewer / edit_worker / repair_worker / summary_worker`
 - `DeepSeek` 在发散找方向、提出新假设、快速换研究层级这类 `planner` 任务里，当前表现更好
 
-这个结论只针对当前仓库、当前评分口径 `trend_capture_v14_midfreq_sharpe_floor_balance` 和当前这组实验流程成立，不把它外推成所有任务的一般结论。
+这个结论只针对当前仓库、当前评分口径 `trend_capture_v15_midfreq_trade_floor_penalty` 和当前这组实验流程成立，不把它外推成所有任务的一般结论。
 
 ### 为什么保留混合架构
 
