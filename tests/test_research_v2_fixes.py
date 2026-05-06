@@ -40,6 +40,7 @@ from research_v2.evaluation import (
     _collect_trend_path,
     _robustness_penalty_payload,
     _trend_score_report,
+    _weighted_average,
     partial_eval_gate_snapshot,
     summarize_evaluation,
 )
@@ -111,6 +112,7 @@ def make_gate_config(**overrides):
         "min_validation_bull_capture": -10.0,
         "min_validation_bear_capture": -10.0,
         "max_fee_drag_pct": 100.0,
+        "min_validation_closed_trades": 0,
         "validation_block_count": 3,
         "min_validation_block_floor": -100.0,
         "max_validation_block_failures": 100,
@@ -502,17 +504,29 @@ class EvaluationFixesTest(unittest.TestCase):
             report.metrics["eval_trend_capture_score"],
             sum(item.trend_score for item in expected_eval_window_scores) / len(expected_eval_window_scores),
         )
+        expected_train_capture_weighted_score = _weighted_average(
+            [(detail.score, detail.weight) for detail in expected_eval_report.segment_details]
+        )
+        expected_validation_capture_weighted_score = _weighted_average(
+            [(detail.score, detail.weight) for detail in expected_validation_report.segment_details]
+        )
+        expected_train_capture_score = (
+            0.50 * expected_eval_report.trend_score + 0.50 * expected_train_capture_weighted_score
+        )
+        expected_validation_capture_score = (
+            0.50 * expected_validation_report.trend_score + 0.50 * expected_validation_capture_weighted_score
+        )
         self.assertAlmostEqual(report.metrics["combined_trend_capture_score"], expected_full_period_report.trend_score)
         self.assertAlmostEqual(report.metrics["full_period_trend_capture_score"], expected_full_period_report.trend_score)
-        self.assertAlmostEqual(report.metrics["train_capture_score"], expected_eval_report.trend_score)
-        self.assertAlmostEqual(report.metrics["validation_capture_score"], expected_validation_report.trend_score)
+        self.assertAlmostEqual(report.metrics["train_capture_score"], expected_train_capture_score)
+        self.assertAlmostEqual(report.metrics["validation_capture_score"], expected_validation_capture_score)
         self.assertAlmostEqual(
             report.metrics["capture_score"],
-            0.50 * (expected_eval_report.trend_score + expected_validation_report.trend_score),
+            0.50 * (expected_train_capture_score + expected_validation_capture_score),
         )
         self.assertAlmostEqual(
             report.metrics["quality_score"],
-            expected_eval_report.trend_score,
+            expected_train_capture_score,
         )
         self.assertAlmostEqual(
             report.metrics["validation_score"],
@@ -533,8 +547,9 @@ class EvaluationFixesTest(unittest.TestCase):
             + 1.00 * max(report.metrics["drawdown_risk_score"] - 1.25, 0.0)
         )
         expected_promotion_score = (
-            0.80 * report.metrics["capture_score"]
-            + 0.20 * report.metrics["timed_return_score"]
+            0.45 * report.metrics["capture_score"]
+            + 0.30 * report.metrics["timed_return_score"]
+            + 0.25 * report.metrics["sharpe_floor_score"]
             - expected_drawdown_penalty
             - report.metrics["robustness_penalty_score"]
         )
@@ -717,8 +732,9 @@ class EvaluationFixesTest(unittest.TestCase):
         self.assertAlmostEqual(
             report.metrics["promotion_score"],
             (
-                0.80 * report.metrics["capture_score"]
-                + 0.20 * report.metrics["timed_return_score"]
+                0.45 * report.metrics["capture_score"]
+                + 0.30 * report.metrics["timed_return_score"]
+                + 0.25 * report.metrics["sharpe_floor_score"]
                 - expected_drawdown_penalty
                 - report.metrics["robustness_penalty_score"]
             ),
@@ -848,12 +864,36 @@ class EvaluationFixesTest(unittest.TestCase):
         self.assertAlmostEqual(payload["block_floor_penalty_score"], 0.06)
         self.assertAlmostEqual(payload["block_tail_penalty_score"], 0.03)
         self.assertAlmostEqual(payload["block_fail_penalty_score"], 0.03)
+        self.assertAlmostEqual(payload["sharpe_gap_penalty_score"], 0.0)
+        self.assertAlmostEqual(payload["sharpe_floor_penalty_score"], 0.0)
         self.assertAlmostEqual(payload["plateau_penalty_score"], 0.15)
         self.assertAlmostEqual(payload["validation_block_tail_gap"], 0.20)
         self.assertAlmostEqual(payload["robustness_penalty_score_raw"], 0.40)
         self.assertAlmostEqual(payload["robustness_penalty_score"], 0.25)
         self.assertEqual(payload["plateau_probe_enabled"], 1.0)
         self.assertEqual(payload["plateau_current_is_best"], 0.0)
+
+    def test_robustness_penalty_payload_adds_train_val_sharpe_balance_penalties(self):
+        payload = _robustness_penalty_payload(
+            promotion_gap=0.05,
+            block_report=ValidationBlockReport(
+                block_scores=(),
+                mean_score=0.0,
+                std_score=0.0,
+                min_score=0.0,
+                tail_score=0.0,
+                fail_count=0,
+                used_block_count=0,
+            ),
+            scoring=ScoringConfig(),
+            train_sharpe_ratio=1.90,
+            validation_sharpe_ratio=0.80,
+        )
+
+        self.assertAlmostEqual(payload["train_val_sharpe_gap"], 1.10)
+        self.assertAlmostEqual(payload["train_val_sharpe_floor"], 0.80)
+        self.assertAlmostEqual(payload["sharpe_gap_penalty_score"], 0.06)
+        self.assertAlmostEqual(payload["sharpe_floor_penalty_score"], 0.03)
 
     def test_summarize_evaluation_emits_funnel_without_low_activity_soft_signal(self):
         eval_window = type("Window", (), {"group": "eval", "label": "train1", "start_date": "2026-01-01", "end_date": "2026-01-10"})()
@@ -1708,11 +1748,14 @@ class JournalPromptFixesTest(unittest.TestCase):
             previous_best_score=1.23,
         )
 
-        self.assertIn("promotion_score` 高于当前 champion", prompt)
-        self.assertIn("权重 `8:2`", prompt)
+        self.assertIn("最小晋级边际", prompt)
+        self.assertIn("0.45 / 0.30 / 0.25", prompt)
         self.assertIn("按日收益年化补分", prompt)
+        self.assertIn("Sharpe floor", prompt)
         self.assertIn("分段回撤惩罚", prompt)
         self.assertIn("鲁棒性软惩罚", prompt)
+        self.assertIn("val 年内平仓数 >= 180", prompt)
+        self.assertIn("默认优先找更稳的平台", prompt)
         self.assertNotIn("promotion_delta >", prompt)
         self.assertIn("当前回合任务", prompt)
         self.assertIn("卡片摘要（已展开，不需要再假设自己能读本地文件）", prompt)
@@ -4921,7 +4964,7 @@ class ReferenceStateFixesTest(unittest.TestCase):
         self.assertTrue(accepted)
         self.assertIn("首个 gate-passed champion", reason)
 
-    def test_promotion_acceptance_accepts_small_positive_improvement(self):
+    def test_promotion_acceptance_accepts_when_reaching_min_margin_without_quality_drop(self):
         baseline_report = EvaluationReport(
             metrics={"promotion_score": 0.40, "quality_score": 0.33},
             gate_passed=True,
@@ -4930,7 +4973,7 @@ class ReferenceStateFixesTest(unittest.TestCase):
             prompt_summary_text="",
         )
         candidate_report = EvaluationReport(
-            metrics={"promotion_score": 0.41, "quality_score": 0.30},
+            metrics={"promotion_score": 0.42, "quality_score": 0.33},
             gate_passed=True,
             gate_reason="通过",
             summary_text="",
@@ -4938,18 +4981,25 @@ class ReferenceStateFixesTest(unittest.TestCase):
         )
         original_best_report = research_script.best_report
         original_champion = research_script.champion_report
+        original_runtime = research_script.RUNTIME
         try:
             research_script.best_report = baseline_report
             research_script.champion_report = baseline_report
+            research_script.RUNTIME = replace(
+                research_script.RUNTIME,
+                promotion_accept_margin=0.02,
+                promotion_accept_quality_drop_margin=0.03,
+            )
             accepted, reason = research_script._promotion_acceptance_decision(candidate_report)
         finally:
             research_script.best_report = original_best_report
             research_script.champion_report = original_champion
+            research_script.RUNTIME = original_runtime
 
         self.assertTrue(accepted)
         self.assertEqual("通过", reason)
 
-    def test_promotion_acceptance_rejects_non_improving_candidate(self):
+    def test_promotion_acceptance_requires_extra_margin_when_quality_drops(self):
         baseline_report = EvaluationReport(
             metrics={"promotion_score": 0.40, "quality_score": 0.33},
             gate_passed=True,
@@ -4958,7 +5008,7 @@ class ReferenceStateFixesTest(unittest.TestCase):
             prompt_summary_text="",
         )
         candidate_report = EvaluationReport(
-            metrics={"promotion_score": 0.40, "quality_score": 0.36},
+            metrics={"promotion_score": 0.42, "quality_score": 0.32},
             gate_passed=True,
             gate_reason="通过",
             summary_text="",
@@ -4966,16 +5016,58 @@ class ReferenceStateFixesTest(unittest.TestCase):
         )
         original_best_report = research_script.best_report
         original_champion = research_script.champion_report
+        original_runtime = research_script.RUNTIME
         try:
             research_script.best_report = baseline_report
             research_script.champion_report = baseline_report
+            research_script.RUNTIME = replace(
+                research_script.RUNTIME,
+                promotion_accept_margin=0.02,
+                promotion_accept_quality_drop_margin=0.03,
+            )
             accepted, reason = research_script._promotion_acceptance_decision(candidate_report)
         finally:
             research_script.best_report = original_best_report
             research_script.champion_report = original_champion
+            research_script.RUNTIME = original_runtime
 
         self.assertFalse(accepted)
-        self.assertEqual("未超过当前champion晋级分(0.40 <= 0.40)", reason)
+        self.assertEqual("质量分回落时未达到更高晋级门槛(0.42 < 0.43)", reason)
+
+    def test_promotion_acceptance_rejects_sub_margin_candidate_even_if_quality_improves(self):
+        baseline_report = EvaluationReport(
+            metrics={"promotion_score": 0.40, "quality_score": 0.33},
+            gate_passed=True,
+            gate_reason="通过",
+            summary_text="",
+            prompt_summary_text="",
+        )
+        candidate_report = EvaluationReport(
+            metrics={"promotion_score": 0.41, "quality_score": 0.36},
+            gate_passed=True,
+            gate_reason="通过",
+            summary_text="",
+            prompt_summary_text="",
+        )
+        original_best_report = research_script.best_report
+        original_champion = research_script.champion_report
+        original_runtime = research_script.RUNTIME
+        try:
+            research_script.best_report = baseline_report
+            research_script.champion_report = baseline_report
+            research_script.RUNTIME = replace(
+                research_script.RUNTIME,
+                promotion_accept_margin=0.02,
+                promotion_accept_quality_drop_margin=0.03,
+            )
+            accepted, reason = research_script._promotion_acceptance_decision(candidate_report)
+        finally:
+            research_script.best_report = original_best_report
+            research_script.champion_report = original_champion
+            research_script.RUNTIME = original_runtime
+
+        self.assertFalse(accepted)
+        self.assertEqual("未达到当前champion晋级门槛(0.41 < 0.42)", reason)
 
     def test_initialize_best_state_falls_back_when_saved_reference_source_is_invalid(self):
         valid_source = (REPO_ROOT / "src/strategy_macd_aggressive.py").read_text()

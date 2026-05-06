@@ -451,13 +451,24 @@ def _low_activity_signal_payload(
     selection_counts: dict[str, dict[str, int]],
     validation_closed_trades: int,
     selection_closed_trades: int,
+    min_validation_closed_trades: int = 180,
 ) -> dict[str, Any]:
     _ = (
         validation_counts,
         selection_counts,
-        validation_closed_trades,
         selection_closed_trades,
     )
+    trade_floor = max(1, int(min_validation_closed_trades))
+    if validation_closed_trades > 0 and validation_closed_trades < trade_floor:
+        return {
+            "count": 1,
+            "lines": [
+                "val交易笔数偏少"
+                f"（{validation_closed_trades}/{trade_floor}），当前方向更像低频段而不是你要的中频运行态"
+            ],
+            "prompt_line": "",
+            "tags": ("low_validation_trades",),
+        }
     return {
         "count": 0,
         "lines": [],
@@ -888,6 +899,8 @@ def _robustness_penalty_payload(
     promotion_gap: float,
     block_report: ValidationBlockReport,
     scoring: ScoringConfig,
+    train_sharpe_ratio: float | None = None,
+    validation_sharpe_ratio: float | None = None,
     plateau_probe: Mapping[str, Any] | None = None,
 ) -> dict[str, float]:
     positive_gap = max(0.0, float(promotion_gap))
@@ -897,6 +910,12 @@ def _robustness_penalty_payload(
         if blocks_enabled
         else 0.0
     )
+    sharpe_gap = 0.0
+    sharpe_floor = 0.0
+    sharpe_penalties_enabled = train_sharpe_ratio is not None and validation_sharpe_ratio is not None
+    if sharpe_penalties_enabled:
+        sharpe_gap = abs(float(train_sharpe_ratio) - float(validation_sharpe_ratio))
+        sharpe_floor = min(float(train_sharpe_ratio), float(validation_sharpe_ratio))
     plateau_payload = _plateau_penalty_payload(plateau_probe, scoring)
 
     gap_penalty_score = _upper_band_penalty(
@@ -910,6 +929,8 @@ def _robustness_penalty_payload(
     block_floor_penalty_score = 0.0
     block_tail_penalty_score = 0.0
     block_fail_penalty_score = 0.0
+    sharpe_gap_penalty_score = 0.0
+    sharpe_floor_penalty_score = 0.0
     if blocks_enabled:
         block_std_penalty_score = _upper_band_penalty(
             float(block_report.std_score),
@@ -936,22 +957,43 @@ def _robustness_penalty_payload(
             int(scoring.robustness_block_fail_penalty_cap_count),
             max(0, int(block_report.fail_count)),
         )
+    if sharpe_penalties_enabled:
+        sharpe_gap_penalty_score = _upper_band_penalty(
+            sharpe_gap,
+            warn_threshold=scoring.robustness_sharpe_gap_warn_threshold,
+            fail_threshold=scoring.robustness_sharpe_gap_fail_threshold,
+            warn_penalty=scoring.robustness_sharpe_gap_warn_penalty,
+            fail_penalty=scoring.robustness_sharpe_gap_fail_penalty,
+        )
+        sharpe_floor_penalty_score = _lower_band_penalty(
+            sharpe_floor,
+            warn_threshold=scoring.robustness_sharpe_floor_warn_threshold,
+            fail_threshold=scoring.robustness_sharpe_floor_fail_threshold,
+            warn_penalty=scoring.robustness_sharpe_floor_warn_penalty,
+            fail_penalty=scoring.robustness_sharpe_floor_fail_penalty,
+        )
     raw_penalty_score = (
         gap_penalty_score
         + block_std_penalty_score
         + block_floor_penalty_score
         + block_tail_penalty_score
         + block_fail_penalty_score
+        + sharpe_gap_penalty_score
+        + sharpe_floor_penalty_score
         + plateau_payload["penalty_score"]
     )
     penalty_score = min(max(0.0, float(scoring.robustness_penalty_cap)), raw_penalty_score)
     return {
         "validation_block_tail_gap": tail_gap,
+        "train_val_sharpe_gap": sharpe_gap,
+        "train_val_sharpe_floor": sharpe_floor,
         "gap_penalty_score": gap_penalty_score,
         "block_std_penalty_score": block_std_penalty_score,
         "block_floor_penalty_score": block_floor_penalty_score,
         "block_tail_penalty_score": block_tail_penalty_score,
         "block_fail_penalty_score": block_fail_penalty_score,
+        "sharpe_gap_penalty_score": sharpe_gap_penalty_score,
+        "sharpe_floor_penalty_score": sharpe_floor_penalty_score,
         "plateau_penalty_score": plateau_payload["penalty_score"],
         "robustness_penalty_score_raw": raw_penalty_score,
         "robustness_penalty_score": penalty_score,

@@ -79,12 +79,12 @@ def _markdown_section_bullets(text: str) -> dict[str, list[str]]:
 def _compact_operator_focus_text(text: str) -> str:
     sections = _markdown_section_bullets(text)
     lines: list[str] = []
-    lines.extend(sections.get("优先方向", [])[:3])
-    lines.extend(sections.get("降权方向", [])[:2])
-    lines.extend(sections.get("默认动作", [])[:1])
+    lines.extend(sections.get("优先方向", [])[:4])
+    lines.extend(sections.get("降权方向", [])[:3])
+    lines.extend(sections.get("默认动作", [])[:2])
     if not lines:
         lines = _bullet_lines(text)
-    return _limit_compact_lines(lines, max_lines=6, max_chars=520)
+    return _limit_compact_lines(lines, max_lines=9, max_chars=720)
 
 
 def _compact_champion_review_text(text: str) -> str:
@@ -206,6 +206,7 @@ def build_strategy_agents_instructions() -> str:
 - 用 OKX 数据研究一套 BTC-USDT-SWAP 20x 高弹性趋势捕获策略；允许较大波动，但不能靠日期特判、路径硬编码或伪优化刷分。
 - `15m` 是唯一事实源，`1h + 4h` 只是由 `15m` 聚合的确认层；突破/跌破除了成交量，也要结合方向流量代理。
 - 目标不是做平滑净值，而是更早跟上 BTC 的主要上涨/下跌，并在趋势失效时更快退出或反手。
+- 当前阶段优先研究 `train/val` 稳定性，而不是把某一段 Sharpe 或收益单独做热；默认优先补弱侧、缩小落差。
 
 工作区文件职责：
 - `src/strategy_macd_aggressive.py`：唯一允许修改的策略文件，包含入场参数 `PARAMS` 与退出参数 `EXIT_PARAMS`。
@@ -383,7 +384,7 @@ def build_strategy_research_prompt(
     reference_metrics: dict[str, Any] | None = None,
     benchmark_label: str = "champion",
     current_base_role: str = "champion",
-    score_regime: str = "trend_capture_v12_robustness_plateau_penalty",
+    score_regime: str = "trend_capture_v14_midfreq_sharpe_floor_balance",
     current_complexity_headroom_text: str = "",
     session_mode: str = "resume",
     operator_focus_text: str = "",
@@ -397,6 +398,14 @@ def build_strategy_research_prompt(
     history_package_path: str = "wiki/latest_history_package.md",
     failure_wiki_path: str = "wiki/failure_wiki.md",
     duplicate_watchlist_path: str = "wiki/duplicate_watchlist.md",
+    promotion_accept_margin: float = 0.02,
+    promotion_accept_quality_drop_margin: float = 0.03,
+    validation_block_count: int = 4,
+    min_validation_block_floor: float = 0.05,
+    min_validation_closed_trades: int = 180,
+    max_dev_validation_gap: float = 0.30,
+    robustness_sharpe_gap_warn_threshold: float = 0.15,
+    robustness_sharpe_gap_fail_threshold: float = 0.30,
 ) -> str:
     _ = current_complexity_headroom_text
     side_bias_guidance = _side_bias_guidance(reference_metrics)
@@ -444,9 +453,10 @@ def build_strategy_research_prompt(
 - session 状态：`{session_label}`；先复盘最近结构化失败证据，再决定继续还是转向。
 - 围绕一个可证伪假设先写 round brief，交给后续 edit worker 落码。
 - 本轮目标是改变真实交易路径，不是只制造源码 diff；若 smoke 行为完全不变，会被系统按 `behavioral_noop` 拒收。
-- 当前评分口径是 `{score_regime}`；只要 `gate` 通过，且 `promotion_score` 高于当前 {benchmark_label}，候选就有资格刷新当前 active reference。
-- `promotion_score` 现在以连续趋势抓取主分与按日收益年化补分权重 `8:2` 为主体，再减去分段回撤惩罚和轻量鲁棒性软惩罚。
-- 鲁棒性只看 `train/val` 落差、`val` 分块稳定性，以及退出参数邻域在 `val` 3 段上的平台形态。
+- 当前评分口径是 `{score_regime}`；只要 `gate` 通过，且 `promotion_score` 达到当前 {benchmark_label} 之上的最小晋级边际，候选才有资格刷新当前 active reference。
+- `promotion_score` 现在以 `capture_score / timed_return_score / Sharpe floor score = 0.45 / 0.30 / 0.25` 为主体；其中 `timed_return_score` 仍是按日收益年化补分，再减去分段回撤惩罚和轻量鲁棒性软惩罚。
+- `capture_score` 不再只偏向少数最大趋势段；`train/val` 连续趋势抓取分采用“段等权均分 50% + 原权重均分 50%”的混合方式。
+- 鲁棒性重点看 `train/val` 抓取落差、`train/val` Sharpe 平衡、`val` 分块稳定性，以及退出参数邻域在 `val` 分段上的平台形态。
 - `train` 滚动窗口均值/中位数、过拟合集中度仍保留为 gate/诊断，但不再是 `promotion_score` 主公式的一部分。
 - `test` 只做只读观察，不参与晋升，也不能作为下一轮 prompt 的证据源。
 
@@ -478,9 +488,12 @@ def build_strategy_research_prompt(
 当前口径的 gate / 评分提醒：
 - val 趋势段命中率 >= 35%
 - val 趋势捕获分 >= 0.05
-- train 与 val 分数落差 <= 0.30
+- val 年内平仓数 >= {min_validation_closed_trades}（当前目标约每月 15 笔）
+- train 与 val 分数落差 <= {max_dev_validation_gap:.2f}
 - val 多头捕获 >= 0.00，val 空头捕获 >= 0.00
-- val 会再切成 3 个连续时间分块：最差分块 >= -0.35，负分块最多 1 个
+- val 会再切成 {validation_block_count} 个连续时间分块：最差分块 >= {min_validation_block_floor:.2f}，负分块最多 1 个
+- `train/val` Sharpe gap 在 {robustness_sharpe_gap_warn_threshold:.2f} 开始告警，在 {robustness_sharpe_gap_fail_threshold:.2f} 进入更强惩罚
+- `promotion_score` 默认至少要比当前 {benchmark_label} 高 {promotion_accept_margin:.2f}；若 `quality_score` 回落，则至少高 {promotion_accept_quality_drop_margin:.2f}
 - 手续费拖累 <= 11.5%
 - train+val 严重集中度过拟合会直接淘汰
 
@@ -490,6 +503,7 @@ def build_strategy_research_prompt(
 {build_candidate_response_format_instructions()}
 - 主进程还会把这份 `draft` 交给 `reviewer` 审稿；若 reviewer 打回，本轮必须先吸收反馈再重写。
 - `primary_direction` 只写本轮主动施力方向；`change_plan` 必须具体到规则块、阈值或最终放行链。
+- 默认优先找更稳的平台：先改善 `val` 最差块、尾块和 `train/val` Sharpe 平衡，再决定补哪一侧；若一个方案主要让强的一侧更强，却不能改善这些稳定性指标，默认降权。
 - 如果本轮主要改 `EXIT_PARAMS` 里的连续数值，可以用 `exit_range_scan` 给一个 3 点小范围；系统 full eval 后会额外做只读 `plateau_probe`，不会自动改代码。
 - `novelty_proof` 不是自我辩护。{_novelty_proof_rule()}
 - 不允许把“未执行代码改动”“blocked”“no_edit”“no_change”这类占位回复当成完成。

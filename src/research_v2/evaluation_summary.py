@@ -53,6 +53,8 @@ def summarize_evaluation_impl(
 
     eval_daily_path = mod._collect_daily_path(results, "eval")
     validation_daily_path = mod._collect_daily_path(results, "validation")
+    eval_sharpe_ratio = mod._annualized_sharpe(eval_daily_path.returns)
+    validation_sharpe_ratio = mod._annualized_sharpe(validation_daily_path.returns)
     eval_path = mod._collect_trend_path(results, "eval")
     validation_path = mod._collect_trend_path(results, "validation")
 
@@ -84,6 +86,14 @@ def summarize_evaluation_impl(
 
     train_capture_score = train_continuous_trend_report.trend_score
     validation_capture_score = validation_trend_report.trend_score
+    train_capture_weighted_score = mod._weighted_average(
+        [(detail.score, detail.weight) for detail in train_continuous_trend_report.segment_details]
+    )
+    validation_capture_weighted_score = mod._weighted_average(
+        [(detail.score, detail.weight) for detail in validation_trend_report.segment_details]
+    )
+    train_capture_score = 0.50 * train_capture_score + 0.50 * train_capture_weighted_score
+    validation_capture_score = 0.50 * validation_capture_score + 0.50 * validation_capture_weighted_score
     capture_score = (
         mod.TRAIN_VAL_SCORE_WEIGHT * train_capture_score
         + mod.TRAIN_VAL_SCORE_WEIGHT * validation_capture_score
@@ -128,12 +138,21 @@ def summarize_evaluation_impl(
         promotion_gap=promotion_gap,
         block_report=validation_block_report,
         scoring=scoring,
+        train_sharpe_ratio=eval_sharpe_ratio,
+        validation_sharpe_ratio=validation_sharpe_ratio,
         plateau_probe=plateau_probe_payload,
     )
     robustness_penalty_score = robustness_penalty_payload["robustness_penalty_score"]
+    robustness_penalty_score = max(
+        0.0,
+        robustness_penalty_score - robustness_penalty_payload["sharpe_floor_penalty_score"],
+    )
+    train_val_sharpe_floor = robustness_penalty_payload["train_val_sharpe_floor"]
+    sharpe_floor_score = mod._clamp(train_val_sharpe_floor / 2.0, 0.0, 1.0)
     promotion_score = (
         scoring.promotion_capture_weight * capture_score
         + scoring.promotion_timed_return_weight * timed_return_score
+        + scoring.promotion_sharpe_floor_weight * sharpe_floor_score
         - drawdown_penalty_score
         - robustness_penalty_score
     )
@@ -149,13 +168,12 @@ def summarize_evaluation_impl(
         selection_counts=selection_funnel_counts,
         validation_closed_trades=validation_closed_trades,
         selection_closed_trades=selection_closed_trades,
+        min_validation_closed_trades=gates.min_validation_closed_trades,
     )
     validation_weakest_axis = mod._validation_weakest_axis(validation_trend_report, validation_block_report)
     selection_total_return = float(selection_source.get("return", 0.0))
     selection_max_drawdown = float(selection_source.get("max_drawdown", 0.0))
     selection_fee_drag_pct = float(selection_source.get("fee_drag_pct", 0.0))
-    eval_sharpe_ratio = mod._annualized_sharpe(eval_daily_path.returns)
-    validation_sharpe_ratio = mod._annualized_sharpe(validation_daily_path.returns)
     selection_sharpe_ratio = mod._annualized_sharpe([float(value) for value in selection_source.get("daily_returns", [])])
 
     gate_reasons: list[str] = []
@@ -175,6 +193,10 @@ def summarize_evaluation_impl(
         gate_reasons.append(f"val空头捕获偏低({validation_trend_report.bear_score:.2f})")
     if avg_fee_drag > gates.max_fee_drag_pct:
         gate_reasons.append(f"手续费拖累过高({avg_fee_drag:.2f}%)")
+    if validation_closed_trades < gates.min_validation_closed_trades:
+        gate_reasons.append(
+            f"val交易笔数偏少({validation_closed_trades}/{gates.min_validation_closed_trades})"
+        )
     if validation_block_report.used_block_count >= 2:
         if validation_block_report.min_score < gates.min_validation_block_floor:
             gate_reasons.append(
@@ -205,7 +227,7 @@ def summarize_evaluation_impl(
             f"{development_score_std:.2f} / {profitable_window_ratio:.0%}"
         ),
         (
-            "train/val连续趋势抓取分 / 抓取主分: "
+            "train/val连续趋势抓取混合分(段等权50%+原权重50%) / 抓取主分: "
             f"{train_capture_score:.2f} / {validation_capture_score:.2f} / {capture_score:.2f}"
         ),
         (
@@ -213,6 +235,7 @@ def summarize_evaluation_impl(
             f"{train_timed_return_score:.2f} / {validation_timed_return_score:.2f} / "
             f"{timed_return_score:.2f} / {drawdown_risk_score:.2f} / {drawdown_penalty_score:.2f} / {promotion_score:.2f}"
         ),
+        f"train/val Sharpe floor / 归一化分: {train_val_sharpe_floor:.2f} / {sharpe_floor_score:.2f}",
         (
             "train/val回撤风险分(窗口数): "
             f"{train_drawdown_risk_score:.2f}({train_drawdown_risk_report.window_count}) / "
@@ -258,12 +281,13 @@ def summarize_evaluation_impl(
             )
         ),
         (
-            "鲁棒性软惩罚(gap/std/floor/tail/fail/plateau/raw/cap后): "
+            "鲁棒性软惩罚(capture_gap/std/floor/tail/fail/sharpe_gap/plateau/raw/cap后): "
             f"{robustness_penalty_payload['gap_penalty_score']:.2f} / "
             f"{robustness_penalty_payload['block_std_penalty_score']:.2f} / "
             f"{robustness_penalty_payload['block_floor_penalty_score']:.2f} / "
             f"{robustness_penalty_payload['block_tail_penalty_score']:.2f} / "
             f"{robustness_penalty_payload['block_fail_penalty_score']:.2f} / "
+            f"{robustness_penalty_payload['sharpe_gap_penalty_score']:.2f} / "
             f"{robustness_penalty_payload['plateau_penalty_score']:.2f} / "
             f"{robustness_penalty_payload['robustness_penalty_score_raw']:.2f} / "
             f"{robustness_penalty_score:.2f}"
@@ -282,6 +306,11 @@ def summarize_evaluation_impl(
         f"train+val连续多头 / 空头捕获: {selection_trend_report.bull_score:.2f} / {selection_trend_report.bear_score:.2f}",
         f"train+val期间收益 / 路径收益: {selection_total_return:.2f}% / {selection_trend_report.path_return_pct:.2f}%",
         f"Sharpe(train / val / train+val): {eval_sharpe_ratio:.2f} / {validation_sharpe_ratio:.2f} / {selection_sharpe_ratio:.2f}",
+        (
+            "train/val Sharpe 平衡(gap / weaker_side): "
+            f"{robustness_penalty_payload['train_val_sharpe_gap']:.2f} / "
+            f"{robustness_penalty_payload['train_val_sharpe_floor']:.2f}"
+        ),
         f"train窗口收益均值 / 中位 / P25 / 最差: {eval_avg_return:.2f}% / {eval_median_return:.2f}% / {eval_p25_return:.2f}% / {eval_worst_return:.2f}%",
         f"val窗口收益均值 / 最差: {validation_avg_return:.2f}% / {validation_worst_return:.2f}%",
         f"train/val趋势抓取落差: {promotion_gap:.2f}",
@@ -343,10 +372,16 @@ def summarize_evaluation_impl(
             f"{development_score_std:.2f}/{profitable_window_ratio:.0%}"
         ),
         (
-            f"- 当前评分组成: train/val 连续趋势抓取={train_capture_score:.2f}/{validation_capture_score:.2f}，"
+            f"- 当前评分组成: train/val 连续趋势抓取混合分={train_capture_score:.2f}/{validation_capture_score:.2f}，"
             f"train/val 按日收益年化分={train_timed_return_score:.2f}/{validation_timed_return_score:.2f}，"
+            f"Sharpe floor归一化分={sharpe_floor_score:.2f}，"
             f"train/val 固定窗口回撤风险分={train_drawdown_risk_score:.2f}/{validation_drawdown_risk_score:.2f}，"
             f"回撤罚分={drawdown_penalty_score:.2f}，鲁棒性软惩罚={robustness_penalty_score:.2f}"
+        ),
+        (
+            f"- train/val Sharpe 平衡: Sharpe={eval_sharpe_ratio:.2f}/{validation_sharpe_ratio:.2f}，"
+            f"gap={robustness_penalty_payload['train_val_sharpe_gap']:.2f}，"
+            f"弱侧={robustness_penalty_payload['train_val_sharpe_floor']:.2f}"
         ),
         (
             f"- train+val 状态: 趋势分/收益分={selection_trend_report.trend_score:.2f}/"
@@ -417,6 +452,8 @@ def summarize_evaluation_impl(
         "validation_score": raw_validation_score,
         "train_capture_score": train_capture_score,
         "validation_capture_score": validation_capture_score,
+        "train_capture_weighted_score": train_capture_weighted_score,
+        "validation_capture_weighted_score": validation_capture_weighted_score,
         "capture_score": capture_score,
         "train_timed_return_score": train_timed_return_score,
         "validation_timed_return_score": validation_timed_return_score,
@@ -492,6 +529,9 @@ def summarize_evaluation_impl(
         "eval_sharpe_ratio": eval_sharpe_ratio,
         "validation_sharpe_ratio": validation_sharpe_ratio,
         "selection_sharpe_ratio": selection_sharpe_ratio,
+        "train_val_sharpe_gap": robustness_penalty_payload["train_val_sharpe_gap"],
+        "train_val_sharpe_floor": robustness_penalty_payload["train_val_sharpe_floor"],
+        "sharpe_floor_score": sharpe_floor_score,
         "combined_path_return_pct": selection_trend_report.path_return_pct,
         "full_period_return_pct": selection_total_return,
         "capture_drop": capture_drop,
@@ -509,6 +549,8 @@ def summarize_evaluation_impl(
         "block_floor_penalty_score": robustness_penalty_payload["block_floor_penalty_score"],
         "block_tail_penalty_score": robustness_penalty_payload["block_tail_penalty_score"],
         "block_fail_penalty_score": robustness_penalty_payload["block_fail_penalty_score"],
+        "sharpe_gap_penalty_score": robustness_penalty_payload["sharpe_gap_penalty_score"],
+        "sharpe_floor_penalty_score": robustness_penalty_payload["sharpe_floor_penalty_score"],
         "plateau_penalty_score": robustness_penalty_payload["plateau_penalty_score"],
         "robustness_penalty_score_raw": robustness_penalty_payload["robustness_penalty_score_raw"],
         "robustness_penalty_score": robustness_penalty_score,

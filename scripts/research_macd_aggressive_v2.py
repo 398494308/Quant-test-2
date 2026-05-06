@@ -143,7 +143,7 @@ DISCORD_CONFIG = load_discord_config()
 EVAL_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "eval")
 VALIDATION_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "validation")
 TEST_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "test")
-SCORE_REGIME = "trend_capture_v12_robustness_plateau_penalty"
+SCORE_REGIME = "trend_capture_v14_midfreq_sharpe_floor_balance"
 MODEL_WORKSPACE_STRATEGY_PATH = Path("src/strategy_macd_aggressive.py")
 PRIMARY_DIRECTION_DOMAINS = frozenset({"long", "short", "mixed", "structure"})
 PLANNER_BRIEF_REQUIRED_FIELDS = ("primary_direction", "hypothesis", "change_plan", "novelty_proof", "change_tags")
@@ -3246,6 +3246,14 @@ def _build_model_round_brief(
         champion_review_path="config/research_v2_champion_review.md",
         champion_review_code_hash=active_reference_code_hash,
         reviewer_summary_text=_load_reviewer_summary_text(),
+        promotion_accept_margin=RUNTIME.promotion_accept_margin,
+        promotion_accept_quality_drop_margin=RUNTIME.promotion_accept_quality_drop_margin,
+        validation_block_count=RUNTIME.gates.validation_block_count,
+        min_validation_block_floor=RUNTIME.gates.min_validation_block_floor,
+        min_validation_closed_trades=RUNTIME.gates.min_validation_closed_trades,
+        max_dev_validation_gap=RUNTIME.gates.max_dev_validation_gap,
+        robustness_sharpe_gap_warn_threshold=RUNTIME.scoring.robustness_sharpe_gap_warn_threshold,
+        robustness_sharpe_gap_fail_threshold=RUNTIME.scoring.robustness_sharpe_gap_fail_threshold,
     )
     round_brief = _request_validated_round_brief(
         base_source=base_source,
@@ -4047,10 +4055,27 @@ def _promotion_acceptance_decision(report: EvaluationReport) -> tuple[bool, str]
         return False, "reference benchmark is not initialized"
     current_best_score = float(benchmark_report.metrics["promotion_score"])
     candidate_score = float(report.metrics["promotion_score"])
-    if candidate_score <= current_best_score:
+    current_best_quality = benchmark_report.metrics.get("quality_score")
+    candidate_quality = report.metrics.get("quality_score")
+    accept_margin = max(0.0, float(RUNTIME.promotion_accept_margin))
+    quality_drop_margin = max(accept_margin, float(RUNTIME.promotion_accept_quality_drop_margin))
+    required_score = current_best_score + accept_margin
+    quality_score_dropped = (
+        current_best_quality is not None
+        and candidate_quality is not None
+        and float(candidate_quality) < float(current_best_quality)
+    )
+    if quality_score_dropped:
+        required_score = current_best_score + quality_drop_margin
+    if candidate_score + 1e-12 < required_score:
+        if quality_score_dropped:
+            return (
+                False,
+                f"质量分回落时未达到更高晋级门槛({candidate_score:.2f} < {required_score:.2f})",
+            )
         return (
             False,
-            f"未超过当前{_benchmark_role()}晋级分({candidate_score:.2f} <= {current_best_score:.2f})",
+            f"未达到当前{_benchmark_role()}晋级门槛({candidate_score:.2f} < {required_score:.2f})",
         )
     return True, "通过"
 

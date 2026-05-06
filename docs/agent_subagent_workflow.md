@@ -56,14 +56,16 @@ flowchart TB
 - 标的：`BTC-USDT-SWAP`，策略按 `20x` 合约研究。
 - 事实层：`15m`；`1h / 4h` 由 `15m` 聚合，只做确认层。
 - 执行层：优先使用 `1m` 回测成交。
-- 评分口径：`trend_capture_v12_robustness_plateau_penalty`。
+- 评分口径：`trend_capture_v14_midfreq_sharpe_floor_balance`。
 - `train`：`2023-07-01` 到 `2024-12-31`。
 - `val`：`2025-01-01` 到 `2025-12-31`。
 - `test`：`2026-01-01` 到 `2026-04-20`。
-- 晋升条件：先过 `gate`，再要求 `promotion_score` 高于当前 active reference。
-- `promotion_score` 以连续趋势抓取主分与按日收益年化补分 `8:2` 为主体，再减去分段回撤惩罚和轻量鲁棒性软惩罚。
+- 晋升条件：先过 `gate`，再要求 `promotion_score` 达到当前 active reference 之上的最小晋级边际；若 `quality_score` 回落，则需要更高边际。
+- `promotion_score = 0.45 * capture_score + 0.30 * timed_return_score + 0.25 * sharpe_floor_score - drawdown_penalty_score - robustness_penalty_score`。
+- `capture_score` 现在使用“段等权均分 50% + 原权重均分 50%”的混合方式，减少少数最大趋势段的主导。
+- `val` 年内平仓数至少 `180` 笔，约等于每月 `15` 笔；交易数只做 gate，不单独加分。
 - 交易数、`filled_entries` 和漏斗通过量只保留观察价值，不再作为下一轮方向的默认软触发。
-- 鲁棒性软惩罚只看 `train/val` 落差、`val` 分块稳定性，以及退出参数邻域在 `val` 3 段上的平台形态。
+- 鲁棒性软惩罚只看 `train/val` 落差、`val` 分块稳定性，以及退出参数邻域在 `val` 3 段上的平台形态；当前更明确压 `val` 最差块、尾块和 `train/val` Sharpe gap，弱侧 Sharpe 通过 `sharpe_floor_score` 进入主分。
 - `test` 只做只读观察；reject / duplicate_skipped 的异步 `test` 只进留档，不进 prompt、不进晋升。
 
 ## 每一轮怎么跑
