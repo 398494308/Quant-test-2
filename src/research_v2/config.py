@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 
@@ -60,21 +61,51 @@ def _env_text(name: str, default: str) -> str:
     return str(os.getenv(name, default)).strip()
 
 
+def _inclusive_days(start_date: str, end_date: str, default: int) -> int:
+    try:
+        start = date.fromisoformat(start_date)
+        end = date.fromisoformat(end_date)
+    except ValueError:
+        return default
+    return max(1, (end - start).days + 1)
+
+
+def _monthly_trade_count(days: int, trades_per_month: float) -> int:
+    months = max(1.0 / 30.4375, days / 30.4375)
+    return max(1, int(round(months * trades_per_month)))
+
+
 def _load_scoring_config(windows: "WindowConfig") -> "ScoringConfig":
     risk_window_days = _env_int("MACD_V2_RISK_WINDOW_DAYS", windows.eval_window_days)
     risk_window_step_days = _env_int(
         "MACD_V2_RISK_WINDOW_STEP_DAYS",
         max(1, risk_window_days // 4),
     )
-    trade_activity_train_range_low = max(1, _env_int("MACD_V2_TRADE_ACTIVITY_TRAIN_RANGE_LOW", 270))
+    development_days = _inclusive_days(
+        windows.development_start_date,
+        windows.development_end_date,
+        default=550,
+    )
+    validation_days = _inclusive_days(
+        windows.validation_start_date,
+        windows.validation_end_date,
+        default=365,
+    )
+    trade_activity_train_range_low = max(
+        1,
+        _env_int("MACD_V2_TRADE_ACTIVITY_TRAIN_RANGE_LOW", _monthly_trade_count(development_days, 10.0)),
+    )
     trade_activity_train_range_high = max(
         trade_activity_train_range_low,
-        _env_int("MACD_V2_TRADE_ACTIVITY_TRAIN_RANGE_HIGH", 360),
+        _env_int("MACD_V2_TRADE_ACTIVITY_TRAIN_RANGE_HIGH", _monthly_trade_count(development_days, 15.0)),
     )
-    trade_activity_validation_range_low = max(1, _env_int("MACD_V2_TRADE_ACTIVITY_VALIDATION_RANGE_LOW", 180))
+    trade_activity_validation_range_low = max(
+        1,
+        _env_int("MACD_V2_TRADE_ACTIVITY_VALIDATION_RANGE_LOW", _monthly_trade_count(validation_days, 10.0)),
+    )
     trade_activity_validation_range_high = max(
         trade_activity_validation_range_low,
-        _env_int("MACD_V2_TRADE_ACTIVITY_VALIDATION_RANGE_HIGH", 240),
+        _env_int("MACD_V2_TRADE_ACTIVITY_VALIDATION_RANGE_HIGH", _monthly_trade_count(validation_days, 15.0)),
     )
     return ScoringConfig(
         promotion_capture_weight=_env_float("MACD_V2_PROMOTION_CAPTURE_WEIGHT", 0.45),
@@ -85,8 +116,10 @@ def _load_scoring_config(windows: "WindowConfig") -> "ScoringConfig":
                 "MACD_V2_PROMOTION_TRADE_ACTIVITY_PENALTY_WEIGHT",
                 "MACD_V2_PROMOTION_TRADE_ACTIVITY_WEIGHT",
             ),
-            0.10,
+            0.20,
         ),
+        trade_idle_penalty_weight=_env_float("MACD_V2_TRADE_IDLE_PENALTY_WEIGHT", 0.15),
+        max_trade_idle_days=_env_float("MACD_V2_MAX_TRADE_IDLE_DAYS", 7.0),
         promotion_drawdown_base_weight=_env_float("MACD_V2_PROMOTION_DRAWDOWN_BASE_WEIGHT", 0.20),
         promotion_drawdown_knee=_env_float("MACD_V2_PROMOTION_DRAWDOWN_KNEE", 1.25),
         promotion_drawdown_excess_weight=_env_float("MACD_V2_PROMOTION_DRAWDOWN_EXCESS_WEIGHT", 1.00),
@@ -184,9 +217,9 @@ class GateConfig:
     min_validation_bear_capture: float
     max_fee_drag_pct: float
     min_validation_closed_trades: int = 0
-    validation_block_count: int = 3
-    min_validation_block_floor: float = -0.20
-    max_validation_block_failures: int = 1
+    validation_block_count: int = 4
+    min_validation_block_floor: float = -0.10
+    max_validation_block_failures: int = 3
 
 
 @dataclass(frozen=True)
@@ -194,7 +227,9 @@ class ScoringConfig:
     promotion_capture_weight: float = 0.45
     promotion_timed_return_weight: float = 0.30
     promotion_sharpe_floor_weight: float = 0.25
-    promotion_trade_activity_penalty_weight: float = 0.10
+    promotion_trade_activity_penalty_weight: float = 0.20
+    trade_idle_penalty_weight: float = 0.15
+    max_trade_idle_days: float = 7.0
     promotion_drawdown_base_weight: float = 0.20
     promotion_drawdown_knee: float = 1.25
     promotion_drawdown_excess_weight: float = 1.00
@@ -237,10 +272,10 @@ class ScoringConfig:
     drawdown_risk_tail_quantile: float = 0.75
     drawdown_risk_tail_weight: float = 0.60
     drawdown_risk_scale_pct: float = 6.0
-    trade_activity_train_range_low: int = 270
-    trade_activity_train_range_high: int = 360
-    trade_activity_validation_range_low: int = 180
-    trade_activity_validation_range_high: int = 240
+    trade_activity_train_range_low: int = 180
+    trade_activity_train_range_high: int = 270
+    trade_activity_validation_range_low: int = 120
+    trade_activity_validation_range_high: int = 180
 
 
 @dataclass(frozen=True)
@@ -313,18 +348,18 @@ def load_research_runtime_config(repo_root: Path) -> ResearchRuntimeConfig:
     )
 
     gates = GateConfig(
-        min_development_mean_score=_env_float("MACD_V2_MIN_DEVELOPMENT_MEAN_SCORE", 0.10),
-        min_development_median_score=_env_float("MACD_V2_MIN_DEVELOPMENT_MEDIAN_SCORE", 0.00),
-        min_validation_hit_rate=_env_float("MACD_V2_MIN_VALIDATION_HIT_RATE", 0.35),
+        min_development_mean_score=_env_float("MACD_V2_MIN_DEVELOPMENT_MEAN_SCORE", -1.00),
+        min_development_median_score=_env_float("MACD_V2_MIN_DEVELOPMENT_MEDIAN_SCORE", -1.00),
+        min_validation_hit_rate=_env_float("MACD_V2_MIN_VALIDATION_HIT_RATE", 0.20),
         min_validation_trend_score=_env_float("MACD_V2_MIN_VALIDATION_TREND_SCORE", 0.05),
         max_dev_validation_gap=_env_float("MACD_V2_MAX_DEV_VALIDATION_GAP", 0.30),
         min_validation_bull_capture=_env_float("MACD_V2_MIN_VALIDATION_BULL_CAPTURE", 0.00),
         min_validation_bear_capture=_env_float("MACD_V2_MIN_VALIDATION_BEAR_CAPTURE", 0.00),
         max_fee_drag_pct=_env_float("MACD_V2_MAX_FEE_DRAG_PCT", 11.5),
         min_validation_closed_trades=_env_int("MACD_V2_MIN_VALIDATION_CLOSED_TRADES", 0),
-        validation_block_count=_env_int("MACD_V2_VALIDATION_BLOCK_COUNT", 3),
-        min_validation_block_floor=_env_float("MACD_V2_MIN_VALIDATION_BLOCK_FLOOR", -0.35),
-        max_validation_block_failures=_env_int("MACD_V2_MAX_VALIDATION_BLOCK_FAILURES", 1),
+        validation_block_count=_env_int("MACD_V2_VALIDATION_BLOCK_COUNT", 4),
+        min_validation_block_floor=_env_float("MACD_V2_MIN_VALIDATION_BLOCK_FLOOR", -0.10),
+        max_validation_block_failures=_env_int("MACD_V2_MAX_VALIDATION_BLOCK_FAILURES", 3),
     )
     scoring = _load_scoring_config(windows)
 

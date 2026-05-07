@@ -1602,6 +1602,25 @@ def _active_long_exit_followthrough_ok(positions, market_state, current_close):
     return _trend_followthrough_exit_long(market_state, trigger_price, current_close)
 
 
+def _active_short_followthrough_ok(positions, market_state, current_close):
+    if not positions:
+        return True
+    lead_position = positions[0]
+    trigger_price = float(lead_position.get("entry_price", current_close))
+    return _trend_followthrough_short(market_state, trigger_price, current_close)
+
+
+def _opposing_followthrough_blocks_entry(positions, market_state, current_close, desired_side):
+    if not positions:
+        return False
+    active_side = _position_side(positions[0])
+    if not active_side or active_side == desired_side:
+        return False
+    if active_side == "long":
+        return _active_long_exit_followthrough_ok(positions, market_state, current_close)
+    return _active_short_followthrough_ok(positions, market_state, current_close)
+
+
 def _long_durable_hold_active(market_state):
     fourh = market_state["four_hour"]
     if fourh is None:
@@ -2125,6 +2144,13 @@ def short_final_veto_clear(context, market_state, params, breakdown_ok, bounce_f
 
 
 def _strategy_exhaustion_short_signal(context, market_state, params, exhausted_side, sideways_regime, *, as_decision=False):
+    if _opposing_followthrough_blocks_entry(
+        context.get("positions"),
+        market_state,
+        context["current"]["close"],
+        "short",
+    ):
+        return None
     if exhausted_side == "long" and not sideways_regime and short_outer_context_ok(context, market_state, params):
         _record_funnel_pass("short", "outer_context_pass")
         short_path_key = _short_entry_path_key(context, market_state, params, require_breakdown_gate=False)
@@ -2140,6 +2166,13 @@ def _strategy_exhaustion_short_signal(context, market_state, params, exhausted_s
 
 def _strategy_long_signal(context, market_state, positions, params, exhausted_side, *, as_decision=False):
     sideways_regime = bool(context.get("sideways_regime", False))
+    if _opposing_followthrough_blocks_entry(
+        positions,
+        market_state,
+        context["current"]["close"],
+        "long",
+    ):
+        return None
     long_reversal_sniper = _long_reversal_sniper_ok(context)
     if long_reversal_sniper and not sideways_regime:
         _record_funnel_pass("long", "final_veto_pass")
@@ -2311,7 +2344,14 @@ def _long_ownership_relay(context, market_state, params, positions, has_long_sig
     return long_ownership_relay
 
 
-def _strategy_short_signal(context, market_state, params, exhausted_side, sideways_regime, *, as_decision=False):
+def _strategy_short_signal(context, market_state, positions, params, exhausted_side, sideways_regime, *, as_decision=False):
+    if _opposing_followthrough_blocks_entry(
+        positions,
+        market_state,
+        context["current"]["close"],
+        "short",
+    ):
+        return None
     if exhausted_side != "short" and not sideways_regime and short_outer_context_ok(context, market_state, params):
         _record_funnel_pass("short", "outer_context_pass")
         short_path_key = _short_entry_path_key(context, market_state, params, require_breakdown_gate=True)
@@ -2336,6 +2376,7 @@ def _strategy_entry_context(data, idx, positions, market_state, params, allow_si
     context = _build_signal_context(data, idx, market_state, params)
     if context is None:
         return None
+    context["positions"] = positions
     sideways_regime = _is_sideways_regime(market_state, positions=positions)
     context["sideways_regime"] = sideways_regime
     if sideways_regime and not allow_sideways:
@@ -2490,7 +2531,7 @@ def strategy_decision(data, idx, positions, market_state):
     decision = _strategy_long_signal(context, market_state, positions, p, exhausted_side, as_decision=True)
     if decision is not None:
         return decision
-    return _strategy_short_signal(context, market_state, p, exhausted_side, sideways_regime, as_decision=True)
+    return _strategy_short_signal(context, market_state, positions, p, exhausted_side, sideways_regime, as_decision=True)
 
 
 def strategy(data, idx, positions, market_state):
@@ -2510,4 +2551,4 @@ def strategy(data, idx, positions, market_state):
     signal = _strategy_long_signal(context, market_state, positions, p, exhausted_side)
     if signal is not None:
         return signal
-    return _strategy_short_signal(context, market_state, p, exhausted_side, sideways_regime)
+    return _strategy_short_signal(context, market_state, positions, p, exhausted_side, sideways_regime)

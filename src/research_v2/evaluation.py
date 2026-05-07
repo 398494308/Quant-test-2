@@ -147,6 +147,7 @@ TURN_PROTECTION_NEUTRAL_DD_PCT = 12.0
 TURN_PROTECTION_DD_STEP_PCT = 6.0
 TURN_PROTECTION_SCORE_MIN = -1.0
 TURN_PROTECTION_SCORE_MAX = 1.0
+DAY_MS = 24 * 60 * 60 * 1000
 
 
 # ==================== 基础统计 ====================
@@ -470,6 +471,68 @@ def _trade_activity_shortfall(actual: int, preferred_min: int) -> float:
     floor = max(1, int(preferred_min))
     trades = max(0, int(actual))
     return _clamp(max(floor - trades, 0) / floor, 0.0, 1.0)
+
+
+def _timestamp_value(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _result_period_timestamps(result: dict[str, Any] | None) -> tuple[int | None, int | None]:
+    payload = result or {}
+    return (
+        _timestamp_value(payload.get("period_start_timestamp")),
+        _timestamp_value(payload.get("period_end_timestamp")),
+    )
+
+
+def _trade_entry_timestamps(result: dict[str, Any] | None) -> list[int]:
+    timestamps: list[int] = []
+    for trade in (result or {}).get("trades_detail", []):
+        timestamp = _timestamp_value(trade.get("entry_timestamp"))
+        if timestamp is not None:
+            timestamps.append(timestamp)
+    return sorted(timestamps)
+
+
+def _max_trade_idle_days_from_timestamps(
+    entry_timestamps: list[int],
+    *,
+    start_timestamp: int | None,
+    end_timestamp: int | None,
+) -> float:
+    if start_timestamp is None or end_timestamp is None or end_timestamp <= start_timestamp:
+        return 0.0
+    ordered_entries = sorted(
+        timestamp
+        for timestamp in entry_timestamps
+        if start_timestamp <= timestamp < end_timestamp
+    )
+    previous_timestamp = start_timestamp
+    max_gap_ms = 0
+    for timestamp in ordered_entries:
+        max_gap_ms = max(max_gap_ms, timestamp - previous_timestamp)
+        previous_timestamp = timestamp
+    max_gap_ms = max(max_gap_ms, end_timestamp - previous_timestamp)
+    return max_gap_ms / DAY_MS
+
+
+def _max_trade_idle_days(result: dict[str, Any] | None) -> float:
+    start_timestamp, end_timestamp = _result_period_timestamps(result)
+    return _max_trade_idle_days_from_timestamps(
+        _trade_entry_timestamps(result),
+        start_timestamp=start_timestamp,
+        end_timestamp=end_timestamp,
+    )
+
+
+def _trade_idle_shortfall(max_idle_days: float, allowed_idle_days: float) -> float:
+    limit = max(0.1, float(allowed_idle_days))
+    return _clamp(max(float(max_idle_days) - limit, 0.0) / limit, 0.0, 1.0)
 
 
 # ==================== 趋势切段评分 ====================

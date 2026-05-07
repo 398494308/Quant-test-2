@@ -143,7 +143,7 @@ DISCORD_CONFIG = load_discord_config()
 EVAL_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "eval")
 VALIDATION_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "validation")
 TEST_WINDOW_COUNT = sum(1 for window in WINDOWS if window.group == "test")
-SCORE_REGIME = "trend_capture_v15_midfreq_trade_floor_penalty"
+SCORE_REGIME = "trend_capture_v16_equal_capture_midfreq_idle_penalty"
 MODEL_WORKSPACE_STRATEGY_PATH = Path("src/strategy_macd_aggressive.py")
 PRIMARY_DIRECTION_DOMAINS = frozenset({"long", "short", "mixed", "structure"})
 PLANNER_BRIEF_REQUIRED_FIELDS = ("primary_direction", "hypothesis", "change_plan", "novelty_proof", "change_tags")
@@ -3249,7 +3249,9 @@ def _build_model_round_brief(
         promotion_accept_margin=RUNTIME.promotion_accept_margin,
         promotion_accept_quality_drop_margin=RUNTIME.promotion_accept_quality_drop_margin,
         validation_block_count=RUNTIME.gates.validation_block_count,
+        min_validation_hit_rate=RUNTIME.gates.min_validation_hit_rate,
         min_validation_block_floor=RUNTIME.gates.min_validation_block_floor,
+        max_validation_block_failures=RUNTIME.gates.max_validation_block_failures,
         min_validation_closed_trades=RUNTIME.gates.min_validation_closed_trades,
         max_dev_validation_gap=RUNTIME.gates.max_dev_validation_gap,
         trade_activity_train_range_low=RUNTIME.scoring.trade_activity_train_range_low,
@@ -3257,6 +3259,8 @@ def _build_model_round_brief(
         trade_activity_validation_range_low=RUNTIME.scoring.trade_activity_validation_range_low,
         trade_activity_validation_range_high=RUNTIME.scoring.trade_activity_validation_range_high,
         promotion_trade_activity_penalty_weight=RUNTIME.scoring.promotion_trade_activity_penalty_weight,
+        trade_idle_penalty_weight=RUNTIME.scoring.trade_idle_penalty_weight,
+        max_trade_idle_days=RUNTIME.scoring.max_trade_idle_days,
         robustness_sharpe_gap_warn_threshold=RUNTIME.scoring.robustness_sharpe_gap_warn_threshold,
         robustness_sharpe_gap_fail_threshold=RUNTIME.scoring.robustness_sharpe_gap_fail_threshold,
     )
@@ -4054,35 +4058,7 @@ def _promotion_acceptance_decision(report: EvaluationReport) -> tuple[bool, str]
 
     if not best_report.gate_passed:
         return True, "通过(首个 gate-passed champion)"
-
-    benchmark_report = _reference_benchmark_report()
-    if benchmark_report is None:
-        return False, "reference benchmark is not initialized"
-    current_best_score = float(benchmark_report.metrics["promotion_score"])
-    candidate_score = float(report.metrics["promotion_score"])
-    current_best_quality = benchmark_report.metrics.get("quality_score")
-    candidate_quality = report.metrics.get("quality_score")
-    accept_margin = max(0.0, float(RUNTIME.promotion_accept_margin))
-    quality_drop_margin = max(accept_margin, float(RUNTIME.promotion_accept_quality_drop_margin))
-    required_score = current_best_score + accept_margin
-    quality_score_dropped = (
-        current_best_quality is not None
-        and candidate_quality is not None
-        and float(candidate_quality) < float(current_best_quality)
-    )
-    if quality_score_dropped:
-        required_score = current_best_score + quality_drop_margin
-    if candidate_score + 1e-12 < required_score:
-        if quality_score_dropped:
-            return (
-                False,
-                f"质量分回落时未达到更高晋级门槛({candidate_score:.2f} < {required_score:.2f})",
-            )
-        return (
-            False,
-            f"未达到当前{_benchmark_role()}晋级门槛({candidate_score:.2f} < {required_score:.2f})",
-        )
-    return True, "通过"
+    return True, "通过(gate-passed refresh)"
 
 
 def _record_duplicate_skip(

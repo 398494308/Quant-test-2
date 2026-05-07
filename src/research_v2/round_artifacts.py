@@ -220,6 +220,10 @@ def persist_round_artifact(
         for key in (
             "train_capture_score",
             "validation_capture_score",
+            "train_capture_equal_score",
+            "validation_capture_equal_score",
+            "train_capture_weighted_score",
+            "validation_capture_weighted_score",
             "capture_score",
             "train_timed_return_score",
             "validation_timed_return_score",
@@ -236,6 +240,11 @@ def persist_round_artifact(
             "validation_sharpe_ratio",
             "selection_sharpe_ratio",
             "total_trades",
+            "train_max_trade_idle_days",
+            "validation_max_trade_idle_days",
+            "trade_count_penalty",
+            "trade_idle_penalty",
+            "trade_activity_penalty",
             "segment_hit_rate",
         )
         if key in metrics_payload

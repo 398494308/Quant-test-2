@@ -25,11 +25,13 @@ class ResearchRuntimeConfigTest(unittest.TestCase):
                         "MACD_V2_PROMOTION_CAPTURE_WEIGHT=0.45",
                         "MACD_V2_PROMOTION_TIMED_RETURN_WEIGHT=0.30",
                         "MACD_V2_PROMOTION_SHARPE_FLOOR_WEIGHT=0.25",
-                        "MACD_V2_PROMOTION_TRADE_ACTIVITY_PENALTY_WEIGHT=0.10",
-                        "MACD_V2_TRADE_ACTIVITY_TRAIN_RANGE_LOW=270",
-                        "MACD_V2_TRADE_ACTIVITY_TRAIN_RANGE_HIGH=360",
-                        "MACD_V2_TRADE_ACTIVITY_VALIDATION_RANGE_LOW=180",
-                        "MACD_V2_TRADE_ACTIVITY_VALIDATION_RANGE_HIGH=240",
+                        "MACD_V2_PROMOTION_TRADE_ACTIVITY_PENALTY_WEIGHT=0.20",
+                        "MACD_V2_TRADE_IDLE_PENALTY_WEIGHT=0.15",
+                        "MACD_V2_MAX_TRADE_IDLE_DAYS=7.0",
+                        "MACD_V2_TRADE_ACTIVITY_TRAIN_RANGE_LOW=180",
+                        "MACD_V2_TRADE_ACTIVITY_TRAIN_RANGE_HIGH=270",
+                        "MACD_V2_TRADE_ACTIVITY_VALIDATION_RANGE_LOW=120",
+                        "MACD_V2_TRADE_ACTIVITY_VALIDATION_RANGE_HIGH=180",
                         "MACD_V2_ROBUSTNESS_PENALTY_CAP=0.31",
                         "MACD_V2_ROBUSTNESS_GAP_WARN_THRESHOLD=0.17",
                         "MACD_V2_ROBUSTNESS_GAP_FAIL_THRESHOLD=0.23",
@@ -56,14 +58,22 @@ class ResearchRuntimeConfigTest(unittest.TestCase):
                 runtime = load_research_runtime_config(repo_root)
 
             self.assertEqual(runtime.gates.min_validation_closed_trades, 0)
+            self.assertAlmostEqual(runtime.gates.min_development_mean_score, -1.00)
+            self.assertAlmostEqual(runtime.gates.min_development_median_score, -1.00)
+            self.assertAlmostEqual(runtime.gates.min_validation_hit_rate, 0.20)
+            self.assertEqual(runtime.gates.validation_block_count, 4)
+            self.assertAlmostEqual(runtime.gates.min_validation_block_floor, -0.10)
+            self.assertEqual(runtime.gates.max_validation_block_failures, 3)
             self.assertAlmostEqual(runtime.scoring.promotion_capture_weight, 0.45)
             self.assertAlmostEqual(runtime.scoring.promotion_timed_return_weight, 0.30)
             self.assertAlmostEqual(runtime.scoring.promotion_sharpe_floor_weight, 0.25)
-            self.assertAlmostEqual(runtime.scoring.promotion_trade_activity_penalty_weight, 0.10)
-            self.assertEqual(runtime.scoring.trade_activity_train_range_low, 270)
-            self.assertEqual(runtime.scoring.trade_activity_train_range_high, 360)
-            self.assertEqual(runtime.scoring.trade_activity_validation_range_low, 180)
-            self.assertEqual(runtime.scoring.trade_activity_validation_range_high, 240)
+            self.assertAlmostEqual(runtime.scoring.promotion_trade_activity_penalty_weight, 0.20)
+            self.assertAlmostEqual(runtime.scoring.trade_idle_penalty_weight, 0.15)
+            self.assertAlmostEqual(runtime.scoring.max_trade_idle_days, 7.0)
+            self.assertEqual(runtime.scoring.trade_activity_train_range_low, 180)
+            self.assertEqual(runtime.scoring.trade_activity_train_range_high, 270)
+            self.assertEqual(runtime.scoring.trade_activity_validation_range_low, 120)
+            self.assertEqual(runtime.scoring.trade_activity_validation_range_high, 180)
             self.assertAlmostEqual(runtime.scoring.robustness_penalty_cap, 0.31)
             self.assertAlmostEqual(runtime.scoring.robustness_gap_warn_threshold, 0.17)
             self.assertAlmostEqual(runtime.scoring.robustness_gap_fail_threshold, 0.23)

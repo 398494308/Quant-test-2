@@ -633,7 +633,16 @@ def _price_before_timestamp(target_ts, execution_timestamps, execution_data, fal
     return execution_data[execution_idx]["close"]
 
 
-def _close_trade(position, price, reason, leverage, allocated_entry_fee=0.0, exit_fee=0.0, funding_pnl=0.0):
+def _close_trade(
+    position,
+    price,
+    reason,
+    leverage,
+    allocated_entry_fee=0.0,
+    exit_fee=0.0,
+    funding_pnl=0.0,
+    exit_timestamp=None,
+):
     gross_pnl_amount = _position_pnl_amount(position, price, leverage)
     net_pnl_amount = gross_pnl_amount - allocated_entry_fee - exit_fee + funding_pnl
     pnl_pct = net_pnl_amount / max(position["size"], 1e-9) * 100.0
@@ -650,6 +659,10 @@ def _close_trade(position, price, reason, leverage, allocated_entry_fee=0.0, exi
         "size": position["size"],
         "pyramids_done": position.get("pyramids_done", 0),
     }
+    if position.get("entry_timestamp") is not None:
+        trade["entry_timestamp"] = int(position["entry_timestamp"])
+    if exit_timestamp is not None:
+        trade["exit_timestamp"] = int(exit_timestamp)
     if "trade_id" in position:
         trade["trade_id"] = position["trade_id"]
     return trade, gross_pnl_amount
@@ -664,7 +677,7 @@ def _close_cash_release(position_size, gross_pnl_amount, exit_fee=0.0, funding_p
     return position_size + gross_pnl_amount + funding_pnl - exit_fee
 
 
-def _settle_full_position(position, price, reason, leverage, exit_p):
+def _settle_full_position(position, price, reason, leverage, exit_p, exit_timestamp=None):
     exit_notional = _position_notional(position, price, leverage)
     exit_fee = _trading_fee_amount(exit_notional, exit_p)
     allocated_entry_fee = position.get("entry_fee_paid", 0.0)
@@ -677,6 +690,7 @@ def _settle_full_position(position, price, reason, leverage, exit_p):
         allocated_entry_fee=allocated_entry_fee,
         exit_fee=exit_fee,
         funding_pnl=allocated_funding,
+        exit_timestamp=exit_timestamp,
     )
     cash_release = _close_cash_release(
         position["size"],
@@ -687,7 +701,7 @@ def _settle_full_position(position, price, reason, leverage, exit_p):
     return trade, gross_pnl_amount, cash_release, exit_fee
 
 
-def _settle_partial_position(position, close_size, price, reason, leverage, exit_p):
+def _settle_partial_position(position, close_size, price, reason, leverage, exit_p, exit_timestamp=None):
     close_fraction = close_size / max(position["size"], 1e-9)
     allocated_entry_fee = position.get("entry_fee_paid", 0.0) * close_fraction
     allocated_funding = position.get("funding_pnl", 0.0) * close_fraction
@@ -703,6 +717,7 @@ def _settle_partial_position(position, close_size, price, reason, leverage, exit
         allocated_entry_fee=allocated_entry_fee,
         exit_fee=exit_fee,
         funding_pnl=allocated_funding,
+        exit_timestamp=exit_timestamp,
     )
     cash_release = _close_cash_release(
         close_size,
@@ -726,6 +741,8 @@ def _apply_trade_leg_rollup(position, trade):
     position["realized_closed_size"] = position.get("realized_closed_size", 0.0) + trade["size"]
     position["realized_leg_count"] = position.get("realized_leg_count", 0) + 1
     position["last_close_reason"] = trade["reason"]
+    if trade.get("exit_timestamp") is not None:
+        position["last_close_timestamp"] = int(trade["exit_timestamp"])
 
 
 def _build_closed_trade(position):
@@ -747,6 +764,10 @@ def _build_closed_trade(position):
         "pyramids_done": position.get("pyramids_done", 0),
         "leg_count": position.get("realized_leg_count", 0),
     }
+    if position.get("entry_timestamp") is not None:
+        trade["entry_timestamp"] = int(position["entry_timestamp"])
+    if position.get("last_close_timestamp") is not None:
+        trade["exit_timestamp"] = int(position["last_close_timestamp"])
     if "trade_id" in position:
         trade["trade_id"] = position["trade_id"]
     return trade
@@ -1530,6 +1551,8 @@ def backtest_macd_aggressive(
                         "size": position["size"],
                         "pyramids_done": position.get("pyramids_done", 0),
                         "trade_id": position.get("trade_id"),
+                        "entry_timestamp": position.get("entry_timestamp"),
+                        "exit_timestamp": subbar_close_ts,
                     }
                     record_settlement_leg(liquidation_trade)
                     _apply_trade_leg_rollup(position, liquidation_trade)
@@ -1545,6 +1568,7 @@ def backtest_macd_aggressive(
                         "止损",
                         leverage,
                         exit_p,
+                        exit_timestamp=subbar_close_ts,
                     )
                     capital += cash_release
                     total_trading_fees += exit_fee
@@ -1574,6 +1598,7 @@ def backtest_macd_aggressive(
                             "第一止盈",
                             leverage,
                             exit_p,
+                            exit_timestamp=subbar_close_ts,
                         )
                         capital += cash_release
                         total_trading_fees += exit_fee
@@ -1628,6 +1653,7 @@ def backtest_macd_aggressive(
                         "趋势失效",
                         leverage,
                         exit_p,
+                        exit_timestamp=bar_close_ts,
                     )
                     capital += cash_release
                     total_trading_fees += exit_fee
@@ -1645,6 +1671,7 @@ def backtest_macd_aggressive(
                     "时间退出",
                     leverage,
                     exit_p,
+                    exit_timestamp=bar_close_ts,
                 )
                 capital += cash_release
                 total_trading_fees += exit_fee
@@ -1674,6 +1701,7 @@ def backtest_macd_aggressive(
                     "反向信号",
                     leverage,
                     exit_p,
+                    exit_timestamp=bar_close_ts,
                 )
                 capital += cash_release
                 total_trading_fees += exit_fee
@@ -1716,6 +1744,7 @@ def backtest_macd_aggressive(
                         "entry_price": entry_fill,
                         "entry_signal": signal,
                         "entry_path_tag": path_tag,
+                        "entry_timestamp": bar_close_ts,
                         "size": target_position_size,
                         "opened_size_total": target_position_size,
                         "hold_bars": 0,
@@ -1770,6 +1799,7 @@ def backtest_macd_aggressive(
             "数据结束",
             leverage,
             exit_p,
+            exit_timestamp=end_ts,
         )
         capital += cash_release
         total_trading_fees += exit_fee
@@ -1842,6 +1872,8 @@ def backtest_macd_aggressive(
         "signal_path_stats": signal_path_stats,
         "strategy_funnel": _strategy_funnel_snapshot(funnel_snapshot_hook),
         "filled_side_entries": _filled_side_entries(signal_entries),
+        "period_start_timestamp": start_ts,
+        "period_end_timestamp": end_ts,
     }
     if include_diagnostics:
         result["daily_equity_curve"] = daily_equity_curve

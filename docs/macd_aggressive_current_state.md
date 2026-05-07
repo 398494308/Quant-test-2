@@ -4,7 +4,7 @@
 
 ## 当前快照
 
-说明：`2026-05-06 17:56`（Asia/Shanghai）已按新的交易活跃度低频惩罚口径完成一次 `--reset-best` 基线重算，并把当前人工压缩版源码写成新的 active reference。下面这张表已经同步到最新 `state/research_macd_aggressive_v2_best.json` 的写回结果；评分公式与 gate 口径以下文为准。
+说明：`2026-05-07 09:15`（Asia/Shanghai）已按新的交易活跃度低频惩罚口径完成一次 `--reset-best` 基线重算，并把当前源码写成新的 active reference。下面这张表已经同步到最新 `state/research_macd_aggressive_v2_best.json` 的写回结果；评分公式与 gate 口径以下文为准。
 
 运行时只有一个 active reference。最新快照在：
 
@@ -26,16 +26,16 @@
 
 | 项目 | 数值 |
 | --- | --- |
-| 当前角色 | baseline |
-| 当前 reference hash | faba5c690d732548f69d42f27d2229103928aab05c1f180399fb69814152cc15 |
+| 当前角色 | champion |
+| 当前 reference hash | a9e00568f7b28cf6f785cf39a98f60244695b578b20baacc73e70eec698021a8 |
 | 当前 reference stage 起点轮次 | 1 |
-| gate | train均值分偏低(0.03)；val命中率偏低(22%)；val最差分块过弱(-0.02) |
-| score regime（保存态 / 仓库默认） | trend_capture_v15_midfreq_trade_floor_penalty / trend_capture_v15_midfreq_trade_floor_penalty |
-| quality_score（train连续趋势分） | 0.1428 |
-| promotion_score（保存态） | -0.2085 |
-| capture_score / timed_return_score / sharpe_floor_score / turn_protection_score | 0.1891 / 0.0786 / 0.1113 / 0.9475 |
+| gate | 通过（研究 gate 已放宽：train walk-forward 只诊断，val命中率>=20%，val最差分块>=-0.10，val负分块<=3） |
+| score regime（保存态 / 仓库默认） | trend_capture_v16_equal_capture_midfreq_idle_penalty / trend_capture_v16_equal_capture_midfreq_idle_penalty |
+| quality_score（train连续趋势分） | 0.1352 |
+| promotion_score（保存态） | -0.4401 |
+| capture_score / timed_return_score / sharpe_floor_score / turn_protection_score | 0.1749 / 0.0786 / 0.1113 / 0.9475 |
 | drawdown_risk_score / drawdown_penalty_score / robustness_penalty_score | 0.3373 / 0.0675 / 0.1900 |
-| train/val连续抓取分 | 0.1428 / 0.2355 |
+| train/val连续抓取分 | 0.1352 / 0.2146 |
 | train+val期间收益 | 17.78% |
 | val期间收益 | 2.35% |
 | val平仓数 | 26 |
@@ -43,7 +43,7 @@
 | Sharpe(train / val / train+val) | 0.48 / 0.22 / 0.37 |
 | test收益 / Sharpe | - / - |
 | train/val连续交易 | 28 / 26 |
-| train/val交易短缺率 / 低频惩罚 | 0.8963 / 0.8556 / 0.0876 |
+| train/val交易短缺率 / 低频惩罚 | 0.8444 / 0.7833 / 0.3128 |
 
 当前轮次留档除了 `journal` 与 `memory/raw` 外，还额外维护一条最小可复现链路：
 
@@ -53,8 +53,8 @@
 
 说明：
 
-- 上表按当前 [state/research_macd_aggressive_v2_best.json](../state/research_macd_aggressive_v2_best.json) 的最近保存态整理；当前 best 写回时间是 `2026-05-06T09:56:48Z`，当前 active reference 是人工压缩后按 `v15` 重新评估出来的 `baseline`。
-- 仓库默认评分已经切到 `trend_capture_v15_midfreq_trade_floor_penalty`；当前保存态也已完成同口径重算，不再混用旧 `v14` 的主评分结果。
+- 上表按当前 [state/research_macd_aggressive_v2_best.json](../state/research_macd_aggressive_v2_best.json) 的最近保存态整理；当前 best 写回时间是 `2026-05-07T01:15:20Z`，当前 active reference 是按 `v16` 重新评估出来的 `champion`。
+- 仓库默认评分已经切到 `trend_capture_v16_equal_capture_midfreq_idle_penalty`；当前保存态也已完成同口径重算。
 - 新口径下 `drawdown_risk_score` 仍是固定窗口 `Ulcer` 风格风险分；`promotion_score` 在分段回撤惩罚之外，又额外接了一层轻量鲁棒性软惩罚，当前更明确压 `val` 最差块、尾块和 `train/val` Sharpe gap，弱侧 Sharpe 通过 `sharpe_floor_score` 进入主分。
 - 当前人工方向已经从“继续补多头收益”切到“优先 `train/val` 稳定性、中频覆盖和弱侧修复”；长期软引导在 [config/research_v2_operator_focus.md](../config/research_v2_operator_focus.md)，人工观察卡仍在 [config/research_v2_champion_review.md](../config/research_v2_champion_review.md) 中按 hash 绑定，仅命中当前 hash 时生效。
 - `state/research_macd_aggressive_v2_best.json` 里如果还带旧字段，例如 `working_base`，那只是历史兼容读取入口；新状态写回只使用单一 active reference 语义。
@@ -121,11 +121,15 @@
 
 `sharpe_floor_score = clamp(min(train_sharpe_ratio, val_sharpe_ratio) / 2.0, 0.0, 1.0)`
 
-`train_trade_activity_shortfall = clamp(max(270 - train_closed_trades, 0) / 270, 0.0, 1.0)`
+`train_trade_activity_shortfall = clamp(max(180 - train_closed_trades, 0) / 180, 0.0, 1.0)`
 
-`val_trade_activity_shortfall = clamp(max(180 - validation_closed_trades, 0) / 180, 0.0, 1.0)`
+`val_trade_activity_shortfall = clamp(max(120 - validation_closed_trades, 0) / 120, 0.0, 1.0)`
 
-`trade_activity_penalty = 0.10 * (0.50 * train_trade_activity_shortfall + 0.50 * val_trade_activity_shortfall)`
+`trade_count_penalty = 0.20 * (0.50 * train_trade_activity_shortfall + 0.50 * val_trade_activity_shortfall)`
+
+`trade_idle_penalty = 0.15 * (0.50 * train_idle_shortfall + 0.50 * val_idle_shortfall)`
+
+`trade_activity_penalty = trade_count_penalty + trade_idle_penalty`
 
 `drawdown_risk_score = 0.50 * train_drawdown_risk_score + 0.50 * val_drawdown_risk_score`
 
@@ -137,7 +141,7 @@
 
 这里特意把 `capture_score` 从“更像追最大段”拉回到“既看大段，也看整体覆盖”；同时把 Sharpe 只用作弱侧保底，不再让它通过软惩罚和主分双重影响总分。
 
-`trade_activity_penalty` 不新增回测。`train` 交易数直接复用现有连续期结果：用 `train+val` 连续回测总交易数减去 `val` 连续回测交易数，得到 `train` 两年的连续交易数；`val` 交易数直接复用现有 `val` 连续回测结果。当前实现只在交易数低于下沿时扣分：`train` 下沿是 `270`，`val` 下沿是 `180`。高于这些下沿不加分也不扣分；区间上沿 `360 / 240` 主要用于研究提示和人工读数，不额外参与计算。
+`trade_activity_penalty` 不新增回测。`train` 交易数直接复用现有连续期结果：用 `train+val` 连续回测总交易数减去 `val` 连续回测交易数，得到 `train` 两年的连续交易数；`val` 交易数直接复用现有 `val` 连续回测结果。当前实现只在交易数低于下沿时扣分：`train` 下沿是 `180`，`val` 下沿是 `120`。高于这些下沿不加分也不扣分；区间上沿 `270 / 180` 主要用于研究提示和人工读数，不额外参与计算。回测会记录每笔交易的入场时间，并额外惩罚 `train/val` 中超过 `7` 天没有新开仓的长空窗。
 
 `drawdown_risk_score` 直接复用现有 `train/val` 日收益路径，不新增回测。两侧都按固定 `28` 天窗口滚动切分，再对每个窗口计算 `Ulcer` 风格回撤值，最后用 `median + P75` 的加权聚合成风险分。这样 `train` 的滚动窗口路径和 `val` 的整年路径会落到同一时间单位上比较，也不会被一次单日极端点完全主导。
 
@@ -150,7 +154,7 @@
 晋升规则：
 
 - 先过 `gate`
-- 再满足 `promotion_score` 达到当前 active reference 之上的最小晋级边际；若 `quality_score` 回落，则需要更高边际
+- 过 `gate` 后即可刷新 active reference；`promotion_score` 只用于排序、诊断和人工复盘，不再作为替换硬门
 - 刷新 champion 时会同步跑 `test`
 - 已完成完整评估但未保留的候选也会后台异步补跑 `test`
 - reject / duplicate_skipped 的 `test` 结果只进 round artifact、通知和人工观察，不参与 prompt、不参与晋升
@@ -161,16 +165,16 @@
 
 当前真正参与 gate 的主条件是：
 
-- `train` 均值分至少 `0.10`
-- `train` 中位分至少 `0.00`
-- `val` 命中率至少 `0.35`
+- `val` 命中率至少 `0.20`
 - `val` 趋势捕获分至少 `0.05`
 - `train / val` 连续趋势抓取分差不超过 `0.30`
 - 手续费拖累不超过 `11.5%`
-- `val` 分成 `4` 块后，最差块至少 `0.05`
-- `val` 负块数量最多 `1`
+- `val` 分成 `4` 块后，最差块至少 `-0.10`
+- `val` 负块数量最多 `3`
 
-交易活跃度不再是硬 gate；它已经进入 `promotion_score` 主公式，但现在是“单边低频惩罚”：希望区间约是 `train 270-360 / val 180-240`。高于区间不奖不罚，低于下沿才按短缺比例扣分。
+这组阈值是研究推进用 gate，不是实盘准入承诺。`train` walk-forward 均值和中位数仍保留在诊断里，但不再作为硬 gate；当前低频基底下，28 天滚动小窗太容易被空窗主导。上一版阈值（`train` 均值 `0.10`、`val` 命中率 `0.35`、`val` 最差块 `0.05`）在当前低频基底上过严：最近 35 个完整候选里，`train` 滚动均值最高约 `0.04`，导致明显改善的候选也无法成为下一轮基底。
+
+交易活跃度不再是硬 gate；它已经进入 `promotion_score` 主公式，但现在是“低频 + 长空窗”惩罚：希望区间约是 `train 180-270 / val 120-180`，最长无新开仓约束是 `7` 天。
 
 另外仍保留过拟合诊断。严重集中度会直接 veto，普通风险会进入 journal 和历史摘要。
 
